@@ -24,7 +24,6 @@ const { addExtra }        = require('puppeteer-extra');
 const puppeteerCore       = require('puppeteer-core');
 const StealthPlugin       = require('puppeteer-extra-plugin-stealth');
 const path                = require('path');
-const os                  = require('os');
 const fs                  = require('fs');
 const http                = require('http');
 const readline            = require('readline');
@@ -35,13 +34,17 @@ puppeteer.use(StealthPlugin());
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const CHROME_PATH      = '/usr/bin/google-chrome';
-const PROFILE_DIR      = path.join(os.homedir(), '.chatgpt-poc-profile');
-const SESSION_FILE     = path.join(os.homedir(), '.chatgpt-poc-session');
-const DAEMON_FILE      = path.join(os.homedir(), '.chatgpt-poc-daemon.json');
-const DAEMON_LOG       = path.join(os.homedir(), '.chatgpt-poc-daemon.log');
+const CHROME_PATH      = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
+const STATE_DIR        = path.join(__dirname, '.chatgpt-poc');
+const PROFILE_DIR      = path.join(STATE_DIR, 'profile');
+const SESSION_FILE     = path.join(STATE_DIR, 'session');
+const DAEMON_FILE      = path.join(STATE_DIR, 'daemon.json');
+const DAEMON_LOG       = path.join(STATE_DIR, 'daemon.log');
 const CHATGPT_URL      = 'https://chatgpt.com';
+const PROJECT_URL      = 'https://chatgpt.com/g/g-p-6a1b384bc3688191b5e2c522d45fbe20/project';
 const RESPONSE_TIMEOUT = 300_000; // 5 min — file analysis can be slow
+
+fs.mkdirSync(STATE_DIR, { recursive: true });
 
 // ─── System prompt ────────────────────────────────────────────────────────────
 
@@ -169,6 +172,16 @@ function launchBrowser() {
   });
 }
 
+function isProjectUrl(url) {
+  return url.startsWith(PROJECT_URL);
+}
+
+function readProjectSessionUrl() {
+  if (!fs.existsSync(SESSION_FILE)) return null;
+  const url = fs.readFileSync(SESSION_FILE, 'utf8').trim();
+  return isProjectUrl(url) ? url : null;
+}
+
 // Single DOM operation — no keystroke simulation, no chunking, no delay.
 // execCommand('insertText') is the fastest reliable way to fill a
 // React-controlled contenteditable without breaking its event listeners.
@@ -222,18 +235,30 @@ async function waitForStreamingDone(page, log, beforeCount) {
     throw err;
   });
 
-  // Phase 2 — wait for the message to stop growing (streaming complete).
-  // Three consecutive 600 ms checks with identical length = done.
+  // Phase 2 — wait for the final answer to stop growing. New ChatGPT UIs can
+  // render a stable "Thinking" placeholder before the final text exists, so
+  // don't treat that placeholder as a complete assistant response.
   let lastLen = -1;
   let stableCount = 0;
+  const deadline = Date.now() + RESPONSE_TIMEOUT;
   while (stableCount < 3) {
+    if (Date.now() > deadline) throw new Error('Timed out waiting for ChatGPT response to finish');
     await new Promise(r => setTimeout(r, 600));
-    const len = await page.evaluate(() => {
+    const state = await page.evaluate(() => {
       const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
-      return msgs.length > 0 ? msgs[msgs.length - 1].innerText.length : 0;
+      const text = msgs.length > 0 ? msgs[msgs.length - 1].innerText : '';
+      const labels = [...document.querySelectorAll('button')]
+        .map(button => `${button.getAttribute('aria-label') || ''} ${button.textContent || ''}`.trim())
+        .filter(Boolean);
+      return {
+        len: text.length,
+        text: text.replace(/\s+/g, ' ').trim(),
+        generating: labels.some(label => /stop|interrupt|cancel|停止|中止|取消/i.test(label)),
+      };
     });
-    if (len === lastLen && len > 0) stableCount++;
-    else { lastLen = len; stableCount = 0; }
+    const placeholder = /^(thinking|thinking\.\.\.|思考中|正在思考)$/i.test(state.text);
+    if (!state.generating && !placeholder && state.len === lastLen && state.len > 0) stableCount++;
+    else { lastLen = state.len; stableCount = 0; }
   }
 }
 
@@ -260,13 +285,11 @@ async function startDaemonProcess() {
     browser = await launchBrowser();
     page    = await browser.newPage();
 
-    const initUrl = fs.existsSync(SESSION_FILE)
-      ? fs.readFileSync(SESSION_FILE, 'utf8').trim()
-      : CHATGPT_URL;
+    const initUrl = readProjectSessionUrl() || PROJECT_URL;
 
     log(`Navigating to ${initUrl}`);
     await page.goto(
-      initUrl.startsWith('https://chatgpt.com') ? initUrl : CHATGPT_URL,
+      isProjectUrl(initUrl) ? initUrl : PROJECT_URL,
       { waitUntil: 'networkidle2', timeout: 30_000 }
     );
 
@@ -326,13 +349,11 @@ async function startDaemonProcess() {
           const currentUrl = page.url();
 
           if (newChat) {
-            log('Starting new chat...');
-            await page.goto(CHATGPT_URL, { waitUntil: 'networkidle2', timeout: 30_000 });
-          } else if (!currentUrl.startsWith('https://chatgpt.com')) {
-            // Tab drifted (e.g. browser opened a link) — restore
-            const sessionUrl = fs.existsSync(SESSION_FILE)
-              ? fs.readFileSync(SESSION_FILE, 'utf8').trim()
-              : CHATGPT_URL;
+            log('Starting new project chat...');
+            await page.goto(PROJECT_URL, { waitUntil: 'networkidle2', timeout: 30_000 });
+          } else if (!isProjectUrl(currentUrl)) {
+            // Tab drifted (e.g. browser opened a link) — restore to the MCP project.
+            const sessionUrl = readProjectSessionUrl() || PROJECT_URL;
             log(`Restoring tab to ${sessionUrl}`);
             await page.goto(sessionUrl, { waitUntil: 'networkidle2', timeout: 30_000 });
           }
@@ -375,7 +396,7 @@ async function startDaemonProcess() {
           await waitForStreamingDone(page, log, beforeCount);
 
           const finalUrl = page.url();
-          if (finalUrl.startsWith('https://chatgpt.com/c/')) {
+          if (isProjectUrl(finalUrl)) {
             fs.writeFileSync(SESSION_FILE, finalUrl, 'utf8');
           }
 
@@ -483,7 +504,7 @@ async function ensureDaemon() {
     }
   }
 
-  throw new Error('Daemon did not start. Check: cat ~/.chatgpt-poc-daemon.log');
+  throw new Error(`Daemon did not start. Check log: ${DAEMON_LOG}`);
 }
 
 // ─── Login (one-time setup, no daemon) ───────────────────────────────────────
@@ -496,15 +517,22 @@ function waitForEnter(prompt) {
 }
 
 async function login() {
-  console.log('[*] Opening Chrome for login...');
-  const browser = await launchBrowser();
-  const page = await browser.newPage();
-  await page.goto(CHATGPT_URL, { waitUntil: 'networkidle2', timeout: 30_000 });
+  console.log('[*] Opening browser for manual login...');
+  spawn(CHROME_PATH, [
+    `--user-data-dir=${PROFILE_DIR}`,
+    '--no-first-run',
+    '--no-default-browser-check',
+    PROJECT_URL,
+  ], {
+    detached: true,
+    stdio: 'ignore',
+  }).unref();
   console.log('');
-  console.log('  Log in to chatgpt.com in the Chrome window that opened.');
-  console.log('  When fully logged in and the chat interface is visible,');
-  await waitForEnter('  press Enter here to save the session: ');
-  await browser.close();
+  console.log('  Log in to chatgpt.com in the browser window that opened.');
+  console.log('  This login window is not controlled by Puppeteer, so Google OAuth');
+  console.log('  is less likely to reject it as an insecure browser.');
+  console.log('  When fully logged in and the chat interface is visible, close the browser window.');
+  await waitForEnter('  Then press Enter here: ');
   console.log('[*] Done. Run: node chatgpt.js "your prompt here"');
 }
 
