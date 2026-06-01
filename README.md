@@ -65,6 +65,9 @@ CHATGPT_SESSION_DIR               Optional user-level #xxxxxx session registry d
 CHATGPT_RESPONSE_TIMEOUT_MS       Browser response wait timeout, default 300000
 CHATGPT_CLI_TIMEOUT_MS            MCP wrapper CLI timeout, default 310000
 CHATGPT_DAEMON_START_TIMEOUT_MS   Daemon startup timeout, default 60000
+CHATGPT_FILE_UPLOAD_TIMEOUT_MS    Wait timeout for ChatGPT file upload readiness, default 180000
+CHATGPT_AUTOSAVE_RESPONSE_CHARS   Auto-save response threshold, default 12000
+CHATGPT_AUTOSAVE_PREVIEW_CHARS    Preview length returned after auto-save, default 4000
 ```
 
 `CHATGPT_PROJECT` is deployment configuration, not an MCP model parameter. The
@@ -121,7 +124,7 @@ node chatgpt.js --session-id #4fa92c "continue the previous research"
 node chatgpt.js --raw "Reply exactly: OK"
 node chatgpt.js --context "project uses Effect v4" "review this approach"
 node chatgpt.js --git "summarize these local changes"
-node chatgpt.js --upload F:\path\to\file.txt "analyze this file"
+node chatgpt.js --upload F:\path\to\file.txt --upload F:\path\to\notes.docx "analyze these files"
 node chatgpt.js --save-to-file "write a long research report"
 node chatgpt.js --status
 node chatgpt.js --stop
@@ -148,12 +151,15 @@ Use project-local config, for example `.opencode/opencode.jsonc`:
         "CHATGPT_BROWSER_PATH": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
         "CHATGPT_PROJECT": "MCP",
         "CHATGPT_STATE_DIR": "F:\\ML\\PythonAIProject\\Claude-Code\\opencode\\.temp\\chatgpt-browser-agent\\.chatgpt-poc",
-        "CHATGPT_RESPONSE_TIMEOUT_MS": "300000",
-        "CHATGPT_CLI_TIMEOUT_MS": "310000",
-        "CHATGPT_DAEMON_START_TIMEOUT_MS": "60000"
+        "CHATGPT_RESPONSE_TIMEOUT_MS": "600000",
+        "CHATGPT_CLI_TIMEOUT_MS": "580000",
+        "CHATGPT_DAEMON_START_TIMEOUT_MS": "60000",
+        "CHATGPT_FILE_UPLOAD_TIMEOUT_MS": "180000",
+        "CHATGPT_AUTOSAVE_RESPONSE_CHARS": "12000",
+        "CHATGPT_AUTOSAVE_PREVIEW_CHARS": "4000"
       },
       "enabled": true,
-      "timeout": 320000
+      "timeout": 620000
     }
   }
 }
@@ -193,7 +199,7 @@ Inputs:
   "sessionID": "#4fa92c",
   "context": "Optional additional context",
   "git": true,
-  "file": "F:\\absolute\\path\\file.txt",
+  "file": ["F:\\absolute\\path\\file.txt", "F:\\absolute\\path\\notes.docx"],
   "saveToFile": true
 }
 ```
@@ -205,7 +211,8 @@ conversation from any OpenCode working directory.
 `git: true` attaches `git branch --show-current`, `git status --short`, and
 `git diff HEAD` from the OpenCode working directory.
 
-`file` uploads a local file through the ChatGPT attachment input.
+`file` uploads one local file or an array of local files through the ChatGPT
+attachment input. Uploads are retried for transient browser frame errors.
 
 `saveToFile: true` saves the text response to the current project cache and
 returns only metadata instead of the full response body:
@@ -223,11 +230,17 @@ Generated ChatGPT sandbox/download files are always saved under:
 The model does not control the output directories. The tool returns saved and
 downloaded file paths plus the `Session: #xxxxxx` handle.
 
+Long responses are auto-saved even when `saveToFile` is omitted. In that case the
+tool returns a preview and the saved file path, avoiding OpenCode tool-output
+truncation while preserving the complete answer locally.
+
 ## MCP Error Semantics
 
 `mcp-server.js` maps non-zero `chatgpt.js` exits, spawn failures, and timeouts to
-MCP tool results with `isError: true`. Successful `ask` calls return only the
-raw ChatGPT response text.
+MCP tool results with `isError: true`. On wrapper timeout it stops the daemon so
+the next call starts cleanly. Browser-frame/protocol errors trigger one automatic
+daemon restart and retry before surfacing an error. Successful `ask` calls return
+the ChatGPT response text or metadata when the response was saved to file.
 
 ## Experimental agent.js
 

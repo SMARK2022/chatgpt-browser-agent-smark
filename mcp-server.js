@@ -16,6 +16,7 @@ const path          = require('path');
 
 const SCRIPT = path.join(__dirname, 'chatgpt.js');
 const CHATGPT_CLI_TIMEOUT = positiveIntEnv('CHATGPT_CLI_TIMEOUT_MS', 310_000);
+const CHATGPT_STOP_TIMEOUT = positiveIntEnv('CHATGPT_STOP_TIMEOUT_MS', 30_000);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -41,20 +42,52 @@ function normalizeToolName(name) {
   return name;
 }
 
+function normalizeFiles(value) {
+  if (!value) return [];
+  return (Array.isArray(value) ? value : [value])
+    .map(item => String(item || '').trim())
+    .filter(Boolean);
+}
+
+function stopDaemon() {
+  spawnSync(process.execPath, [SCRIPT, '--stop'], {
+    encoding: 'utf8',
+    timeout: CHATGPT_STOP_TIMEOUT,
+    maxBuffer: 1024 * 1024,
+  });
+}
+
+function shouldRestartDaemon(text) {
+  return /detached Frame|Execution context was destroyed|Cannot find context|Target closed|Protocol error|Runtime\.callFunctionOn timed out/i.test(text);
+}
+
 /**
  * Run chatgpt.js with the given args array.
  * Returns trimmed stdout and marks non-zero process results as MCP tool errors.
  */
-function runChatgpt(args) {
-  const result = spawnSync('node', [SCRIPT, ...args], {
+function runChatgpt(args, retry = true) {
+  const result = spawnSync(process.execPath, [SCRIPT, ...args], {
     encoding:  'utf8',
     timeout:   CHATGPT_CLI_TIMEOUT,
     maxBuffer: 10 * 1024 * 1024,
   });
   const out = (result.stdout || '').trim();
   const err = (result.stderr || '').trim();
-  if (result.error) return { text: `Error: ${result.error.message}`, isError: true };
+  if (result.error) {
+    if (result.error.code === 'ETIMEDOUT') {
+      stopDaemon();
+      return {
+        text: `Error: ChatGPT request timed out after ${CHATGPT_CLI_TIMEOUT}ms; daemon was restarted automatically. Retry with the same sessionID, or use saveToFile for long answers.`,
+        isError: true,
+      };
+    }
+    return { text: `Error: ${result.error.message}`, isError: true };
+  }
   if (result.status !== 0) {
+    if (retry && shouldRestartDaemon(`${err}\n${out}`)) {
+      stopDaemon();
+      return runChatgpt(args, false);
+    }
     return {
       text: err || out || `Error: chatgpt.js exited with status ${result.status}`,
       isError: true,
@@ -94,8 +127,11 @@ const TOOLS = [
           description: 'If true, attach git branch, status, and diff from the current OpenCode working directory as context',
         },
         file: {
-          type: 'string',
-          description: 'Absolute path to a local file to upload to ChatGPT via the attachment button',
+          oneOf: [
+            { type: 'string' },
+            { type: 'array', items: { type: 'string' } },
+          ],
+          description: 'Absolute path, or array of absolute paths, to local files to upload to ChatGPT via the attachment button',
         },
         saveToFile: {
           type: 'boolean',
@@ -172,7 +208,7 @@ function handleRequest(req) {
         flags.push('--cwd', process.cwd());
       }
       if (args.context)  flags.push('--context', args.context);
-      if (args.file)     flags.push('--upload',  args.file);
+      for (const file of normalizeFiles(args.file)) flags.push('--upload', file);
       flags.push(args.prompt);
 
       sendToolResult(id, runChatgpt(flags));

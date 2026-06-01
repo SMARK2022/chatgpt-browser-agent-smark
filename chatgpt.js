@@ -47,6 +47,9 @@ const CHATGPT_URL      = 'https://chatgpt.com';
 const DEFAULT_PROJECT  = process.env.CHATGPT_PROJECT || process.env.CHATGPT_PROJECT_NAME || process.env.CHATGPT_PROJECT_URL || 'MCP';
 const RESPONSE_TIMEOUT = positiveIntEnv('CHATGPT_RESPONSE_TIMEOUT_MS', 300_000); // 5 min — file analysis can be slow
 const DAEMON_START_TIMEOUT = positiveIntEnv('CHATGPT_DAEMON_START_TIMEOUT_MS', 60_000);
+const FILE_UPLOAD_TIMEOUT = positiveIntEnv('CHATGPT_FILE_UPLOAD_TIMEOUT_MS', 180_000);
+const AUTO_SAVE_RESPONSE_CHARS = positiveIntEnv('CHATGPT_AUTOSAVE_RESPONSE_CHARS', 12_000);
+const AUTO_SAVE_PREVIEW_CHARS = positiveIntEnv('CHATGPT_AUTOSAVE_PREVIEW_CHARS', 4_000);
 
 // 运行状态和会话索引分离：浏览器 profile/daemon 放插件状态目录，#xxxxxx 会话索引放用户级 opencode 数据目录。
 fs.mkdirSync(STATE_DIR, { recursive: true });
@@ -127,40 +130,71 @@ function buildFullPrompt({ userPrompt, stdinData, fileData, gitData, contextData
  * After setting the files via CDP we fire a synthetic change event so React's
  * event system picks up the new FileList and registers the attachment.
  */
-async function uploadFileToChatGPT(page, uploadPath, log) {
-  const abs = path.resolve(uploadPath);
-  if (!fs.existsSync(abs)) throw new Error(`Upload file not found: ${abs}`);
-  log(`Uploading file: ${abs}`);
+function normalizePathList(value) {
+  if (!value) return [];
+  return (Array.isArray(value) ? value : [value])
+    .map(item => String(item || '').trim())
+    .filter(Boolean);
+}
 
-  await page.bringToFront();
-
-  // Wait for the hidden file input to be present in the DOM
-  const inputHandle = await page.waitForSelector('#upload-files', { timeout: 8_000 });
-
-  // CDP-level file injection — no dialog needed
-  await inputHandle.uploadFile(abs);
-
-  // Notify React that the input's FileList changed
-  await page.evaluate(() => {
-    const el = document.getElementById('upload-files');
-    if (el) el.dispatchEvent(new Event('change', { bubbles: true }));
-  });
-
-  // Give ChatGPT's React handler a moment to process the file and render a preview
-  await new Promise(r => setTimeout(r, 2_000));
-
-  // ChatGPT may show a "You've already uploaded this file" warning dialog when
-  // the same file has been uploaded recently.  Dismiss it so the flow continues.
-  const dialog = await page.$('[role="dialog"]');
-  if (dialog) {
-    const dialogText = await page.evaluate(el => el.textContent.trim().slice(0, 120), dialog);
-    log(`Dismissing dialog: "${dialogText}"`);
-    const okBtn = await page.$('[role="dialog"] button');
-    if (okBtn) await okBtn.click();
-    await new Promise(r => setTimeout(r, 800));
+async function uploadFilesToChatGPT(page, uploadPaths, log) {
+  const files = normalizePathList(uploadPaths).map(file => path.resolve(file));
+  for (const file of files) {
+    if (!fs.existsSync(file)) throw new Error(`Upload file not found: ${file}`);
   }
+  if (files.length === 0) return;
 
-  log('Upload complete.');
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      log(`Uploading ${files.length} file(s), attempt ${attempt}: ${files.join(', ')}`);
+      await page.bringToFront();
+      await page.waitForSelector('#prompt-textarea', { timeout: 15_000 });
+      const inputHandle = await page.waitForSelector('#upload-files', { timeout: 15_000 });
+
+      // CDP 直接注入文件，支持一次上传多个文件，避免系统文件选择器和前台焦点依赖。
+      await inputHandle.uploadFile(...files);
+      await page.evaluate(() => {
+        const el = document.getElementById('upload-files');
+        if (el) el.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+
+      await dismissUploadDialog(page, log);
+      await waitForUploadReady(page, log);
+      log('Upload complete.');
+      return;
+    } catch (err) {
+      log(`Upload attempt ${attempt} failed: ${err.message}`);
+      if (attempt === 3 || !isRecoverableBrowserError(err)) throw err;
+      await new Promise(r => setTimeout(r, 1_500));
+    }
+  }
+}
+
+async function dismissUploadDialog(page, log) {
+  await new Promise(r => setTimeout(r, 1_000));
+  const dialog = await page.$('[role="dialog"]');
+  if (!dialog) return;
+  const dialogText = await page.evaluate(el => el.textContent.trim().slice(0, 160), dialog).catch(() => 'unknown dialog');
+  log(`Dismissing dialog: "${dialogText}"`);
+  const okBtn = await page.$('[role="dialog"] button');
+  if (okBtn) await okBtn.click();
+  await new Promise(r => setTimeout(r, 800));
+}
+
+async function waitForUploadReady(page, log) {
+  // 大 PDF/DOCX 上传后 ChatGPT 会在后台解析，send button 会保持 disabled；这里给文件任务更长等待。
+  await page.waitForFunction(
+    () => {
+      const btn = document.querySelector('button[data-testid="send-button"]');
+      return btn && !btn.disabled;
+    },
+    { timeout: FILE_UPLOAD_TIMEOUT, polling: 1_000 }
+  );
+  log('Send button is enabled after upload.');
+}
+
+function isRecoverableBrowserError(err) {
+  return /detached Frame|Execution context was destroyed|Cannot find context|Node is detached|Target closed|Protocol error|Runtime\.callFunctionOn timed out/i.test(err.message || '');
 }
 
 function launchBrowser() {
@@ -442,7 +476,7 @@ async function fillTextarea(page, text) {
   }, text);
 }
 
-async function waitForStreamingDone(page, log, beforeState) {
+async function waitForStreamingDone(page, log, beforeState, options = {}) {
   // ChatGPT 有时会复用最后一个 assistant DOM 节点，而不是新增节点；因此同时记录数量和最后文本。
   if (beforeState === undefined || typeof beforeState === 'number') {
     beforeState = await assistantState(page, typeof beforeState === 'number' ? beforeState : undefined);
@@ -473,6 +507,11 @@ async function waitForStreamingDone(page, log, beforeState) {
       return { assistants, allRoles, buttons: buttons.slice(0,15), url };
     }).catch(() => ({ error: 'page.evaluate failed' }));
     log(`waitForStreamingDone TIMEOUT dump: ${JSON.stringify(dump)}`);
+    const current = await assistantState(page).catch(() => null);
+    if (current && current.lastText && current.lastText !== beforeState.lastText) {
+      log('waitForStreamingDone: continuing with changed assistant text after phase-1 timeout');
+      return;
+    }
     throw err;
   });
 
@@ -483,7 +522,14 @@ async function waitForStreamingDone(page, log, beforeState) {
   let lastChangedAt = Date.now();
   const deadline = Date.now() + RESPONSE_TIMEOUT;
   while (true) {
-    if (Date.now() > deadline) throw new Error('Timed out waiting for ChatGPT response to finish');
+    if (Date.now() > deadline) {
+      const current = await assistantState(page).catch(() => null);
+      if (current && current.lastText && current.lastText !== beforeState.lastText) {
+        log('waitForStreamingDone: response deadline reached, returning best available assistant text');
+        break;
+      }
+      throw new Error('Timed out waiting for ChatGPT response to finish');
+    }
     await new Promise(r => setTimeout(r, 750));
     const state = await page.evaluate(() => {
       const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
@@ -491,10 +537,11 @@ async function waitForStreamingDone(page, log, beforeState) {
       const labels = [...document.querySelectorAll('button')]
         .map(button => `${button.getAttribute('aria-label') || ''} ${button.textContent || ''}`.trim())
         .filter(Boolean);
+      const stopButton = !!document.querySelector('button[data-testid="stop-button"], button[aria-label*="Stop"], button[aria-label*="停止"]');
       return {
         len: text.length,
         text: text.replace(/\s+/g, ' ').trim(),
-        generating: labels.some(label => /stop|interrupt|cancel|停止|中止|取消/i.test(label)),
+        generating: stopButton || labels.some(label => /stop|interrupt|cancel|停止|中止|取消/i.test(label)),
       };
     });
     const placeholder = /^(thinking|thinking\.\.\.|思考中|正在思考)$/i.test(state.text);
@@ -503,9 +550,14 @@ async function waitForStreamingDone(page, log, beforeState) {
       lastChangedAt = Date.now();
       continue;
     }
-    const stableMs = state.len < 1_000 ? 2_500 : state.len < 4_000 ? 5_000 : 8_000;
+    const stableMs = responseStableMs(state.len, options.slow);
     if (!state.generating && !placeholder && state.len > 0 && Date.now() - lastChangedAt >= stableMs) break;
   }
+}
+
+function responseStableMs(length, slow) {
+  if (slow) return length < 1_000 ? 15_000 : length < 4_000 ? 18_000 : 22_000;
+  return length < 1_000 ? 6_000 : length < 4_000 ? 8_000 : 12_000;
 }
 
 async function assistantState(page, count) {
@@ -813,11 +865,12 @@ async function startDaemonProcess() {
       let body = '';
       req.on('data', chunk => (body += chunk));
       req.on('end', async () => {
-        const { fullPrompt, uploadPath, workspaceDir, sessionID: requestedSessionID, saveToFile } = JSON.parse(body);
+        const { fullPrompt, uploadPath, uploadPaths, workspaceDir, sessionID: requestedSessionID, saveToFile } = JSON.parse(body);
 
         try {
           const sessionID = normalizeSessionID(requestedSessionID) || createSessionID();
-          log(`ask: sessionID=${sessionID} saveToFile=${!!saveToFile} upload=${uploadPath||'none'} workspace=${workspaceDir||process.cwd()} len=${fullPrompt.length}`);
+          const files = normalizePathList(uploadPaths || uploadPath);
+          log(`ask: sessionID=${sessionID} saveToFile=${!!saveToFile} uploads=${files.length || 'none'} workspace=${workspaceDir||process.cwd()} len=${fullPrompt.length}`);
 
           // sessionID 是全局句柄；存在则恢复对应 ChatGPT 会话，不存在则在固定 Project 中创建新会话。
           const session = readSessionEntry(sessionID, project);
@@ -827,25 +880,9 @@ async function startDaemonProcess() {
             await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 30_000 });
           }
 
-          if (uploadPath) await uploadFileToChatGPT(page, uploadPath, log);
+          await uploadFilesToChatGPT(page, files, log);
 
           await fillTextarea(page, fullPrompt);
-
-          // If a file was uploaded, wait until the send button is enabled.
-          // ChatGPT uploads the file to its servers in the background; the send
-          // button stays disabled until that upload finishes.  Clicking a disabled
-          // button does nothing, which is what caused the previous silent failures.
-          if (uploadPath) {
-            log('Waiting for send button to become enabled (file upload in progress)...');
-            await page.waitForFunction(
-              () => {
-                const btn = document.querySelector('button[data-testid="send-button"]');
-                return btn && !btn.disabled;
-              },
-              { timeout: 60_000 }
-            );
-            log('Send button is now enabled.');
-          }
 
           // 发送前记录 assistant 状态，避免 ChatGPT 复用 DOM 节点时误判没有新回复。
           const beforeState = await assistantState(page);
@@ -858,7 +895,7 @@ async function startDaemonProcess() {
           log('Submitted via Enter key');
 
           log('Prompt sent, waiting for response...');
-          await waitForStreamingDone(page, log, beforeState);
+          await waitForStreamingDone(page, log, beforeState, { slow: files.length > 0 || fullPrompt.length > 2_000 });
 
           const finalUrl = page.url();
           if (isAllowedChatUrl(finalUrl, project)) {
@@ -872,10 +909,16 @@ async function startDaemonProcess() {
           fs.mkdirSync(dirs.downloads, { recursive: true });
           // 下载目录不暴露给模型，始终写到当前项目 cache，避免全局目录堆积生成物。
           const downloads = await downloadAssistantFiles(page, dirs.downloads, log);
-          const savedResponse = saveToFile ? saveResponseToFile(raw, workspaceDir, sessionID) : null;
+          const autoSave = !saveToFile && raw.length > AUTO_SAVE_RESPONSE_CHARS;
+          const savedResponse = saveToFile || autoSave ? saveResponseToFile(raw, workspaceDir, sessionID) : null;
+          const response = saveToFile
+            ? ''
+            : autoSave
+              ? `${raw.slice(0, AUTO_SAVE_PREVIEW_CHARS).trimEnd()}\n\n[Full response auto-saved because it was ${raw.length} characters.]`
+              : raw;
 
           log(`Done: ${raw.length} chars`);
-          send(200, { ok: true, response: saveToFile ? '' : raw, downloads, savedResponse, sessionID });
+          send(200, { ok: true, response, downloads, savedResponse, sessionID });
         } catch (err) {
           log(`Error: ${err.message}`);
           send(500, { ok: false, error: err.message });
@@ -1011,7 +1054,7 @@ async function login() {
 function parseArgs(argv) {
   const args = argv.slice(2);
   const opts = {
-    login: false, file: null, upload: null,
+    login: false, file: null, upload: [],
     git: false, context: null, stop: false, status: false, raw: false,
     saveToFile: false, sessionID: null, daemonInternal: false, cwd: null, workspace: null, prompt: [],
   };
@@ -1025,7 +1068,7 @@ function parseArgs(argv) {
       case '--save-to-file':    opts.saveToFile     = true;  break;
       case '--daemon-internal': opts.daemonInternal = true;  break;
       case '--file':            opts.file    = args[++i];    break;
-      case '--upload':          opts.upload  = args[++i];    break;
+      case '--upload':          opts.upload.push(args[++i]); break;
       case '--session-id':      opts.sessionID = args[++i];  break;
       case '--context':         opts.context = args[++i];    break;
       case '--cwd':             opts.cwd     = args[++i];    break;
@@ -1043,7 +1086,7 @@ Usage:
   node chatgpt.js "prompt"                              # create a new #xxxxxx session
   node chatgpt.js --session-id #4fa92c "prompt"         # continue a session
   node chatgpt.js --file <path> "prompt"                # paste file content as text in prompt
-  node chatgpt.js --upload <path> "prompt"              # upload file via ChatGPT attachment button
+  node chatgpt.js --upload <path> [--upload <path>] "prompt" # upload one or more files
   node chatgpt.js --save-to-file "prompt"               # save response under .opencode/cache/chatgpt
   node chatgpt.js --raw "prompt"                         # print response text only
   node chatgpt.js --git "write a commit message"        # attach git diff/status
@@ -1104,7 +1147,7 @@ Usage:
     const port   = await ensureDaemon();
     const result = await httpPost(port, '/ask', {
       fullPrompt,
-      uploadPath: opts.upload || null,
+      uploadPaths: opts.upload,
       workspaceDir: opts.workspace || opts.cwd || process.cwd(),
       sessionID: opts.sessionID || null,
       saveToFile: opts.saveToFile,
