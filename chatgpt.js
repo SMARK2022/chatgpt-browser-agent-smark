@@ -260,11 +260,11 @@ async function waitForStreamingDone(page, log, beforeCount) {
   // render a stable "Thinking" placeholder before the final text exists, so
   // don't treat that placeholder as a complete assistant response.
   let lastLen = -1;
-  let stableCount = 0;
+  let lastChangedAt = Date.now();
   const deadline = Date.now() + RESPONSE_TIMEOUT;
-  while (stableCount < 3) {
+  while (true) {
     if (Date.now() > deadline) throw new Error('Timed out waiting for ChatGPT response to finish');
-    await new Promise(r => setTimeout(r, 600));
+    await new Promise(r => setTimeout(r, 750));
     const state = await page.evaluate(() => {
       const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
       const text = msgs.length > 0 ? msgs[msgs.length - 1].innerText : '';
@@ -278,8 +278,13 @@ async function waitForStreamingDone(page, log, beforeCount) {
       };
     });
     const placeholder = /^(thinking|thinking\.\.\.|思考中|正在思考)$/i.test(state.text);
-    if (!state.generating && !placeholder && state.len === lastLen && state.len > 0) stableCount++;
-    else { lastLen = state.len; stableCount = 0; }
+    if (state.len !== lastLen) {
+      lastLen = state.len;
+      lastChangedAt = Date.now();
+      continue;
+    }
+    const stableMs = state.len < 1_000 ? 2_500 : state.len < 4_000 ? 5_000 : 8_000;
+    if (!state.generating && !placeholder && state.len > 0 && Date.now() - lastChangedAt >= stableMs) break;
   }
 }
 
