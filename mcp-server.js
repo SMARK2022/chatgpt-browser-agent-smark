@@ -13,6 +13,7 @@
 const { spawnSync } = require('child_process');
 const readline      = require('readline');
 const path          = require('path');
+const os            = require('os');
 
 const SCRIPT = path.join(__dirname, 'chatgpt.js');
 const CHATGPT_CLI_TIMEOUT = positiveIntEnv('CHATGPT_CLI_TIMEOUT_MS', 310_000);
@@ -39,6 +40,13 @@ function normalizeToolName(name) {
   if (name === 'chatgpt_status') return 'status';
   if (name === 'chatgpt_stop') return 'stop';
   return name;
+}
+
+function defaultDownloadDir() {
+  if (process.env.CHATGPT_DOWNLOAD_DIR) return path.resolve(process.env.CHATGPT_DOWNLOAD_DIR);
+  if (process.env.OPENCODE_CHATGPT_DOWNLOAD_DIR) return path.resolve(process.env.OPENCODE_CHATGPT_DOWNLOAD_DIR);
+  const dataHome = process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share');
+  return path.join(dataHome, 'opencode', 'tool-output', 'chatgpt-downloads');
 }
 
 /**
@@ -104,6 +112,10 @@ const TOOLS = [
         savePath: {
           type: 'string',
           description: 'Absolute path where ChatGPT\'s response should be saved as a text file',
+        },
+        downloadDir: {
+          type: 'string',
+          description: 'Optional absolute directory for generated ChatGPT sandbox/download files. Defaults to opencode tool-output cache.',
         },
       },
       required: ['prompt'],
@@ -216,6 +228,7 @@ function handleRequest(req) {
       }
       if (args.context)  flags.push('--context', args.context);
       if (args.file)     flags.push('--upload',  args.file);
+      flags.push('--download-dir', args.downloadDir || defaultDownloadDir());
       if (args.savePath) flags.push('--save',    args.savePath);
       flags.push(args.prompt);
 

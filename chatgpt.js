@@ -291,11 +291,191 @@ async function waitForStreamingDone(page, log, beforeCount) {
 async function extractLastAssistantMessage(page) {
   return page.evaluate(() => {
     const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
-    if (msgs.length > 0) return msgs[msgs.length - 1].innerText.trim();
-    const blocks = document.querySelectorAll('.markdown, .prose');
-    if (blocks.length > 0) return blocks[blocks.length - 1].innerText.trim();
+    const root = msgs.length > 0
+      ? msgs[msgs.length - 1].querySelector('.markdown, .prose') || msgs[msgs.length - 1]
+      : [...document.querySelectorAll('.markdown, .prose')].at(-1);
+    if (root) return markdownFromElement(root);
     return null;
+
+    function markdownFromElement(root) {
+      return cleanup([...root.childNodes].map(node => block(node, 0)).join('')) || root.innerText.trim();
+    }
+
+    function cleanup(value) {
+      return value
+        .replace(/\u00a0/g, ' ')
+        .replace(/[ \t]+\n/g, '\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+    }
+
+    function inlineChildren(el) {
+      return [...el.childNodes].map(inline).join('');
+    }
+
+    function inline(node) {
+      if (node.nodeType === Node.TEXT_NODE) return node.textContent || '';
+      if (node.nodeType !== Node.ELEMENT_NODE) return '';
+
+      const el = node;
+      const tag = el.tagName.toLowerCase();
+      if (tag === 'br') return '\n';
+      if (tag === 'button' || tag === 'svg') return '';
+      if (tag === 'code' && !el.closest('pre')) return `\`${el.textContent || ''}\``;
+      if (tag === 'strong' || tag === 'b') return `**${inlineChildren(el).trim()}**`;
+      if (tag === 'em' || tag === 'i') return `*${inlineChildren(el).trim()}*`;
+      if (tag === 'a') {
+        const text = inlineChildren(el).trim() || el.href;
+        return el.href ? `[${text}](${el.href})` : text;
+      }
+      return inlineChildren(el);
+    }
+
+    function block(node, depth) {
+      if (node.nodeType === Node.TEXT_NODE) return node.textContent || '';
+      if (node.nodeType !== Node.ELEMENT_NODE) return '';
+
+      const el = node;
+      const tag = el.tagName.toLowerCase();
+      if (tag === 'button' || tag === 'svg' || tag === 'style' || tag === 'script') return '';
+      if (/^h[1-6]$/.test(tag)) return `${'#'.repeat(Number(tag[1]))} ${inlineChildren(el).trim()}\n\n`;
+      if (tag === 'p') return `${inlineChildren(el).trim()}\n\n`;
+      if (tag === 'pre') return codeBlock(el);
+      if (tag === 'blockquote') return quoteBlock(el, depth);
+      if (tag === 'ul') return listBlock(el, depth, false);
+      if (tag === 'ol') return listBlock(el, depth, true);
+      if (tag === 'table') return tableBlock(el);
+      if (tag === 'hr') return '---\n\n';
+      if (tag === 'li') return listItem(el, depth, '-');
+      if (tag === 'div' || tag === 'section' || tag === 'article') {
+        return [...el.childNodes].map(child => block(child, depth)).join('');
+      }
+      return `${inline(el).trim()}\n\n`;
+    }
+
+    function codeBlock(el) {
+      const code = el.querySelector('code');
+      const codeText = (code ? code.innerText || code.textContent : el.innerText || el.textContent || '').trimEnd();
+      const firstLine = (el.innerText || '').split('\n').map(line => line.trim()).find(Boolean) || '';
+      const language = firstLine && !codeText.trimStart().startsWith(firstLine) && /^[a-zA-Z0-9_+#.-]{1,30}$/.test(firstLine)
+        ? firstLine.toLowerCase()
+        : '';
+      return `\`\`\`${language}\n${codeText}\n\`\`\`\n\n`;
+    }
+
+    function quoteBlock(el, depth) {
+      const text = cleanup([...el.childNodes].map(child => block(child, depth)).join(''));
+      return `${text.split('\n').map(line => `> ${line}`).join('\n')}\n\n`;
+    }
+
+    function listBlock(el, depth, ordered) {
+      const items = [...el.children].filter(child => child.tagName.toLowerCase() === 'li');
+      return `${items.map((item, index) => listItem(item, depth, ordered ? `${index + 1}.` : '*')).join('')}\n`;
+    }
+
+    function listItem(el, depth, marker) {
+      const indent = '  '.repeat(depth);
+      const nested = [];
+      const parts = [];
+      for (const child of el.childNodes) {
+        if (child.nodeType === Node.ELEMENT_NODE && ['ul', 'ol'].includes(child.tagName.toLowerCase())) {
+          nested.push(block(child, depth + 1).trimEnd());
+          continue;
+        }
+        const text = child.nodeType === Node.ELEMENT_NODE && child.tagName.toLowerCase() === 'p'
+          ? inlineChildren(child).trim()
+          : cleanup(block(child, depth));
+        if (text) parts.push(text);
+      }
+      const head = `${indent}${marker} ${parts.join('\n').trim()}\n`;
+      return nested.length ? `${head}${nested.join('\n')}\n` : head;
+    }
+
+    function tableBlock(el) {
+      const rows = [...el.querySelectorAll('tr')].map(row => [...row.children].map(cell => cleanup(cell.innerText || '')));
+      if (rows.length === 0) return '';
+      const header = rows[0];
+      const separator = header.map(() => '---');
+      return `${[header, separator, ...rows.slice(1)].map(row => `| ${row.join(' | ')} |`).join('\n')}\n\n`;
+    }
   });
+}
+
+async function downloadAssistantFiles(page, downloadDir, log) {
+  fs.mkdirSync(downloadDir, { recursive: true });
+  const client = await page.target().createCDPSession();
+  await client.send('Page.setDownloadBehavior', { behavior: 'allow', downloadPath: downloadDir });
+
+  const files = await page.evaluate(() => {
+    const msg = [...document.querySelectorAll('[data-message-author-role="assistant"]')].at(-1);
+    if (!msg) return [];
+    return [...msg.querySelectorAll('button')]
+      .map((button, index) => ({
+        index,
+        text: (button.innerText || button.textContent || '').trim().replace(/^(download|下载)\s+/i, ''),
+        aria: button.getAttribute('aria-label') || '',
+        className: button.className || '',
+      }))
+      .filter(button =>
+        button.text &&
+        !button.aria &&
+        /behavior-btn|entity-underline/.test(button.className) &&
+        /\.[a-z0-9]{1,12}$/i.test(button.text)
+      );
+  });
+
+  const downloaded = [];
+  for (const file of files) {
+    log(`Downloading generated file: ${file.text}`);
+    const before = snapshotDownloadDir(downloadDir);
+    await page.evaluate(index => {
+      const msg = [...document.querySelectorAll('[data-message-author-role="assistant"]')].at(-1);
+      const button = msg ? [...msg.querySelectorAll('button')][index] : undefined;
+      button?.scrollIntoView({ block: 'center' });
+      button?.click();
+    }, file.index);
+    downloaded.push({ name: file.text, path: await waitForDownloadedFile(downloadDir, before, file.text) });
+  }
+  return downloaded;
+}
+
+function snapshotDownloadDir(downloadDir) {
+  if (!fs.existsSync(downloadDir)) return new Map();
+  return new Map(
+    fs.readdirSync(downloadDir)
+      .filter(name => !name.endsWith('.crdownload') && !name.endsWith('.tmp'))
+      .map(name => {
+        const stat = fs.statSync(path.join(downloadDir, name));
+        return [name, `${stat.size}:${stat.mtimeMs}`];
+      })
+  );
+}
+
+async function waitForDownloadedFile(downloadDir, before, expectedName) {
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 500));
+    const active = fs.readdirSync(downloadDir).some(name => name.endsWith('.crdownload') || name.endsWith('.tmp'));
+    if (active) continue;
+
+    const current = snapshotDownloadDir(downloadDir);
+    const expected = current.get(expectedName);
+    if (expected && expected !== before.get(expectedName)) return path.join(downloadDir, expectedName);
+
+    for (const [name, marker] of current) {
+      if (marker !== before.get(name)) return path.join(downloadDir, name);
+    }
+  }
+  throw new Error(`Timed out waiting for generated file download: ${expectedName}`);
+}
+
+function formatResponse(result) {
+  if (!result.downloads || result.downloads.length === 0) return result.response;
+  return [
+    result.response,
+    'Downloaded files:',
+    ...result.downloads.map(file => `- ${file.name}: ${file.path}`),
+  ].join('\n\n');
 }
 
 // ─── Daemon process ───────────────────────────────────────────────────────────
@@ -368,8 +548,8 @@ async function startDaemonProcess() {
       let body = '';
       req.on('data', chunk => (body += chunk));
       req.on('end', async () => {
-        const { fullPrompt, codeOnly, newChat, uploadPath } = JSON.parse(body);
-        log(`ask: newChat=${newChat} codeOnly=${codeOnly} upload=${uploadPath||'none'} len=${fullPrompt.length}`);
+        const { fullPrompt, codeOnly, newChat, uploadPath, downloadDir } = JSON.parse(body);
+        log(`ask: newChat=${newChat} codeOnly=${codeOnly} upload=${uploadPath||'none'} download=${downloadDir||'none'} len=${fullPrompt.length}`);
 
         try {
           const currentUrl = page.url();
@@ -429,9 +609,11 @@ async function startDaemonProcess() {
           const raw = await extractLastAssistantMessage(page);
           if (!raw) throw new Error('Could not extract response from page');
 
+          const downloads = downloadDir ? await downloadAssistantFiles(page, path.resolve(downloadDir), log) : [];
+
           const output = codeOnly ? extractCodeBlocks(raw) : raw;
           log(`Done: ${output.length} chars`);
-          send(200, { ok: true, response: output });
+          send(200, { ok: true, response: output, downloads });
         } catch (err) {
           log(`Error: ${err.message}`);
           send(500, { ok: false, error: err.message });
@@ -568,7 +750,7 @@ function parseArgs(argv) {
   const args = argv.slice(2);
   const opts = {
     login: false, codeOnly: false, file: null, upload: null, save: null,
-    git: false, context: null, newChat: false, stop: false, status: false, raw: false,
+    git: false, context: null, newChat: false, stop: false, status: false, raw: false, downloadDir: null,
     daemonInternal: false, cwd: null, prompt: [],
   };
   for (let i = 0; i < args.length; i++) {
@@ -584,6 +766,7 @@ function parseArgs(argv) {
       case '--file':            opts.file    = args[++i];    break;
       case '--upload':          opts.upload  = args[++i];    break;
       case '--save':            opts.save    = args[++i];    break;
+      case '--download-dir':    opts.downloadDir = args[++i]; break;
       case '--context':         opts.context = args[++i];    break;
       case '--cwd':             opts.cwd     = args[++i];    break;
       default:                  opts.prompt.push(args[i]);
@@ -601,6 +784,7 @@ Usage:
   node chatgpt.js --code "write fizzbuzz in Go"         # extract code blocks only
   node chatgpt.js --file <path> "prompt"                # paste file content as text in prompt
   node chatgpt.js --upload <path> "prompt"              # upload file via ChatGPT attachment button
+  node chatgpt.js --download-dir <dir> "prompt"          # download generated ChatGPT files
   node chatgpt.js --save <path> "prompt"                # save response to a file
   node chatgpt.js --raw "prompt"                         # print response text only
   node chatgpt.js --git "write a commit message"        # attach git diff/status
@@ -662,17 +846,19 @@ Usage:
     const result = await httpPost(port, '/ask', {
       fullPrompt, codeOnly: opts.codeOnly, newChat: opts.newChat,
       uploadPath: opts.upload || null,
+      downloadDir: opts.downloadDir || null,
     });
     if (!result.ok) throw new Error(result.error || 'Daemon returned an error');
+    const responseText = formatResponse(result);
     if (opts.raw) {
-      console.log(result.response);
+      console.log(responseText);
     } else {
       console.log('\n--- RESPONSE ---');
-      console.log(result.response);
+      console.log(responseText);
       console.log('--- END ---\n');
     }
     if (opts.save) {
-      fs.writeFileSync(path.resolve(opts.save), result.response, 'utf8');
+      fs.writeFileSync(path.resolve(opts.save), responseText, 'utf8');
       console.error(`[*] Response saved to: ${path.resolve(opts.save)}`);
     }
   } catch (err) {

@@ -175,6 +175,7 @@ Inputs:
   "newChat": true,
   "codeOnly": false,
   "file": "F:\\absolute\\path\\file.txt",
+  "downloadDir": "F:\\optional\\download\\directory",
   "savePath": "F:\\absolute\\path\\answer.txt"
 }
 ```
@@ -183,6 +184,18 @@ Inputs:
 `git diff HEAD` from the OpenCode working directory.
 
 `file` uploads a local file through the ChatGPT attachment input.
+
+`downloadDir` downloads generated ChatGPT sandbox files from the last assistant
+message into the given local directory, then appends the downloaded file paths to
+the tool result. When omitted, MCP downloads to opencode's managed tool-output
+directory:
+
+```text
+${XDG_DATA_HOME:-~/.local/share}/opencode/tool-output/chatgpt-downloads
+```
+
+Override the default with `CHATGPT_DOWNLOAD_DIR` or
+`OPENCODE_CHATGPT_DOWNLOAD_DIR`.
 
 `savePath` writes the ChatGPT response to a local file. Calls with `savePath` do
 not use the short dedup cache, so each save request writes the requested file.
