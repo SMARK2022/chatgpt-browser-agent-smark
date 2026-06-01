@@ -34,29 +34,37 @@ puppeteer.use(StealthPlugin());
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const CHROME_PATH      = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
-const STATE_DIR        = path.join(__dirname, '.chatgpt-poc');
+const CHROME_PATH      = process.env.CHATGPT_BROWSER_PATH || 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
+const STATE_DIR        = path.resolve(process.env.CHATGPT_STATE_DIR || path.join(__dirname, '.chatgpt-poc'));
 const PROFILE_DIR      = path.join(STATE_DIR, 'profile');
 const SESSION_FILE     = path.join(STATE_DIR, 'session');
 const DAEMON_FILE      = path.join(STATE_DIR, 'daemon.json');
 const DAEMON_LOG       = path.join(STATE_DIR, 'daemon.log');
 const CHATGPT_URL      = 'https://chatgpt.com';
-const PROJECT_URL      = 'https://chatgpt.com/g/g-p-6a1b384bc3688191b5e2c522d45fbe20/project';
-const RESPONSE_TIMEOUT = 300_000; // 5 min — file analysis can be slow
+const PROJECT_URL      = process.env.CHATGPT_PROJECT_URL || 'https://chatgpt.com/g/g-p-6a1b384bc3688191b5e2c522d45fbe20/project';
+const RESPONSE_TIMEOUT = positiveIntEnv('CHATGPT_RESPONSE_TIMEOUT_MS', 300_000); // 5 min — file analysis can be slow
+const DAEMON_START_TIMEOUT = positiveIntEnv('CHATGPT_DAEMON_START_TIMEOUT_MS', 60_000);
 
 fs.mkdirSync(STATE_DIR, { recursive: true });
 
 // ─── System prompt ────────────────────────────────────────────────────────────
 
 const SYSTEM_PROMPT = `\
-You are a senior software engineer acting as a coding assistant.
-Rules:
-- Be concise. Code over explanation.
-- Write complete, working, production-quality code.
-- Match the language, style, and patterns of any provided code or context.
-- When fixing code show only the corrected version, no before/after commentary.
-- No disclaimers, caveats, or filler text.
-- If the task is ambiguous, pick the most reasonable interpretation and go.
+You are ChatGPT, an external assistant connected to opencode through the user's browser session.
+
+Work as a high-signal research and engineering collaborator. Use the provided
+code, diffs, logs, files, and task context together with your general knowledge
+and any available web or research capabilities.
+
+Prioritize:
+- accurate, current answers grounded in evidence;
+- practical debugging and implementation guidance;
+- broad ecosystem, documentation, issue, and repository research when useful;
+- concrete tradeoffs, risks, commands, code, or next steps when they help.
+
+Match the user's requested depth. Be concise when the answer is simple, and be
+thorough when research or analysis is needed. If information is uncertain, say
+what is uncertain and give the best supported path forward.
 ---
 `;
 
@@ -172,14 +180,27 @@ function launchBrowser() {
   });
 }
 
-function isProjectUrl(url) {
+function positiveIntEnv(name, fallback) {
+  const value = Number.parseInt(process.env[name] || '', 10);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function isProjectEntryUrl(url) {
   return url.startsWith(PROJECT_URL);
 }
 
-function readProjectSessionUrl() {
+function isChatSessionUrl(url) {
+  return url.startsWith(`${CHATGPT_URL}/c/`);
+}
+
+function isAllowedChatUrl(url) {
+  return isProjectEntryUrl(url) || isChatSessionUrl(url);
+}
+
+function readChatSessionUrl() {
   if (!fs.existsSync(SESSION_FILE)) return null;
   const url = fs.readFileSync(SESSION_FILE, 'utf8').trim();
-  return isProjectUrl(url) ? url : null;
+  return isAllowedChatUrl(url) ? url : null;
 }
 
 // Single DOM operation — no keystroke simulation, no chunking, no delay.
@@ -285,11 +306,11 @@ async function startDaemonProcess() {
     browser = await launchBrowser();
     page    = await browser.newPage();
 
-    const initUrl = readProjectSessionUrl() || PROJECT_URL;
+    const initUrl = readChatSessionUrl() || PROJECT_URL;
 
     log(`Navigating to ${initUrl}`);
     await page.goto(
-      isProjectUrl(initUrl) ? initUrl : PROJECT_URL,
+      isAllowedChatUrl(initUrl) ? initUrl : PROJECT_URL,
       { waitUntil: 'networkidle2', timeout: 30_000 }
     );
 
@@ -351,9 +372,9 @@ async function startDaemonProcess() {
           if (newChat) {
             log('Starting new project chat...');
             await page.goto(PROJECT_URL, { waitUntil: 'networkidle2', timeout: 30_000 });
-          } else if (!isProjectUrl(currentUrl)) {
-            // Tab drifted (e.g. browser opened a link) — restore to the MCP project.
-            const sessionUrl = readProjectSessionUrl() || PROJECT_URL;
+          } else if (!isAllowedChatUrl(currentUrl)) {
+            // Tab drifted (e.g. browser opened a link) — restore to the last ChatGPT conversation or project entry.
+            const sessionUrl = readChatSessionUrl() || PROJECT_URL;
             log(`Restoring tab to ${sessionUrl}`);
             await page.goto(sessionUrl, { waitUntil: 'networkidle2', timeout: 30_000 });
           }
@@ -396,7 +417,7 @@ async function startDaemonProcess() {
           await waitForStreamingDone(page, log, beforeCount);
 
           const finalUrl = page.url();
-          if (isProjectUrl(finalUrl)) {
+          if (isAllowedChatUrl(finalUrl)) {
             fs.writeFileSync(SESSION_FILE, finalUrl, 'utf8');
           }
 
@@ -493,7 +514,7 @@ async function ensureDaemon() {
   });
   child.unref();
 
-  const deadline = Date.now() + 45_000;
+  const deadline = Date.now() + DAEMON_START_TIMEOUT;
   while (Date.now() < deadline) {
     await new Promise(r => setTimeout(r, 1_000));
     state = readDaemonState();
@@ -542,7 +563,7 @@ function parseArgs(argv) {
   const args = argv.slice(2);
   const opts = {
     login: false, codeOnly: false, file: null, upload: null, save: null,
-    git: false, context: null, newChat: false, stop: false, status: false,
+    git: false, context: null, newChat: false, stop: false, status: false, raw: false,
     daemonInternal: false, cwd: null, prompt: [],
   };
   for (let i = 0; i < args.length; i++) {
@@ -553,6 +574,7 @@ function parseArgs(argv) {
       case '--new':             opts.newChat        = true;  break;
       case '--stop':            opts.stop           = true;  break;
       case '--status':          opts.status         = true;  break;
+      case '--raw':             opts.raw            = true;  break;
       case '--daemon-internal': opts.daemonInternal = true;  break;
       case '--file':            opts.file    = args[++i];    break;
       case '--upload':          opts.upload  = args[++i];    break;
@@ -575,6 +597,7 @@ Usage:
   node chatgpt.js --file <path> "prompt"                # paste file content as text in prompt
   node chatgpt.js --upload <path> "prompt"              # upload file via ChatGPT attachment button
   node chatgpt.js --save <path> "prompt"                # save response to a file
+  node chatgpt.js --raw "prompt"                         # print response text only
   node chatgpt.js --git "write a commit message"        # attach git diff/status
   node chatgpt.js --context "we use Fiber v2" "prompt"  # inline context
   cat error.log | node chatgpt.js "what is wrong"       # pipe input
@@ -636,9 +659,13 @@ Usage:
       uploadPath: opts.upload || null,
     });
     if (!result.ok) throw new Error(result.error || 'Daemon returned an error');
-    console.log('\n--- RESPONSE ---');
-    console.log(result.response);
-    console.log('--- END ---\n');
+    if (opts.raw) {
+      console.log(result.response);
+    } else {
+      console.log('\n--- RESPONSE ---');
+      console.log(result.response);
+      console.log('--- END ---\n');
+    }
     if (opts.save) {
       fs.writeFileSync(path.resolve(opts.save), result.response, 'utf8');
       console.error(`[*] Response saved to: ${path.resolve(opts.save)}`);

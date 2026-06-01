@@ -15,6 +15,7 @@ const readline      = require('readline');
 const path          = require('path');
 
 const SCRIPT = path.join(__dirname, 'chatgpt.js');
+const CHATGPT_CLI_TIMEOUT = positiveIntEnv('CHATGPT_CLI_TIMEOUT_MS', 310_000);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -22,30 +23,56 @@ function send(obj) {
   process.stdout.write(JSON.stringify(obj) + '\n');
 }
 
+function positiveIntEnv(name, fallback) {
+  const value = Number.parseInt(process.env[name] || '', 10);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function sendToolResult(id, result) {
+  const payload = { content: [{ type: 'text', text: result.text }] };
+  if (result.isError) payload.isError = true;
+  send({ jsonrpc: '2.0', id, result: payload });
+}
+
+function normalizeToolName(name) {
+  if (name === 'chatgpt_ask') return 'ask';
+  if (name === 'chatgpt_status') return 'status';
+  if (name === 'chatgpt_stop') return 'stop';
+  return name;
+}
+
 /**
  * Run chatgpt.js with the given args array.
- * Returns trimmed stdout (+ stderr on error).
+ * Returns trimmed stdout and marks non-zero process results as MCP tool errors.
  */
 function runChatgpt(args) {
   const result = spawnSync('node', [SCRIPT, ...args], {
     encoding:  'utf8',
-    timeout:   180_000,
+    timeout:   CHATGPT_CLI_TIMEOUT,
     maxBuffer: 10 * 1024 * 1024,
   });
-  if (result.error) return `Error: ${result.error.message}`;
   const out = (result.stdout || '').trim();
   const err = (result.stderr || '').trim();
-  return out || err || '(no output)';
+  if (result.error) return { text: `Error: ${result.error.message}`, isError: true };
+  if (result.status !== 0) {
+    return {
+      text: err || out || `Error: chatgpt.js exited with status ${result.status}`,
+      isError: true,
+    };
+  }
+  return { text: out || err || '(no output)', isError: false };
 }
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
 const TOOLS = [
   {
-    name: 'chatgpt_ask',
+    name: 'ask',
     description:
-      'Ask ChatGPT a question via chatgpt.com using a persistent browser. ' +
-      'Useful as a second opinion or when the main model\'s knowledge may be stale. ' +
+      'Ask ChatGPT via the user\'s logged-in chatgpt.com browser session. ' +
+      'Use for web-backed research, current documentation, ecosystem and issue investigation, ' +
+      'repository or architecture research, debugging ideas, implementation guidance, ' +
+      'summarization, comparison, and other tasks where ChatGPT\'s web/project context can help. ' +
       'The daemon auto-starts on first use and stays alive between calls.',
     inputSchema: {
       type: 'object',
@@ -64,7 +91,7 @@ const TOOLS = [
         },
         git: {
           type: 'boolean',
-          description: 'If true, attach git diff/log from the current working directory as context',
+          description: 'If true, attach git status and diff from the current working directory as context',
         },
         newChat: {
           type: 'boolean',
@@ -83,12 +110,12 @@ const TOOLS = [
     },
   },
   {
-    name: 'chatgpt_status',
+    name: 'status',
     description: 'Check whether the ChatGPT browser daemon is currently running.',
     inputSchema: { type: 'object', properties: {} },
   },
   {
-    name: 'chatgpt_stop',
+    name: 'stop',
     description: 'Shut down the ChatGPT browser daemon and close the browser.',
     inputSchema: { type: 'object', properties: {} },
   },
@@ -113,12 +140,14 @@ function cacheKey(args) {
 }
 
 function cacheGet(args) {
+  if (args.savePath) return null;
   const hit = cache.get(cacheKey(args));
   if (hit && Date.now() - hit.ts < CACHE_TTL) return hit.text;
   return null;
 }
 
 function cachePut(args, text) {
+  if (args.savePath) return;
   cache.set(cacheKey(args), { text, ts: Date.now() });
   // Evict stale entries
   for (const [k, v] of cache) {
@@ -156,22 +185,20 @@ function handleRequest(req) {
 
   // ── Tool invocation ────────────────────────────────────────────────────────
   if (method === 'tools/call') {
-    const name = params && params.name;
+    const name = normalizeToolName(params && params.name);
     const args = (params && params.arguments) || {};
 
-    if (name === 'chatgpt_status') {
-      const text = runChatgpt(['--status']);
-      send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }] } });
+    if (name === 'status') {
+      sendToolResult(id, runChatgpt(['--status']));
       return;
     }
 
-    if (name === 'chatgpt_stop') {
-      const text = runChatgpt(['--stop']);
-      send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }] } });
+    if (name === 'stop') {
+      sendToolResult(id, runChatgpt(['--stop']));
       return;
     }
 
-    if (name === 'chatgpt_ask') {
+    if (name === 'ask') {
       // Return cached result if same prompt was called recently
       const cached = cacheGet(args);
       if (cached) {
@@ -179,7 +206,7 @@ function handleRequest(req) {
         return;
       }
 
-      const flags = [];
+      const flags = ['--raw'];
       if (args.newChat)  flags.push('--new');
       if (args.codeOnly) flags.push('--code');
       if (args.git) {
@@ -192,9 +219,9 @@ function handleRequest(req) {
       if (args.savePath) flags.push('--save',    args.savePath);
       flags.push(args.prompt);
 
-      const text = runChatgpt(flags);
-      cachePut(args, text);
-      send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }] } });
+      const result = runChatgpt(flags);
+      if (!result.isError) cachePut(args, result.text);
+      sendToolResult(id, result);
       return;
     }
 

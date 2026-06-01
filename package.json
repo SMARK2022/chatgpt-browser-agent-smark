@@ -4,7 +4,11 @@
   "description": "Persistent browser daemon + MCP server + agentic loop that routes prompts to chatgpt.com — no API key required",
   "main": "chatgpt.js",
   "scripts": {
-    "start": "node chatgpt.js"
+    "start": "node chatgpt.js",
+    "login": "node chatgpt.js --login",
+    "status": "node chatgpt.js --status",
+    "stop": "node chatgpt.js --stop",
+    "mcp": "node mcp-server.js"
   },
   "dependencies": {
     "puppeteer-core": "^22.0.0",

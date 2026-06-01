@@ -15,7 +15,9 @@
  *   --files  f1,f2,...   Seed files to include upfront (optional)
  *   --check  "cmd"       Command to run after applying changes (e.g. "go build ./...")
  *   --cwd    /path       Working directory (default: process.cwd())
- *   --auto               Apply file changes without confirmation prompts
+ *   --auto               Apply commands and file changes without confirmation prompts
+ *   --i-understand-this-runs-chatgpt-generated-commands
+ *                        Required with --auto
  *
  * Example:
  *   node agent.js --check "go build ./..." --cwd ~/GolandProjects/steroidCycleTracker \
@@ -35,12 +37,13 @@ const MAX_TURNS = 20; // safety cap on autonomous turns
 // ─── CLI parsing ───────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const args = { files: [], check: null, cwd: process.cwd(), auto: false, task: null };
+  const args = { files: [], check: null, cwd: process.cwd(), auto: false, unsafeAuto: false, task: null };
   for (let i = 0; i < argv.length; i++) {
     if      (argv[i] === '--files') args.files = argv[++i].split(',').map(s => s.trim());
     else if (argv[i] === '--check') args.check = argv[++i];
     else if (argv[i] === '--cwd')   args.cwd   = path.resolve(argv[++i]);
     else if (argv[i] === '--auto')  args.auto  = true;
+    else if (argv[i] === '--i-understand-this-runs-chatgpt-generated-commands') args.unsafeAuto = true;
     else                            args.task  = argv[i];
   }
   return args;
@@ -209,6 +212,14 @@ async function main() {
     console.error(
       'Usage: node agent.js [--files f1,f2] [--check "cmd"] [--cwd /path] [--auto] "task"\n' +
       'Example: node agent.js --check "go build ./..." --cwd ~/project "add validation to createUserHandler"'
+    );
+    process.exit(1);
+  }
+
+  if (args.auto && !args.unsafeAuto) {
+    console.error(
+      '--auto runs ChatGPT-generated shell commands and file writes without per-action confirmation.\n' +
+      'Add --i-understand-this-runs-chatgpt-generated-commands if you intentionally want unattended execution.'
     );
     process.exit(1);
   }
