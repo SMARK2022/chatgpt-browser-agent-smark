@@ -187,11 +187,10 @@ Inputs:
 
 `downloadDir` downloads generated ChatGPT sandbox files from the last assistant
 message into the given local directory, then appends the downloaded file paths to
-the tool result. When omitted, MCP downloads to opencode's managed tool-output
-directory:
+the tool result. When omitted, MCP downloads to the current OpenCode project cache:
 
 ```text
-${XDG_DATA_HOME:-~/.local/share}/opencode/tool-output/chatgpt-downloads
+<current-project>/.opencode/cache/chatgpt-downloads
 ```
 
 Override the default with `CHATGPT_DOWNLOAD_DIR` or

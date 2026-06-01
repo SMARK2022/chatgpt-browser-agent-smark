@@ -177,6 +177,7 @@ function launchBrowser() {
       '--disable-extensions-except=',
     ],
     defaultViewport: null,
+    protocolTimeout: RESPONSE_TIMEOUT,
   });
 }
 
@@ -298,7 +299,8 @@ async function extractLastAssistantMessage(page) {
     return null;
 
     function markdownFromElement(root) {
-      return cleanup([...root.childNodes].map(node => block(node, 0)).join('')) || root.innerText.trim();
+      const text = cleanup([...root.childNodes].map(node => block(node, 0)).join(''));
+      return normalizeReferences(text, root) || root.innerText.trim();
     }
 
     function cleanup(value) {
@@ -319,6 +321,7 @@ async function extractLastAssistantMessage(page) {
 
       const el = node;
       const tag = el.tagName.toLowerCase();
+      if (el.getAttribute('data-testid') === 'webpage-citation-pill' || el.closest('[data-testid="webpage-citation-pill"]')) return '';
       if (tag === 'br') return '\n';
       if (tag === 'button' || tag === 'svg') return '';
       if (tag === 'code' && !el.closest('pre')) return `\`${el.textContent || ''}\``;
@@ -326,9 +329,43 @@ async function extractLastAssistantMessage(page) {
       if (tag === 'em' || tag === 'i') return `*${inlineChildren(el).trim()}*`;
       if (tag === 'a') {
         const text = inlineChildren(el).trim() || el.href;
-        return el.href ? `[${text}](${el.href})` : text;
+        return el.href ? `[${text}](${cleanHref(el.href, text)})` : text;
       }
       return inlineChildren(el);
+    }
+
+    function normalizeReferences(markdown, root) {
+      const labels = new Map(
+        [...root.querySelectorAll('[data-testid="webpage-citation-pill"] a[href]')]
+          .map(link => [cleanHref(link.href, link.textContent || ''), cleanup(link.textContent || '')])
+          .filter(([, label]) => label)
+      );
+      return markdown.replace(/^\[(\d+)\]\s+\[(https?:\/\/[^\]]+)\]\((https?:\/\/[^)]+)\)$/gm, (_, index, text, href) => {
+        const clean = cleanHref(href, text);
+        return `[${index}] [${labels.get(clean) || shortLinkLabel(clean)}](${clean})`;
+      });
+    }
+
+    function shortLinkLabel(href) {
+      try {
+        const url = new URL(href);
+        return url.hostname.replace(/^www\./, '');
+      } catch {
+        return href;
+      }
+    }
+
+    function cleanHref(href, text) {
+      try {
+        const url = new URL(href);
+        for (const key of [...url.searchParams.keys()]) {
+          if (key.toLowerCase().startsWith('utm_')) url.searchParams.delete(key);
+        }
+        const cleaned = url.toString();
+        return /^https?:\/\//.test(text) ? text : cleaned;
+      } catch {
+        return href;
+      }
     }
 
     function block(node, depth) {
