@@ -66,8 +66,9 @@ CHATGPT_RESPONSE_TIMEOUT_MS       Browser response wait timeout, default 300000
 CHATGPT_CLI_TIMEOUT_MS            MCP wrapper CLI timeout, default 310000
 CHATGPT_DAEMON_START_TIMEOUT_MS   Daemon startup timeout, default 60000
 CHATGPT_FILE_UPLOAD_TIMEOUT_MS    Wait timeout for ChatGPT file upload readiness, default 180000
-CHATGPT_AUTOSAVE_RESPONSE_CHARS   Auto-save response threshold, default 12000
-CHATGPT_AUTOSAVE_PREVIEW_CHARS    Preview length returned after auto-save, default 4000
+CHATGPT_MAX_RETURN_CHARS          Safe response return threshold, default 6000
+CHATGPT_RESPONSE_PREVIEW_CHARS    Preview length returned after local save, default 4000
+CHATGPT_MCP_MAX_RETURN_CHARS      Final MCP wrapper output cap, default 8000
 ```
 
 `CHATGPT_PROJECT` is deployment configuration, not an MCP model parameter. The
@@ -155,8 +156,9 @@ Use project-local config, for example `.opencode/opencode.jsonc`:
         "CHATGPT_CLI_TIMEOUT_MS": "580000",
         "CHATGPT_DAEMON_START_TIMEOUT_MS": "60000",
         "CHATGPT_FILE_UPLOAD_TIMEOUT_MS": "180000",
-        "CHATGPT_AUTOSAVE_RESPONSE_CHARS": "12000",
-        "CHATGPT_AUTOSAVE_PREVIEW_CHARS": "4000"
+        "CHATGPT_MAX_RETURN_CHARS": "6000",
+        "CHATGPT_RESPONSE_PREVIEW_CHARS": "4000",
+        "CHATGPT_MCP_MAX_RETURN_CHARS": "8000"
       },
       "enabled": true,
       "timeout": 620000
@@ -230,9 +232,10 @@ Generated ChatGPT sandbox/download files are always saved under:
 The model does not control the output directories. The tool returns saved and
 downloaded file paths plus the `Session: #xxxxxx` handle.
 
-Long responses are auto-saved even when `saveToFile` is omitted. In that case the
-tool returns a preview and the saved file path, avoiding OpenCode tool-output
-truncation while preserving the complete answer locally.
+Long responses are saved before returning to OpenCode even when `saveToFile` is
+omitted. In that case the tool returns a bounded preview, the saved file path,
+line count, character count, and `Session: #xxxxxx`. This avoids OpenCode's own
+tool-output truncation path while preserving the complete answer locally.
 
 ## MCP Error Semantics
 

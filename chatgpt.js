@@ -48,8 +48,8 @@ const DEFAULT_PROJECT  = process.env.CHATGPT_PROJECT || process.env.CHATGPT_PROJ
 const RESPONSE_TIMEOUT = positiveIntEnv('CHATGPT_RESPONSE_TIMEOUT_MS', 300_000); // 5 min — file analysis can be slow
 const DAEMON_START_TIMEOUT = positiveIntEnv('CHATGPT_DAEMON_START_TIMEOUT_MS', 60_000);
 const FILE_UPLOAD_TIMEOUT = positiveIntEnv('CHATGPT_FILE_UPLOAD_TIMEOUT_MS', 180_000);
-const AUTO_SAVE_RESPONSE_CHARS = positiveIntEnv('CHATGPT_AUTOSAVE_RESPONSE_CHARS', 12_000);
-const AUTO_SAVE_PREVIEW_CHARS = positiveIntEnv('CHATGPT_AUTOSAVE_PREVIEW_CHARS', 4_000);
+const MAX_RETURN_CHARS = positiveIntEnv('CHATGPT_MAX_RETURN_CHARS', 6_000);
+const RESPONSE_PREVIEW_CHARS = positiveIntEnv('CHATGPT_RESPONSE_PREVIEW_CHARS', 4_000);
 
 // 运行状态和会话索引分离：浏览器 profile/daemon 放插件状态目录，#xxxxxx 会话索引放用户级 opencode 数据目录。
 fs.mkdirSync(STATE_DIR, { recursive: true });
@@ -355,7 +355,19 @@ function saveResponseToFile(text, workspaceDir, sessionID) {
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, timestampName('md'));
   fs.writeFileSync(file, text, 'utf8');
-  return file;
+  return { path: file, ...textStats(text) };
+}
+
+function textStats(text) {
+  return {
+    chars: text.length,
+    lines: text ? text.split(/\r\n|\r|\n/).length : 0,
+  };
+}
+
+function previewResponse(text) {
+  if (text.length <= RESPONSE_PREVIEW_CHARS) return text;
+  return `${text.slice(0, RESPONSE_PREVIEW_CHARS).trimEnd()}\n\n[Preview truncated locally before returning to OpenCode.]`;
 }
 
 async function resolveProject(page, requested, log) {
@@ -790,7 +802,14 @@ async function waitForDownloadedFile(downloadDir, before, expectedName) {
 function formatResponse(result) {
   return [
     result.response || null,
-    result.savedResponse ? `Response saved to:\n${result.savedResponse}` : null,
+    result.savedResponse
+      ? [
+          'Response saved to:',
+          result.savedResponse.path,
+          `Lines: ${result.savedResponse.lines}`,
+          `Characters: ${result.savedResponse.chars}`,
+        ].join('\n')
+      : null,
     result.downloads && result.downloads.length > 0
       ? ['Downloaded files:', ...result.downloads.map(file => `- ${file.name}: ${file.path}`)].join('\n')
       : null,
@@ -909,12 +928,12 @@ async function startDaemonProcess() {
           fs.mkdirSync(dirs.downloads, { recursive: true });
           // 下载目录不暴露给模型，始终写到当前项目 cache，避免全局目录堆积生成物。
           const downloads = await downloadAssistantFiles(page, dirs.downloads, log);
-          const autoSave = !saveToFile && raw.length > AUTO_SAVE_RESPONSE_CHARS;
+          const autoSave = !saveToFile && raw.length > MAX_RETURN_CHARS;
           const savedResponse = saveToFile || autoSave ? saveResponseToFile(raw, workspaceDir, sessionID) : null;
           const response = saveToFile
             ? ''
             : autoSave
-              ? `${raw.slice(0, AUTO_SAVE_PREVIEW_CHARS).trimEnd()}\n\n[Full response auto-saved because it was ${raw.length} characters.]`
+              ? `${previewResponse(raw)}\n\n[Full response saved locally before returning to OpenCode. Lines: ${savedResponse.lines}; Characters: ${savedResponse.chars}.]`
               : raw;
 
           log(`Done: ${raw.length} chars`);

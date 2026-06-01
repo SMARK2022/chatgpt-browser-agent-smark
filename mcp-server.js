@@ -17,6 +17,7 @@ const path          = require('path');
 const SCRIPT = path.join(__dirname, 'chatgpt.js');
 const CHATGPT_CLI_TIMEOUT = positiveIntEnv('CHATGPT_CLI_TIMEOUT_MS', 310_000);
 const CHATGPT_STOP_TIMEOUT = positiveIntEnv('CHATGPT_STOP_TIMEOUT_MS', 30_000);
+const MCP_MAX_RETURN_CHARS = positiveIntEnv('CHATGPT_MCP_MAX_RETURN_CHARS', 8_000);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -30,9 +31,15 @@ function positiveIntEnv(name, fallback) {
 }
 
 function sendToolResult(id, result) {
-  const payload = { content: [{ type: 'text', text: result.text }] };
+  const payload = { content: [{ type: 'text', text: limitToolText(result.text) }] };
   if (result.isError) payload.isError = true;
   send({ jsonrpc: '2.0', id, result: payload });
+}
+
+function limitToolText(text) {
+  const value = String(text || '');
+  if (value.length <= MCP_MAX_RETURN_CHARS) return value;
+  return `${value.slice(0, MCP_MAX_RETURN_CHARS).trimEnd()}\n\n[Output truncated by chatgpt MCP wrapper before reaching OpenCode. Characters returned: ${MCP_MAX_RETURN_CHARS}; original characters: ${value.length}.]`;
 }
 
 function normalizeToolName(name) {
