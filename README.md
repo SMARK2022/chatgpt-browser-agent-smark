@@ -59,23 +59,43 @@ Runtime behavior is controlled by environment variables:
 
 ```text
 CHATGPT_BROWSER_PATH              Browser executable path
-CHATGPT_PROJECT_URL               ChatGPT Project URL to open for new chats
-CHATGPT_STATE_DIR                 Profile, session, daemon, and log directory
+CHATGPT_PROJECT                   Fixed ChatGPT Project name, id, or URL
+CHATGPT_STATE_DIR                 Browser profile, project cache, daemon, and log directory
+CHATGPT_SESSION_DIR               Optional user-level #xxxxxx session registry directory
 CHATGPT_RESPONSE_TIMEOUT_MS       Browser response wait timeout, default 300000
 CHATGPT_CLI_TIMEOUT_MS            MCP wrapper CLI timeout, default 310000
 CHATGPT_DAEMON_START_TIMEOUT_MS   Daemon startup timeout, default 60000
 ```
 
-If `CHATGPT_PROJECT_URL` is set, new chats start from that Project page. The
-current local setup uses the ChatGPT Project named `MCP`.
+`CHATGPT_PROJECT` is deployment configuration, not an MCP model parameter. The
+daemon resolves it once as the fixed ChatGPT Project used for all sessions. It
+can be a short project name such as `MCP`, a project id such as `g-p-...`, or a
+full Project URL. If name resolution is unreliable, use the full Project URL.
+
+`CHATGPT_SESSION_DIR` stores the global `#xxxxxx -> ChatGPT conversation URL`
+registry. If omitted, the default user-level opencode data directory is used,
+for example `%LOCALAPPDATA%\opencode\chatgpt-browser-agent` on Windows.
 
 The state directory contains:
 
 ```text
 profile\       Dedicated browser profile
-session        Last ChatGPT conversation/project URL
+projects.json  Resolved Project name/id/url cache
 daemon.json    Current daemon pid and port
 daemon.log     Daemon startup/request logs
+```
+
+Current-project artifacts are stored separately from the global session registry:
+
+```text
+<current-project>/.opencode/cache/chatgpt/
+  responses/
+    #4fa92c/
+      2026-06-01T10-30-15Z.md
+  downloads/
+    #4fa92c/
+      story.txt
+      result.csv
 ```
 
 ## First Login
@@ -96,13 +116,13 @@ Enter in the terminal.
 ## CLI Usage
 
 ```powershell
-node chatgpt.js --new "explain this error"
-node chatgpt.js --raw --new "Reply exactly: OK"
-node chatgpt.js --code "write a binary search in Go"
+node chatgpt.js "explain this error"
+node chatgpt.js --session-id #4fa92c "continue the previous research"
+node chatgpt.js --raw "Reply exactly: OK"
 node chatgpt.js --context "project uses Effect v4" "review this approach"
 node chatgpt.js --git "summarize these local changes"
 node chatgpt.js --upload F:\path\to\file.txt "analyze this file"
-node chatgpt.js --save F:\path\to\answer.txt "write a migration plan"
+node chatgpt.js --save-to-file "write a long research report"
 node chatgpt.js --status
 node chatgpt.js --stop
 ```
@@ -126,7 +146,7 @@ Use project-local config, for example `.opencode/opencode.jsonc`:
       ],
       "environment": {
         "CHATGPT_BROWSER_PATH": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
-        "CHATGPT_PROJECT_URL": "https://chatgpt.com/g/g-p-6a1b384bc3688191b5e2c522d45fbe20/project",
+        "CHATGPT_PROJECT": "MCP",
         "CHATGPT_STATE_DIR": "F:\\ML\\PythonAIProject\\Claude-Code\\opencode\\.temp\\chatgpt-browser-agent\\.chatgpt-poc",
         "CHATGPT_RESPONSE_TIMEOUT_MS": "300000",
         "CHATGPT_CLI_TIMEOUT_MS": "310000",
@@ -170,34 +190,38 @@ Inputs:
 ```json
 {
   "prompt": "The question or task to send to ChatGPT",
+  "sessionID": "#4fa92c",
   "context": "Optional additional context",
   "git": true,
-  "newChat": true,
-  "codeOnly": false,
   "file": "F:\\absolute\\path\\file.txt",
-  "downloadDir": "F:\\optional\\download\\directory",
-  "savePath": "F:\\absolute\\path\\answer.txt"
+  "saveToFile": true
 }
 ```
+
+`sessionID` is a global short handle for a ChatGPT conversation, such as
+`#4fa92c`. Omit it to create a new session; pass an existing ID to continue that
+conversation from any OpenCode working directory.
 
 `git: true` attaches `git branch --show-current`, `git status --short`, and
 `git diff HEAD` from the OpenCode working directory.
 
 `file` uploads a local file through the ChatGPT attachment input.
 
-`downloadDir` downloads generated ChatGPT sandbox files from the last assistant
-message into the given local directory, then appends the downloaded file paths to
-the tool result. When omitted, MCP downloads to the current OpenCode project cache:
+`saveToFile: true` saves the text response to the current project cache and
+returns only metadata instead of the full response body:
 
 ```text
-<current-project>/.opencode/cache/chatgpt-downloads
+<current-project>/.opencode/cache/chatgpt/responses/<sessionID>/<timestamp>.md
 ```
 
-Override the default with `CHATGPT_DOWNLOAD_DIR` or
-`OPENCODE_CHATGPT_DOWNLOAD_DIR`.
+Generated ChatGPT sandbox/download files are always saved under:
 
-`savePath` writes the ChatGPT response to a local file. Calls with `savePath` do
-not use the short dedup cache, so each save request writes the requested file.
+```text
+<current-project>/.opencode/cache/chatgpt/downloads/<sessionID>/
+```
+
+The model does not control the output directories. The tool returns saved and
+downloaded file paths plus the `Session: #xxxxxx` handle.
 
 ## MCP Error Semantics
 

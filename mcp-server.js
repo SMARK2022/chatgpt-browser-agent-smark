@@ -2,7 +2,7 @@
 /**
  * mcp-server.js — MCP stdio server wrapping the chatgpt daemon
  *
- * Registered in ~/.config/opencode/opencode.json so the chatgpt tools
+ * Registered in project-local .opencode/opencode.jsonc so the chatgpt tools
  * appear in OpenCode's MCP tools panel alongside other MCP servers.
  *
  * Protocol: JSON-RPC 2.0 over stdin/stdout (MCP stdio transport).
@@ -39,12 +39,6 @@ function normalizeToolName(name) {
   if (name === 'chatgpt_status') return 'status';
   if (name === 'chatgpt_stop') return 'stop';
   return name;
-}
-
-function defaultDownloadDir() {
-  if (process.env.CHATGPT_DOWNLOAD_DIR) return path.resolve(process.env.CHATGPT_DOWNLOAD_DIR);
-  if (process.env.OPENCODE_CHATGPT_DOWNLOAD_DIR) return path.resolve(process.env.OPENCODE_CHATGPT_DOWNLOAD_DIR);
-  return path.join(process.cwd(), '.opencode', 'cache', 'chatgpt-downloads');
 }
 
 /**
@@ -87,33 +81,25 @@ const TOOLS = [
           type: 'string',
           description: 'The question or task to send to ChatGPT',
         },
-        codeOnly: {
-          type: 'boolean',
-          description: 'If true, extract only code blocks from the response',
+        sessionID: {
+          type: 'string',
+          description: 'Optional global ChatGPT session handle like #4fa92c. Omit to create a new session; pass an existing ID to continue it.',
         },
         context: {
           type: 'string',
-          description: 'Additional context to prepend to the prompt',
+          description: 'Additional curated context to prepend to the prompt',
         },
         git: {
           type: 'boolean',
-          description: 'If true, attach git status and diff from the current working directory as context',
-        },
-        newChat: {
-          type: 'boolean',
-          description: 'If true, start a fresh conversation instead of continuing the last one',
+          description: 'If true, attach git branch, status, and diff from the current OpenCode working directory as context',
         },
         file: {
           type: 'string',
           description: 'Absolute path to a local file to upload to ChatGPT via the attachment button',
         },
-        savePath: {
-          type: 'string',
-          description: 'Absolute path where ChatGPT\'s response should be saved as a text file',
-        },
-        downloadDir: {
-          type: 'string',
-          description: 'Optional absolute directory for generated ChatGPT sandbox/download files. Defaults to the current project .opencode cache.',
+        saveToFile: {
+          type: 'boolean',
+          description: 'If true, save ChatGPT\'s text response under <current-project>/.opencode/cache/chatgpt/responses/<sessionID>/ and return only metadata.',
         },
       },
       required: ['prompt'],
@@ -130,40 +116,6 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: {} },
   },
 ];
-
-// ─── Dedup cache ──────────────────────────────────────────────────────────────
-// Prevents the model from hitting ChatGPT multiple times with the same prompt
-// within a short window (common when small models loop before outputting).
-
-const CACHE_TTL = 60_000; // 60 seconds
-const cache     = new Map(); // key → { text, ts }
-
-function cacheKey(args) {
-  return JSON.stringify({
-    p:  args.prompt    || '',
-    c:  args.context   || '',
-    nc: !!args.newChat,
-    co: !!args.codeOnly,
-    g:  !!args.git,
-    f:  args.file      || '',
-  });
-}
-
-function cacheGet(args) {
-  if (args.savePath) return null;
-  const hit = cache.get(cacheKey(args));
-  if (hit && Date.now() - hit.ts < CACHE_TTL) return hit.text;
-  return null;
-}
-
-function cachePut(args, text) {
-  if (args.savePath) return;
-  cache.set(cacheKey(args), { text, ts: Date.now() });
-  // Evict stale entries
-  for (const [k, v] of cache) {
-    if (Date.now() - v.ts > CACHE_TTL) cache.delete(k);
-  }
-}
 
 // ─── Request dispatcher ───────────────────────────────────────────────────────
 
@@ -209,30 +161,21 @@ function handleRequest(req) {
     }
 
     if (name === 'ask') {
-      // Return cached result if same prompt was called recently
-      const cached = cacheGet(args);
-      if (cached) {
-        send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: cached }] } });
-        return;
-      }
-
-      const flags = ['--raw'];
-      if (args.newChat)  flags.push('--new');
-      if (args.codeOnly) flags.push('--code');
+      // MCP schema 只暴露意图参数：会话句柄、上下文、git、上传文件和是否保存回答。
+      // project/new/download/save path 这些执行细节由本地 wrapper 固定处理。
+      const flags = ['--raw', '--workspace', process.cwd()];
+      if (args.sessionID)  flags.push('--session-id', args.sessionID);
+      if (args.saveToFile) flags.push('--save-to-file');
       if (args.git) {
         flags.push('--git');
-        // process.cwd() is the directory OpenCode was launched from — correct for git ops
+        // process.cwd() 是 OpenCode 启动目录，用它读取当前项目的 git 上下文。
         flags.push('--cwd', process.cwd());
       }
       if (args.context)  flags.push('--context', args.context);
       if (args.file)     flags.push('--upload',  args.file);
-      flags.push('--download-dir', args.downloadDir || defaultDownloadDir());
-      if (args.savePath) flags.push('--save',    args.savePath);
       flags.push(args.prompt);
 
-      const result = runChatgpt(flags);
-      if (!result.isError) cachePut(args, result.text);
-      sendToolResult(id, result);
+      sendToolResult(id, runChatgpt(flags));
       return;
     }
 

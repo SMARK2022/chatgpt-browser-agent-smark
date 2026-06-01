@@ -10,8 +10,7 @@
  *
  * Usage:
  *   node chatgpt.js "prompt"                              # continue last chat
- *   node chatgpt.js --new "prompt"                        # start fresh chat
- *   node chatgpt.js --code "write fizzbuzz in Go"         # extract code only
+ *   node chatgpt.js --session-id #4fa92c "prompt"         # continue a session
  *   node chatgpt.js --file <path> "prompt"                # attach a file
  *   node chatgpt.js --git "write a commit message"        # attach git context
  *   node chatgpt.js --context "we use Fiber v2" "prompt"  # inline context
@@ -27,6 +26,8 @@ const path                = require('path');
 const fs                  = require('fs');
 const http                = require('http');
 const readline            = require('readline');
+const os                  = require('os');
+const crypto              = require('crypto');
 const { execSync, spawn } = require('child_process');
 
 const puppeteer = addExtra(puppeteerCore);
@@ -36,16 +37,20 @@ puppeteer.use(StealthPlugin());
 
 const CHROME_PATH      = process.env.CHATGPT_BROWSER_PATH || 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
 const STATE_DIR        = path.resolve(process.env.CHATGPT_STATE_DIR || path.join(__dirname, '.chatgpt-poc'));
+const USER_DATA_DIR    = path.resolve(process.env.CHATGPT_SESSION_DIR || defaultUserDataDir());
 const PROFILE_DIR      = path.join(STATE_DIR, 'profile');
-const SESSION_FILE     = path.join(STATE_DIR, 'session');
+const PROJECTS_FILE    = path.join(STATE_DIR, 'projects.json');
+const SESSION_INDEX_FILE = path.join(USER_DATA_DIR, 'sessions.json');
 const DAEMON_FILE      = path.join(STATE_DIR, 'daemon.json');
 const DAEMON_LOG       = path.join(STATE_DIR, 'daemon.log');
 const CHATGPT_URL      = 'https://chatgpt.com';
-const PROJECT_URL      = process.env.CHATGPT_PROJECT_URL || 'https://chatgpt.com/g/g-p-6a1b384bc3688191b5e2c522d45fbe20/project';
+const DEFAULT_PROJECT  = process.env.CHATGPT_PROJECT || process.env.CHATGPT_PROJECT_NAME || process.env.CHATGPT_PROJECT_URL || 'MCP';
 const RESPONSE_TIMEOUT = positiveIntEnv('CHATGPT_RESPONSE_TIMEOUT_MS', 300_000); // 5 min — file analysis can be slow
 const DAEMON_START_TIMEOUT = positiveIntEnv('CHATGPT_DAEMON_START_TIMEOUT_MS', 60_000);
 
+// 运行状态和会话索引分离：浏览器 profile/daemon 放插件状态目录，#xxxxxx 会话索引放用户级 opencode 数据目录。
 fs.mkdirSync(STATE_DIR, { recursive: true });
+fs.mkdirSync(USER_DATA_DIR, { recursive: true });
 
 // ─── System prompt ────────────────────────────────────────────────────────────
 
@@ -87,6 +92,7 @@ function readFile(filePath) {
 }
 
 function getGitContext(cwd) {
+  // git 是输入侧上下文开关：只读取当前 OpenCode 工作区的分支、状态和 diff，方便交给 ChatGPT 研究。
   const run = cmd => { try { return execSync(cmd, { encoding: 'utf8', cwd }).trim(); } catch { return ''; } };
   const branch = run('git branch --show-current');
   const status = run('git status --short');
@@ -97,14 +103,6 @@ function getGitContext(cwd) {
   if (status) out += `\nStatus:\n${status}\n`;
   if (diff)   out += `\nDiff:\n${diff}\n`;
   return out;
-}
-
-function extractCodeBlocks(text) {
-  const blocks = [];
-  const re = /```[\w]*\n([\s\S]*?)```/g;
-  let m;
-  while ((m = re.exec(text)) !== null) blocks.push(m[1].trimEnd());
-  return blocks.length > 0 ? blocks.join('\n\n') : text;
 }
 
 function buildFullPrompt({ userPrompt, stdinData, fileData, gitData, contextData }) {
@@ -186,22 +184,247 @@ function positiveIntEnv(name, fallback) {
   return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
-function isProjectEntryUrl(url) {
-  return url.startsWith(PROJECT_URL);
+function defaultUserDataDir() {
+  if (process.env.OPENCODE_DATA_DIR) return path.join(process.env.OPENCODE_DATA_DIR, 'chatgpt-browser-agent');
+  if (process.env.LOCALAPPDATA) return path.join(process.env.LOCALAPPDATA, 'opencode', 'chatgpt-browser-agent');
+  return path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'), 'opencode', 'chatgpt-browser-agent');
 }
 
-function isChatSessionUrl(url) {
-  return url.startsWith(`${CHATGPT_URL}/c/`);
+function normalizeProjectKey(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/[^a-z0-9\u4e00-\u9fff_-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
 }
 
-function isAllowedChatUrl(url) {
-  return isProjectEntryUrl(url) || isChatSessionUrl(url);
+function readJSON(file, fallback) {
+  if (!fs.existsSync(file)) return fallback;
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch { return fallback; }
 }
 
-function readChatSessionUrl() {
-  if (!fs.existsSync(SESSION_FILE)) return null;
-  const url = fs.readFileSync(SESSION_FILE, 'utf8').trim();
-  return isAllowedChatUrl(url) ? url : null;
+function writeJSON(file, value) {
+  fs.writeFileSync(file, JSON.stringify(value, null, 2), 'utf8');
+}
+
+function normalizeSessionID(value) {
+  // 对模型只暴露短句柄，避免把 ChatGPT 的真实 conversation URL 泄漏进 schema。
+  if (!value) return null;
+  const body = String(value).trim().toLowerCase().replace(/^#/, '');
+  if (/^[a-f0-9]{6}$/.test(body)) return `#${body}`;
+  throw new Error('sessionID must be a short handle like #4fa92c');
+}
+
+function parseProjectRef(value, name) {
+  const input = String(value || '').trim();
+  const token = input.match(/\/g\/(g-p-[^/]+)(?:\/|$)/)?.[1]
+    || input.match(/^(g-p-[a-f0-9]+(?:-[a-z0-9-]+)?)$/i)?.[1];
+  if (!token) return;
+  const id = token.match(/^(g-p-[a-f0-9]+)/i)?.[1];
+  if (!id) return;
+  const url = `${CHATGPT_URL}/g/${token}/project`;
+  const title = name || token.replace(id, '').replace(/^-/, '') || id;
+  return { id, token, key: normalizeProjectKey(title || id), name: title, url };
+}
+
+function projectIdFromUrl(url) {
+  return parseProjectRef(url)?.id;
+}
+
+function isChatSessionUrlForProject(url, project) {
+  return projectIdFromUrl(url) === project.id && /\/c\//.test(url);
+}
+
+function isProjectEntryUrlForProject(url, project) {
+  return projectIdFromUrl(url) === project.id && /\/project(?:$|[?#])/.test(url);
+}
+
+function isAllowedChatUrl(url, project) {
+  return isProjectEntryUrlForProject(url, project) || isChatSessionUrlForProject(url, project);
+}
+
+function readProjectCache() {
+  const cache = readJSON(PROJECTS_FILE, { projects: {} });
+  return cache && typeof cache === 'object' && cache.projects ? cache : { projects: {} };
+}
+
+function cacheProject(project) {
+  const cache = readProjectCache();
+  const keys = new Set([project.id, project.token, project.key, normalizeProjectKey(project.name)]);
+  for (const key of keys) {
+    if (key) cache.projects[key] = project;
+  }
+  writeJSON(PROJECTS_FILE, cache);
+}
+
+function readSessionIndex() {
+  const index = readJSON(SESSION_INDEX_FILE, { sessions: {} });
+  return index && typeof index === 'object' && index.sessions ? index : { sessions: {} };
+}
+
+function createSessionID() {
+  // 6 位 hex 足够短，生成时做碰撞检查；用户可以从任意目录用同一个 #id 继续会话。
+  const index = readSessionIndex();
+  for (let i = 0; i < 20; i++) {
+    const id = `#${crypto.randomBytes(3).toString('hex')}`;
+    if (!index.sessions[id]) return id;
+  }
+  throw new Error('Could not allocate a unique ChatGPT sessionID');
+}
+
+function readSessionEntry(sessionID, project) {
+  const entry = readSessionIndex().sessions[sessionID];
+  return entry && isAllowedChatUrl(entry.url, project) ? entry : null;
+}
+
+function writeSessionEntry(sessionID, project, url) {
+  const index = readSessionIndex();
+  const now = new Date().toISOString();
+  index.sessions[sessionID] = {
+    url,
+    project: project.name,
+    projectID: project.id,
+    projectURL: project.url,
+    createdAt: index.sessions[sessionID]?.createdAt || now,
+    updatedAt: now,
+  };
+  writeJSON(SESSION_INDEX_FILE, index);
+}
+
+function sameUrl(a, b) {
+  return String(a || '').replace(/[#?].*$/, '').replace(/\/$/, '') === String(b || '').replace(/[#?].*$/, '').replace(/\/$/, '');
+}
+
+function resolveWorkspaceDir(value) {
+  const cwd = path.resolve(value || process.cwd());
+  try { return execSync('git rev-parse --show-toplevel', { cwd, encoding: 'utf8' }).trim() || cwd; }
+  catch { return cwd; }
+}
+
+function sessionCacheDirs(workspaceDir, sessionID) {
+  // ChatGPT 生成物属于当前项目，因此文本快照和下载文件固定落到项目 .opencode/cache/chatgpt。
+  const root = path.join(resolveWorkspaceDir(workspaceDir), '.opencode', 'cache', 'chatgpt');
+  return {
+    responses: path.join(root, 'responses', sessionID),
+    downloads: path.join(root, 'downloads', sessionID),
+  };
+}
+
+function timestampName(ext) {
+  return `${new Date().toISOString().replace(/\.\d{3}Z$/, 'Z').replace(/:/g, '-')}.${ext}`;
+}
+
+function saveResponseToFile(text, workspaceDir, sessionID) {
+  const dir = sessionCacheDirs(workspaceDir, sessionID).responses;
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, timestampName('md'));
+  fs.writeFileSync(file, text, 'utf8');
+  return file;
+}
+
+async function resolveProject(page, requested, log) {
+  const value = String(requested || DEFAULT_PROJECT).trim();
+  const direct = parseProjectRef(value);
+  if (direct) {
+    cacheProject(direct);
+    return direct;
+  }
+
+  const key = normalizeProjectKey(value);
+  const cached = readProjectCache().projects[key];
+  if (cached) return cached;
+
+  log(`Resolving ChatGPT project: ${value}`);
+  const discovered = await discoverProjects(page, log);
+  const match = discovered.find(project =>
+    normalizeProjectKey(project.name) === key ||
+    project.key === key ||
+    project.id === value ||
+    project.token === value
+  );
+  if (match) return match;
+  throw new Error(`Could not find ChatGPT project "${value}". Set CHATGPT_PROJECT to a project name or URL.`);
+}
+
+async function discoverProjects(page, log) {
+  await page.goto(CHATGPT_URL, { waitUntil: 'networkidle2', timeout: 30_000 });
+  await new Promise(r => setTimeout(r, 1_000));
+
+  const cachedProjects = await cachedProjectsFromPage(page);
+  if (cachedProjects.length > 0) {
+    for (const project of cachedProjects) cacheProject(project);
+    log(`Discovered cached ChatGPT projects: ${cachedProjects.map(project => `${project.name}=${project.id}`).join(', ')}`);
+    return cachedProjects;
+  }
+
+  for (let i = 0; i < 5; i++) {
+    const clicked = await page.evaluate(() => {
+      const buttons = [...document.querySelectorAll('button, div.group.__menu-item, a.group.__menu-item')];
+      const button = buttons.find(item => {
+        const text = (item.innerText || item.textContent || '').trim();
+        return ['Show more', 'More'].includes(text) && String(item.className).includes('__menu-item');
+      });
+      if (!button) return false;
+      button.click();
+      return true;
+    });
+    if (!clicked) break;
+    await new Promise(r => setTimeout(r, 700));
+  }
+
+  const projects = await page.evaluate(() => {
+    return [...document.querySelectorAll('a[href*="/g/g-p-"][href*="/project"]')]
+      .map(anchor => ({
+        name: (anchor.innerText || anchor.textContent || '').trim().split('\n')[0],
+        href: anchor.href,
+      }))
+      .filter(project => project.name && project.href);
+  });
+
+  const parsed = projects
+    .map(project => parseProjectRef(project.href, project.name))
+    .filter(Boolean);
+  for (const project of parsed) cacheProject(project);
+  log(`Discovered ChatGPT projects: ${parsed.map(project => `${project.name}=${project.id}`).join(', ') || 'none'}`);
+  return parsed;
+}
+
+async function cachedProjectsFromPage(page) {
+  const projects = await page.evaluate(() => {
+    const found = [];
+    const seen = new WeakSet();
+    for (const key of Object.keys(localStorage)) {
+      if (!/(snorlax-history|pinned-items|gizmo)/.test(key)) continue;
+      try { visit(JSON.parse(localStorage.getItem(key))); }
+      catch {}
+    }
+    return found;
+
+    function visit(value) {
+      if (!value || typeof value !== 'object') return;
+      if (seen.has(value)) return;
+      seen.add(value);
+
+      const candidate = value.gizmo && value.gizmo.id ? value.gizmo : value;
+      if (typeof candidate.id === 'string' && candidate.id.startsWith('g-p-')) {
+        const name = candidate.display?.name || candidate.name;
+        if (name) {
+          found.push({
+            name,
+            href: `https://chatgpt.com/g/${candidate.short_url || candidate.id}/project`,
+          });
+        }
+      }
+
+      for (const child of Array.isArray(value) ? value : Object.values(value)) visit(child);
+    }
+  });
+  return projects
+    .map(project => parseProjectRef(project.href, project.name))
+    .filter(Boolean)
+    .filter((project, index, all) => all.findIndex(item => item.id === project.id) === index);
 }
 
 // Single DOM operation — no keystroke simulation, no chunking, no delay.
@@ -219,16 +442,12 @@ async function fillTextarea(page, text) {
   }, text);
 }
 
-async function waitForStreamingDone(page, log, beforeCount) {
-  // beforeCount must be measured BEFORE the message is sent so we don't
-  // accidentally measure it after ChatGPT has already started responding.
-  // The caller passes it in; fall back to measuring now only for text-only paths.
-  if (beforeCount === undefined) {
-    beforeCount = await page.evaluate(
-      () => document.querySelectorAll('[data-message-author-role="assistant"]').length
-    );
+async function waitForStreamingDone(page, log, beforeState) {
+  // ChatGPT 有时会复用最后一个 assistant DOM 节点，而不是新增节点；因此同时记录数量和最后文本。
+  if (beforeState === undefined || typeof beforeState === 'number') {
+    beforeState = await assistantState(page, typeof beforeState === 'number' ? beforeState : undefined);
   }
-  log(`waitForStreamingDone: beforeCount=${beforeCount}`);
+  log(`waitForStreamingDone: beforeCount=${beforeState.count}`);
 
   // Phase 1 — wait for a new assistant message to appear (ChatGPT started replying).
   // polling:1000 reduces CDP round-trips on heavy pages and avoids
@@ -236,12 +455,12 @@ async function waitForStreamingDone(page, log, beforeCount) {
   await page.waitForFunction(
     before => {
       const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
-      if (msgs.length <= before) return false;
-      // Also ensure the last message has at least some text
-      return (msgs[msgs.length - 1].innerText || '').trim().length > 0;
+      const text = msgs.length > 0 ? (msgs[msgs.length - 1].innerText || '').trim() : '';
+      if (msgs.length > before.count) return text.length > 0;
+      return text.length > 0 && text !== before.lastText;
     },
     { timeout: RESPONSE_TIMEOUT, polling: 1_000 },
-    beforeCount
+    beforeState
   ).catch(async err => {
     // On timeout, dump the DOM state to the log for debugging
     const dump = await page.evaluate(() => {
@@ -287,6 +506,16 @@ async function waitForStreamingDone(page, log, beforeCount) {
     const stableMs = state.len < 1_000 ? 2_500 : state.len < 4_000 ? 5_000 : 8_000;
     if (!state.generating && !placeholder && state.len > 0 && Date.now() - lastChangedAt >= stableMs) break;
   }
+}
+
+async function assistantState(page, count) {
+  return page.evaluate(existingCount => {
+    const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
+    return {
+      count: existingCount ?? msgs.length,
+      lastText: msgs.length > 0 ? (msgs[msgs.length - 1].innerText || '').trim() : '',
+    };
+  }, count);
 }
 
 async function extractLastAssistantMessage(page) {
@@ -507,12 +736,14 @@ async function waitForDownloadedFile(downloadDir, before, expectedName) {
 }
 
 function formatResponse(result) {
-  if (!result.downloads || result.downloads.length === 0) return result.response;
   return [
-    result.response,
-    'Downloaded files:',
-    ...result.downloads.map(file => `- ${file.name}: ${file.path}`),
-  ].join('\n\n');
+    result.response || null,
+    result.savedResponse ? `Response saved to:\n${result.savedResponse}` : null,
+    result.downloads && result.downloads.length > 0
+      ? ['Downloaded files:', ...result.downloads.map(file => `- ${file.name}: ${file.path}`)].join('\n')
+      : null,
+    result.sessionID ? `Session: ${result.sessionID}` : null,
+  ].filter(Boolean).join('\n\n');
 }
 
 // ─── Daemon process ───────────────────────────────────────────────────────────
@@ -523,18 +754,15 @@ async function startDaemonProcess() {
 
   log('Daemon starting...');
 
-  let browser, page;
+  let browser, page, project;
   try {
     browser = await launchBrowser();
     page    = await browser.newPage();
 
-    const initUrl = readChatSessionUrl() || PROJECT_URL;
+    project = await resolveProject(page, DEFAULT_PROJECT, log);
 
-    log(`Navigating to ${initUrl}`);
-    await page.goto(
-      isAllowedChatUrl(initUrl) ? initUrl : PROJECT_URL,
-      { waitUntil: 'networkidle2', timeout: 30_000 }
-    );
+    log(`Navigating to fixed project: ${project.name} (${project.id})`);
+    await page.goto(project.url, { waitUntil: 'networkidle2', timeout: 30_000 });
 
     const loggedOut = await page.evaluate(() => {
       const hasLoginBtn = [...document.querySelectorAll('button, a')]
@@ -585,22 +813,19 @@ async function startDaemonProcess() {
       let body = '';
       req.on('data', chunk => (body += chunk));
       req.on('end', async () => {
-        const { fullPrompt, codeOnly, newChat, uploadPath, downloadDir } = JSON.parse(body);
-        log(`ask: newChat=${newChat} codeOnly=${codeOnly} upload=${uploadPath||'none'} download=${downloadDir||'none'} len=${fullPrompt.length}`);
+        const { fullPrompt, uploadPath, workspaceDir, sessionID: requestedSessionID, saveToFile } = JSON.parse(body);
 
         try {
-          const currentUrl = page.url();
+          const sessionID = normalizeSessionID(requestedSessionID) || createSessionID();
+          log(`ask: sessionID=${sessionID} saveToFile=${!!saveToFile} upload=${uploadPath||'none'} workspace=${workspaceDir||process.cwd()} len=${fullPrompt.length}`);
 
-          if (newChat) {
-            log('Starting new project chat...');
-            await page.goto(PROJECT_URL, { waitUntil: 'networkidle2', timeout: 30_000 });
-          } else if (!isAllowedChatUrl(currentUrl)) {
-            // Tab drifted (e.g. browser opened a link) — restore to the last ChatGPT conversation or project entry.
-            const sessionUrl = readChatSessionUrl() || PROJECT_URL;
-            log(`Restoring tab to ${sessionUrl}`);
-            await page.goto(sessionUrl, { waitUntil: 'networkidle2', timeout: 30_000 });
+          // sessionID 是全局句柄；存在则恢复对应 ChatGPT 会话，不存在则在固定 Project 中创建新会话。
+          const session = readSessionEntry(sessionID, project);
+          const targetUrl = session?.url || project.url;
+          if (!sameUrl(page.url(), targetUrl)) {
+            log(session ? `Restoring session ${sessionID}` : `Starting session ${sessionID} in ${project.name}`);
+            await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 30_000 });
           }
-          // else: already on the right chat page, skip navigation entirely
 
           if (uploadPath) await uploadFileToChatGPT(page, uploadPath, log);
 
@@ -622,11 +847,8 @@ async function startDaemonProcess() {
             log('Send button is now enabled.');
           }
 
-          // Snapshot assistant count BEFORE submitting so waitForStreamingDone
-          // can reliably detect the new response even if ChatGPT replies instantly.
-          const beforeCount = await page.evaluate(
-            () => document.querySelectorAll('[data-message-author-role="assistant"]').length
-          );
+          // 发送前记录 assistant 状态，避免 ChatGPT 复用 DOM 节点时误判没有新回复。
+          const beforeState = await assistantState(page);
 
           // Submit by pressing Enter in the focused textarea.
           // Clicking the send button is unreliable when text is selected or when
@@ -636,21 +858,24 @@ async function startDaemonProcess() {
           log('Submitted via Enter key');
 
           log('Prompt sent, waiting for response...');
-          await waitForStreamingDone(page, log, beforeCount);
+          await waitForStreamingDone(page, log, beforeState);
 
           const finalUrl = page.url();
-          if (isAllowedChatUrl(finalUrl)) {
-            fs.writeFileSync(SESSION_FILE, finalUrl, 'utf8');
+          if (isAllowedChatUrl(finalUrl, project)) {
+            writeSessionEntry(sessionID, project, finalUrl);
           }
 
           const raw = await extractLastAssistantMessage(page);
           if (!raw) throw new Error('Could not extract response from page');
 
-          const downloads = downloadDir ? await downloadAssistantFiles(page, path.resolve(downloadDir), log) : [];
+          const dirs = sessionCacheDirs(workspaceDir, sessionID);
+          fs.mkdirSync(dirs.downloads, { recursive: true });
+          // 下载目录不暴露给模型，始终写到当前项目 cache，避免全局目录堆积生成物。
+          const downloads = await downloadAssistantFiles(page, dirs.downloads, log);
+          const savedResponse = saveToFile ? saveResponseToFile(raw, workspaceDir, sessionID) : null;
 
-          const output = codeOnly ? extractCodeBlocks(raw) : raw;
-          log(`Done: ${output.length} chars`);
-          send(200, { ok: true, response: output, downloads });
+          log(`Done: ${raw.length} chars`);
+          send(200, { ok: true, response: saveToFile ? '' : raw, downloads, savedResponse, sessionID });
         } catch (err) {
           log(`Error: ${err.message}`);
           send(500, { ok: false, error: err.message });
@@ -767,7 +992,7 @@ async function login() {
     `--user-data-dir=${PROFILE_DIR}`,
     '--no-first-run',
     '--no-default-browser-check',
-    PROJECT_URL,
+    parseProjectRef(DEFAULT_PROJECT)?.url || CHATGPT_URL,
   ], {
     detached: true,
     stdio: 'ignore',
@@ -786,26 +1011,25 @@ async function login() {
 function parseArgs(argv) {
   const args = argv.slice(2);
   const opts = {
-    login: false, codeOnly: false, file: null, upload: null, save: null,
-    git: false, context: null, newChat: false, stop: false, status: false, raw: false, downloadDir: null,
-    daemonInternal: false, cwd: null, prompt: [],
+    login: false, file: null, upload: null,
+    git: false, context: null, stop: false, status: false, raw: false,
+    saveToFile: false, sessionID: null, daemonInternal: false, cwd: null, workspace: null, prompt: [],
   };
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
       case '--login':           opts.login          = true;  break;
-      case '--code':            opts.codeOnly       = true;  break;
       case '--git':             opts.git            = true;  break;
-      case '--new':             opts.newChat        = true;  break;
       case '--stop':            opts.stop           = true;  break;
       case '--status':          opts.status         = true;  break;
       case '--raw':             opts.raw            = true;  break;
+      case '--save-to-file':    opts.saveToFile     = true;  break;
       case '--daemon-internal': opts.daemonInternal = true;  break;
       case '--file':            opts.file    = args[++i];    break;
       case '--upload':          opts.upload  = args[++i];    break;
-      case '--save':            opts.save    = args[++i];    break;
-      case '--download-dir':    opts.downloadDir = args[++i]; break;
+      case '--session-id':      opts.sessionID = args[++i];  break;
       case '--context':         opts.context = args[++i];    break;
       case '--cwd':             opts.cwd     = args[++i];    break;
+      case '--workspace':       opts.workspace = args[++i];  break;
       default:                  opts.prompt.push(args[i]);
     }
   }
@@ -816,13 +1040,11 @@ function printHelp() {
   console.log(`
 Usage:
   node chatgpt.js --login                               # first-time setup
-  node chatgpt.js "prompt"                              # continue last chat (daemon auto-starts)
-  node chatgpt.js --new "prompt"                        # force a new chat
-  node chatgpt.js --code "write fizzbuzz in Go"         # extract code blocks only
+  node chatgpt.js "prompt"                              # create a new #xxxxxx session
+  node chatgpt.js --session-id #4fa92c "prompt"         # continue a session
   node chatgpt.js --file <path> "prompt"                # paste file content as text in prompt
   node chatgpt.js --upload <path> "prompt"              # upload file via ChatGPT attachment button
-  node chatgpt.js --download-dir <dir> "prompt"          # download generated ChatGPT files
-  node chatgpt.js --save <path> "prompt"                # save response to a file
+  node chatgpt.js --save-to-file "prompt"               # save response under .opencode/cache/chatgpt
   node chatgpt.js --raw "prompt"                         # print response text only
   node chatgpt.js --git "write a commit message"        # attach git diff/status
   node chatgpt.js --context "we use Fiber v2" "prompt"  # inline context
@@ -881,9 +1103,11 @@ Usage:
   try {
     const port   = await ensureDaemon();
     const result = await httpPost(port, '/ask', {
-      fullPrompt, codeOnly: opts.codeOnly, newChat: opts.newChat,
+      fullPrompt,
       uploadPath: opts.upload || null,
-      downloadDir: opts.downloadDir || null,
+      workspaceDir: opts.workspace || opts.cwd || process.cwd(),
+      sessionID: opts.sessionID || null,
+      saveToFile: opts.saveToFile,
     });
     if (!result.ok) throw new Error(result.error || 'Daemon returned an error');
     const responseText = formatResponse(result);
@@ -893,10 +1117,6 @@ Usage:
       console.log('\n--- RESPONSE ---');
       console.log(responseText);
       console.log('--- END ---\n');
-    }
-    if (opts.save) {
-      fs.writeFileSync(path.resolve(opts.save), responseText, 'utf8');
-      console.error(`[*] Response saved to: ${path.resolve(opts.save)}`);
     }
   } catch (err) {
     console.error('[ERROR]', err.message);
