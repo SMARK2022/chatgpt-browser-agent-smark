@@ -152,8 +152,8 @@ Use project-local config, for example `.opencode/opencode.jsonc`:
         "CHATGPT_BROWSER_PATH": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
         "CHATGPT_PROJECT": "MCP",
         "CHATGPT_STATE_DIR": "F:\\ML\\PythonAIProject\\Claude-Code\\opencode\\.temp\\chatgpt-browser-agent\\.chatgpt-poc",
-        "CHATGPT_RESPONSE_TIMEOUT_MS": "600000",
-        "CHATGPT_CLI_TIMEOUT_MS": "580000",
+        "CHATGPT_RESPONSE_TIMEOUT_MS": "540000",
+        "CHATGPT_CLI_TIMEOUT_MS": "610000",
         "CHATGPT_DAEMON_START_TIMEOUT_MS": "60000",
         "CHATGPT_FILE_UPLOAD_TIMEOUT_MS": "180000",
         "CHATGPT_MAX_RETURN_CHARS": "6000",
@@ -161,7 +161,7 @@ Use project-local config, for example `.opencode/opencode.jsonc`:
         "CHATGPT_MCP_MAX_RETURN_CHARS": "8000"
       },
       "enabled": true,
-      "timeout": 620000
+      "timeout": 650000
     }
   }
 }

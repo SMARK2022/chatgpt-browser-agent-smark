@@ -550,10 +550,12 @@ async function waitForStreamingDone(page, log, beforeState, options = {}) {
         .map(button => `${button.getAttribute('aria-label') || ''} ${button.textContent || ''}`.trim())
         .filter(Boolean);
       const stopButton = !!document.querySelector('button[data-testid="stop-button"], button[aria-label*="Stop"], button[aria-label*="停止"]');
+      const copyButton = labels.some(label => /copy|复制/i.test(label));
       return {
         len: text.length,
         text: text.replace(/\s+/g, ' ').trim(),
-        generating: stopButton || labels.some(label => /stop|interrupt|cancel|停止|中止|取消/i.test(label)),
+        copyButton,
+        generating: stopButton || labels.some(label => /^(stop|interrupt|cancel|停止|中止|取消)\b/i.test(label)),
       };
     });
     const placeholder = /^(thinking|thinking\.\.\.|思考中|正在思考)$/i.test(state.text);
@@ -563,7 +565,8 @@ async function waitForStreamingDone(page, log, beforeState, options = {}) {
       continue;
     }
     const stableMs = responseStableMs(state.len, options.slow);
-    if (!state.generating && !placeholder && state.len > 0 && Date.now() - lastChangedAt >= stableMs) break;
+    const doneStableMs = state.copyButton && !state.generating && !placeholder ? Math.min(stableMs, 2_000) : stableMs;
+    if (!state.generating && !placeholder && state.len > 0 && Date.now() - lastChangedAt >= doneStableMs) break;
   }
 }
 

@@ -10,7 +10,7 @@
 
 'use strict';
 
-const { spawnSync } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const readline      = require('readline');
 const path          = require('path');
 
@@ -18,6 +18,7 @@ const SCRIPT = path.join(__dirname, 'chatgpt.js');
 const CHATGPT_CLI_TIMEOUT = positiveIntEnv('CHATGPT_CLI_TIMEOUT_MS', 310_000);
 const CHATGPT_STOP_TIMEOUT = positiveIntEnv('CHATGPT_STOP_TIMEOUT_MS', 30_000);
 const MCP_MAX_RETURN_CHARS = positiveIntEnv('CHATGPT_MCP_MAX_RETURN_CHARS', 8_000);
+const activeCalls = new Map();
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -68,39 +69,86 @@ function shouldRestartDaemon(text) {
   return /detached Frame|Execution context was destroyed|Cannot find context|Target closed|Protocol error|Runtime\.callFunctionOn timed out/i.test(text);
 }
 
+function killProcessTree(pid) {
+  if (!pid) return;
+  if (process.platform === 'win32') {
+    spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { encoding: 'utf8', timeout: CHATGPT_STOP_TIMEOUT });
+    return;
+  }
+  try { process.kill(pid, 'SIGTERM'); } catch {}
+}
+
+function cancelCall(id, reason) {
+  const active = activeCalls.get(id);
+  if (!active) return;
+  killProcessTree(active.child.pid);
+  stopDaemon();
+  activeCalls.delete(id);
+  if (reason) active.cancelled = reason;
+}
+
 /**
  * Run chatgpt.js with the given args array.
  * Returns trimmed stdout and marks non-zero process results as MCP tool errors.
  */
-function runChatgpt(args, retry = true) {
-  const result = spawnSync(process.execPath, [SCRIPT, ...args], {
-    encoding:  'utf8',
-    timeout:   CHATGPT_CLI_TIMEOUT,
-    maxBuffer: 10 * 1024 * 1024,
-  });
-  const out = (result.stdout || '').trim();
-  const err = (result.stderr || '').trim();
-  if (result.error) {
-    if (result.error.code === 'ETIMEDOUT') {
+function runChatgpt(args, id, retry = true) {
+  return new Promise(resolve => {
+    const child = spawn(process.execPath, [SCRIPT, ...args], {
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const active = { child, cancelled: null };
+    if (id !== undefined) activeCalls.set(id, active);
+
+    let out = '';
+    let err = '';
+    const append = (key, chunk) => {
+      if (key === 'out') out += chunk.toString('utf8');
+      else err += chunk.toString('utf8');
+    };
+    child.stdout.on('data', chunk => append('out', chunk));
+    child.stderr.on('data', chunk => append('err', chunk));
+
+    const timer = setTimeout(() => {
+      killProcessTree(child.pid);
       stopDaemon();
-      return {
+      if (id !== undefined) activeCalls.delete(id);
+      resolve({
         text: `Error: ChatGPT request timed out after ${CHATGPT_CLI_TIMEOUT}ms; daemon was restarted automatically. Retry with the same sessionID, or use saveToFile for long answers.`,
         isError: true,
-      };
-    }
-    return { text: `Error: ${result.error.message}`, isError: true };
-  }
-  if (result.status !== 0) {
-    if (retry && shouldRestartDaemon(`${err}\n${out}`)) {
-      stopDaemon();
-      return runChatgpt(args, false);
-    }
-    return {
-      text: err || out || `Error: chatgpt.js exited with status ${result.status}`,
-      isError: true,
-    };
-  }
-  return { text: out || err || '(no output)', isError: false };
+      });
+    }, CHATGPT_CLI_TIMEOUT);
+
+    child.on('error', error => {
+      clearTimeout(timer);
+      if (id !== undefined) activeCalls.delete(id);
+      resolve({ text: `Error: ${error.message}`, isError: true });
+    });
+
+    child.on('close', status => {
+      clearTimeout(timer);
+      if (id !== undefined && activeCalls.get(id) === active) activeCalls.delete(id);
+      out = out.trim();
+      err = err.trim();
+
+      if (active.cancelled) {
+        resolve({ text: `Error: ChatGPT request cancelled: ${active.cancelled}`, isError: true });
+        return;
+      }
+
+      if (status !== 0) {
+        if (retry && shouldRestartDaemon(`${err}\n${out}`)) {
+          stopDaemon();
+          runChatgpt(args, id, false).then(resolve);
+          return;
+        }
+        resolve({ text: err || out || `Error: chatgpt.js exited with status ${status}`, isError: true });
+        return;
+      }
+
+      resolve({ text: out || err || '(no output)', isError: false });
+    });
+  });
 }
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
@@ -162,7 +210,7 @@ const TOOLS = [
 
 // ─── Request dispatcher ───────────────────────────────────────────────────────
 
-function handleRequest(req) {
+async function handleRequest(req) {
   const { id, method, params } = req;
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -182,6 +230,11 @@ function handleRequest(req) {
   // Notification — no response required
   if (method === 'notifications/initialized') return;
 
+  if (method === 'notifications/cancelled' || method === '$/cancelRequest') {
+    cancelCall(params && (params.requestId ?? params.id), params && params.reason);
+    return;
+  }
+
   // ── Tool discovery ─────────────────────────────────────────────────────────
   if (method === 'tools/list') {
     send({ jsonrpc: '2.0', id, result: { tools: TOOLS } });
@@ -194,12 +247,15 @@ function handleRequest(req) {
     const args = (params && params.arguments) || {};
 
     if (name === 'status') {
-      sendToolResult(id, runChatgpt(['--status']));
+      sendToolResult(id, await runChatgpt(['--status'], id));
       return;
     }
 
     if (name === 'stop') {
-      sendToolResult(id, runChatgpt(['--stop']));
+      for (const callID of [...activeCalls.keys()]) {
+        if (callID !== id) cancelCall(callID, 'stop requested');
+      }
+      sendToolResult(id, await runChatgpt(['--stop'], id));
       return;
     }
 
@@ -218,7 +274,7 @@ function handleRequest(req) {
       for (const file of normalizeFiles(args.file)) flags.push('--upload', file);
       flags.push(args.prompt);
 
-      sendToolResult(id, runChatgpt(flags));
+      sendToolResult(id, await runChatgpt(flags, id));
       return;
     }
 
@@ -254,7 +310,9 @@ rl.on('line', (line) => {
     send({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } });
     return;
   }
-  handleRequest(req);
+  handleRequest(req).catch(error => {
+    send({ jsonrpc: '2.0', id: req && req.id !== undefined ? req.id : null, error: { code: -32603, message: error.message } });
+  });
 });
 
 // Keep the process alive waiting for stdin
