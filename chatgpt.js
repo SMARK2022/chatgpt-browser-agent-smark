@@ -43,7 +43,7 @@ const DAEMON_FILE = path.join(STATE_DIR, 'daemon.json');
 const DAEMON_LOCK_FILE = path.join(STATE_DIR, 'daemon.lock');
 const DAEMON_LOG = path.join(STATE_DIR, 'daemon.log');
 const DEFAULT_PROJECT = process.env.CHATGPT_PROJECT || process.env.CHATGPT_PROJECT_NAME || process.env.CHATGPT_PROJECT_URL || 'MCP';
-const DAEMON_VERSION = 10;
+const DAEMON_VERSION = 16;
 const DAEMON_START_TIMEOUT = positiveIntEnv('CHATGPT_DAEMON_START_TIMEOUT_MS', 60_000);
 const BROWSER_CONNECT_TIMEOUT_MS = positiveIntEnv('CHATGPT_BROWSER_CONNECT_TIMEOUT_MS', 3_000);
 const HTTP_TIMEOUT = positiveIntEnv('CHATGPT_HTTP_TIMEOUT_MS', 30_000);
@@ -57,7 +57,6 @@ const MAX_UPLOAD_FILES = positiveIntEnv('CHATGPT_MAX_UPLOAD_FILES', 12);
 const MAX_UPLOAD_BYTES = positiveIntEnv('CHATGPT_MAX_UPLOAD_BYTES', 400 * 1024 * 1024);
 const MAX_TOTAL_UPLOAD_BYTES = positiveIntEnv('CHATGPT_MAX_TOTAL_UPLOAD_BYTES', 800 * 1024 * 1024);
 const EXPLICIT_UPLOAD_ROOTS = uploadRoots();
-assertRuntimeDirsSafe();
 let activeStartLock = null;
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
@@ -75,7 +74,8 @@ You are ChatGPT, an external assistant connected to opencode through the user's 
 
 Work as a high-signal research and engineering collaborator. Use the provided
 code, diffs, logs, files, and task context together with your general knowledge
-and any available web or research capabilities.
+and available web, research, data-analysis, sandbox, image, or file-generation
+capabilities when they materially improve the answer.
 
 Prioritize:
 - accurate, current answers grounded in evidence;
@@ -86,7 +86,11 @@ Prioritize:
 
 Match the user's requested depth. Be concise when the answer is simple, and be
 thorough when research or analysis is needed. If information is uncertain, say
-what is uncertain and give the best supported path forward.
+what is uncertain and give the best supported path forward. Use web/research
+selectively for current facts, documentation, issues, repositories, or
+ambiguous claims; do not let browsing replace direct reasoning when the provided
+context is sufficient. When you use web sources, keep source markers close to
+the supported claims.
 ---
 `;
 
@@ -120,23 +124,6 @@ function defaultStateDir() {
 function runtimeUnsafeRoots() {
   // cwd 可能不是 OpenCode workspace；显式 workspace env 也要参与 OPENCODE_DATA_DIR 的项目内判定。
   return [process.cwd(), __dirname, process.env.CHATGPT_WORKSPACE_DIR, ...(process.env.CHATGPT_WORKSPACE_ROOTS || '').split(path.delimiter)].filter(Boolean).map(item => path.resolve(item));
-}
-
-function assertRuntimeDirsSafe() {
-  // 兼容旧 MCP 配置：运行态目录可能显式放在插件子目录中，但 .gitignore 已负责排除敏感文件。
-}
-
-function runtimeDirInsideUnsafe(dir) {
-  const target = path.resolve(dir);
-  const existing = nearestExistingPath(target);
-  const realTarget = path.resolve(fs.realpathSync.native(existing), path.relative(existing, target));
-  return runtimeUnsafeRoots().some(root => isInside(root, target) || isInside(fs.existsSync(root) ? fs.realpathSync.native(root) : root, realTarget));
-}
-
-function nearestExistingPath(target) {
-  let current = path.resolve(target);
-  while (!fs.existsSync(current) && path.dirname(current) !== current) current = path.dirname(current);
-  return current;
 }
 
 function normalizePathList(value) {
@@ -258,8 +245,7 @@ function buildFullPrompt({ userPrompt, stdinData, fileData, gitData, contextData
 }
 
 function workflowHint(mode, imageAspectRatio) {
-  // 这些提示只解释“本地已经切好的 ChatGPT UI 模式”，不替用户改写任务；auto 模式保持完全中性。
-  if (mode === 'search') return 'Workflow: The ChatGPT composer is in Web Search mode. Use current web results when useful, keep source markers close to sourced claims, and say when no source supports an answer.\n';
+  // 这些提示只解释“本地已经切好的 ChatGPT UI 模式”，不替用户改写任务；auto 模式保留 ChatGPT 自主检索能力。
   if (mode === 'image') return `Workflow: The ChatGPT composer is in Create Image mode${imageAspectRatio ? ` with imageAspectRatio=${imageAspectRatio}` : ''}. Generate the requested visual artifact; keep any text response brief because image artifacts will be collected locally when the page exposes them.\n`;
   return null;
 }
@@ -629,7 +615,6 @@ Usage:
   node chatgpt.js --raw "prompt"                        # print tool output without CLI framing
   node chatgpt.js --git "write a commit message"        # attach git diff/status
   node chatgpt.js --context "we use Effect v4" "prompt" # inline context
-  node chatgpt.js --mode search "prompt"              # force a known ChatGPT composer mode
   node chatgpt.js --mode image --image-aspect-ratio wide "prompt"
   node chatgpt.js --request-json -                       # internal MCP payload mode over stdin
   cat error.log | node chatgpt.js "what is wrong"       # pipe input

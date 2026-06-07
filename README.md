@@ -152,10 +152,14 @@ a user-private state directory outside a shared repository checkout. Any local
 process that can read this file can intentionally drive the same logged-in
 browser session, request uploads from the project chatgpt upload cache, and write
 response/artifact caches for the `workspaceDir` supplied by the caller. Under
-OpenCode this is the current instance directory unless explicitly overridden. In
-repo-local OpenCode config, keep `CHATGPT_WORKSPACE_ROOTS` at the checkout root
-instead of a broad parent directory unless you intentionally trust sibling projects.
-If roots are omitted, the daemon only accepts its launch cwd as the workspace root.
+OpenCode this is the current instance directory unless explicitly overridden.
+
+When `CHATGPT_WORKSPACE_ROOTS` is omitted, the daemon accepts the caller-supplied
+`workspaceDir` so one user-level browser daemon can serve multiple OpenCode TUI
+instances without pinning cache writes to the first project that started it. To
+turn this into a stricter deployment boundary, set `CHATGPT_WORKSPACE_ROOTS` to
+one or more trusted roots; in repo-local config, prefer the checkout root instead
+of a broad parent directory unless you intentionally trust sibling projects.
 
 Older experiments may leave `.chatgpt-poc/sessions.json` with `legacyProjects`.
 That file is migration residue; active `#xxxxxxxxxx` sessions live in
@@ -288,15 +292,17 @@ conversation from any OpenCode working directory.
 `git diff HEAD` from the OpenCode working directory.
 
 `mode` optionally selects a known ChatGPT composer mode before sending the
-prompt. Supported values are `auto`, `search`, and `image`.
-This is based on the live ChatGPT DOM where these modes are exposed as
-`role="menuitemradio"` entries under the composer plus menu. `auto` keeps the
-normal ChatGPT behavior and lets ChatGPT decide whether web access is useful.
-`search` explicitly selects Web Search before sending and adds a small workflow
-hint asking ChatGPT to keep source markers near sourced claims. Deep Research,
-Agent mode, scheduled tasks, and external app modes are not exposed through MCP
-because live UI tests showed empty-turn, privacy/onboarding, scheduled-task, or
-external-account semantics that do not fit a normal OpenCode ask.
+prompt. Supported values are `auto` and `image`. `auto` keeps normal ChatGPT
+behavior, including ordinary web/research use when the prompt asks for current
+information or ChatGPT decides browsing materially improves the answer. There is
+no separate `search` mode exposed to OpenCode: live tests showed that plain
+prompts can still produce web citation pills, while a schema-level search flag
+adds another model decision branch without a reliable answer-quality benefit.
+
+Deep Research, Agent mode, scheduled tasks, and external app modes are not exposed
+through MCP because live UI tests showed empty-turn, privacy/onboarding,
+scheduled-task, or external-account semantics that do not fit a normal OpenCode
+ask.
 
 `imageAspectRatio` is optional and only applies to native ChatGPT image generation.
 If it is provided without `mode`, the bridge infers `mode: "image"`. Supported
@@ -313,14 +319,15 @@ wide       -> 宽屏 16:9
 
 This is useful for OpenCode workflows that need predictable visual artifacts:
 square icons, wide architecture diagrams, portrait posters, or story-sized mobile
-mockups. The ratio selector is deliberately kept out of `mode` so normal search
-and text analysis calls do not inherit image-generation state.
+mockups. The ratio selector is deliberately kept out of `mode` so normal text,
+analysis, and research calls do not inherit image-generation state.
 
-Search citations are extracted from ChatGPT's citation-pill DOM. ChatGPT may show
-sources as site-name pills rather than literal `[1]` text, so the bridge converts
-those pills into local `[Ref n]` markers and appends a `References` section with
-the source URLs. This avoids relying on the browser clipboard copy button, which
-is not stable under automation and would modify the user's system clipboard.
+Web citations are extracted from ChatGPT's citation-pill DOM whenever ChatGPT uses
+web/research sources in normal mode. ChatGPT may show sources as site-name pills
+rather than literal `[1]` text, so the bridge converts those pills into local
+`[Ref n]` markers and appends a `References` section with the source URLs. This
+avoids relying on the browser clipboard copy button, which is not stable under
+automation and would modify the user's system clipboard.
 
 MCP `file` means browser attachment upload, not CLI `--file` text embedding. It
 uploads one local file or an array of local files through the ChatGPT attachment

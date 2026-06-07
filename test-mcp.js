@@ -68,7 +68,11 @@ function testBasicProtocol() {
   const batch = responses.find(Array.isArray);
   assert.ok(responses.some(item => item.id === 1 && item.result?.capabilities?.tools));
   assert.ok(responses.some(item => item.id === 2 && item.result?.tools?.some(tool => tool.name === 'ask')));
-  assert.ok(responses.find(item => item.id === 2).result.tools.find(tool => tool.name === 'ask').inputSchema.properties.imageAspectRatio);
+  const askSchema = responses.find(item => item.id === 2).result.tools.find(tool => tool.name === 'ask').inputSchema;
+  assert.ok(askSchema.properties.imageAspectRatio);
+  // schema 是主 agent 的“能力地图”：这里固定不暴露 search，让检索回到自然 prompt 和 ChatGPT 自主工具选择。
+  // 这样既保留 citation DOM 提取，也避免模型为了选择 mode 而多一层无收益决策。
+  assert.deepStrictEqual(askSchema.properties.mode.enum, ['auto', 'image']);
   assert.ok(responses.some(item => item.id === 'resources' && Array.isArray(item.result?.resources)));
   assert.ok(responses.some(item => item.id === 'prompts' && Array.isArray(item.result?.prompts)));
   assert.ok(responses.some(item => item.id === null && item.error?.code === -32600));
@@ -96,18 +100,20 @@ function testArgumentValidation() {
     JSON.stringify({ jsonrpc: '2.0', id: 'ask-bad-file', method: 'tools/call', params: { name: 'ask', arguments: { prompt: 'x', file: ['relative.txt'] } } }),
     // mode 只允许已实测的低副作用 composer 入口；agent/task 类入口不能被模型随手打开。
     JSON.stringify({ jsonrpc: '2.0', id: 'ask-bad-mode', method: 'tools/call', params: { name: 'ask', arguments: { prompt: 'x', mode: 'agent' } } }),
+    JSON.stringify({ jsonrpc: '2.0', id: 'ask-search-mode', method: 'tools/call', params: { name: 'ask', arguments: { prompt: 'x', mode: 'search' } } }),
     JSON.stringify({ jsonrpc: '2.0', id: 'ask-deep-research-mode', method: 'tools/call', params: { name: 'ask', arguments: { prompt: 'x', mode: 'deepResearch' } } }),
-    // 比例参数是 image mode 的窄能力，必须既拒绝未知比例，也拒绝和 search 这类文本模式混用。
+    // 比例参数是 image mode 的窄能力，必须既拒绝未知比例，也拒绝和 auto 这类文本模式显式混用。
     JSON.stringify({ jsonrpc: '2.0', id: 'ask-bad-ratio', method: 'tools/call', params: { name: 'ask', arguments: { prompt: 'x', imageAspectRatio: 'cinema' } } }),
-    JSON.stringify({ jsonrpc: '2.0', id: 'ask-ratio-search-conflict', method: 'tools/call', params: { name: 'ask', arguments: { prompt: 'x', mode: 'search', imageAspectRatio: 'wide' } } }),
+    JSON.stringify({ jsonrpc: '2.0', id: 'ask-ratio-mode-conflict', method: 'tools/call', params: { name: 'ask', arguments: { prompt: 'x', mode: 'auto', imageAspectRatio: 'wide' } } }),
   ]);
   assert.ok(responses.every(item => item.result?.isError));
   assert.match(responses.find(item => item.id === 'ask-extra').result.content[0].text, /Unknown ask argument/);
   assert.match(responses.find(item => item.id === 'ask-bad-file').result.content[0].text, /absolute path/);
   assert.match(responses.find(item => item.id === 'ask-bad-mode').result.content[0].text, /mode must be one of/);
+  assert.match(responses.find(item => item.id === 'ask-search-mode').result.content[0].text, /mode must be one of/);
   assert.match(responses.find(item => item.id === 'ask-deep-research-mode').result.content[0].text, /mode must be one of/);
   assert.match(responses.find(item => item.id === 'ask-bad-ratio').result.content[0].text, /imageAspectRatio must be one of/);
-  assert.match(responses.find(item => item.id === 'ask-ratio-search-conflict').result.content[0].text, /imageAspectRatio requires mode=image/);
+  assert.match(responses.find(item => item.id === 'ask-ratio-mode-conflict').result.content[0].text, /imageAspectRatio requires mode=image/);
 }
 
 function testOversizedLineRecovery() {

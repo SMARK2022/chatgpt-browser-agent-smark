@@ -46,7 +46,7 @@ const DAEMON_FILE      = path.join(STATE_DIR, 'daemon.json');
 const DAEMON_LOG       = path.join(STATE_DIR, 'daemon.log');
 const CHATGPT_URL      = 'https://chatgpt.com';
 const DEFAULT_PROJECT  = process.env.CHATGPT_PROJECT || process.env.CHATGPT_PROJECT_NAME || process.env.CHATGPT_PROJECT_URL || 'MCP';
-const DAEMON_VERSION   = 10;
+const DAEMON_VERSION   = 16;
 const RESPONSE_TIMEOUT = positiveIntEnv('CHATGPT_RESPONSE_TIMEOUT_MS', 540_000); // 大文件分析会很慢，默认给 9 分钟。
 const MAX_RETURN_CHARS = positiveIntEnv('CHATGPT_MAX_RETURN_CHARS', 6_000);
 const RESPONSE_PREVIEW_CHARS = positiveIntEnv('CHATGPT_RESPONSE_PREVIEW_CHARS', 4_000);
@@ -63,7 +63,7 @@ const MAX_UPLOAD_FILES = positiveIntEnv('CHATGPT_MAX_UPLOAD_FILES', 12);
 const MAX_UPLOAD_BYTES = positiveIntEnv('CHATGPT_MAX_UPLOAD_BYTES', 400 * 1024 * 1024);
 const MAX_TOTAL_UPLOAD_BYTES = positiveIntEnv('CHATGPT_MAX_TOTAL_UPLOAD_BYTES', 800 * 1024 * 1024);
 const MAX_FULL_PROMPT_CHARS = positiveIntEnv('CHATGPT_MAX_FULL_PROMPT_CHARS', 500_000);
-const ASK_MODES = new Set(['auto', 'search', 'image']);
+const ASK_MODES = new Set(['auto', 'image']);
 // 图片比例来自实测的 ChatGPT image popover；保存语义枚举，DOM 本地化标签留给 adapter 翻译。
 const IMAGE_ASPECT_RATIOS = new Set(['auto', 'square', 'portrait', 'story', 'landscape', 'wide']);
 const EXPLICIT_UPLOAD_ROOTS = uploadRoots();
@@ -74,7 +74,6 @@ const CHATGPT_DOM = createChatGPTDom({
 });
 
 // 运行状态和会话索引分离：浏览器 profile/daemon 放插件状态目录，#xxxxxxxxxx 会话索引放用户级 opencode 数据目录。
-assertRuntimeDirsSafe();
 ensurePrivateDir(STATE_DIR);
 ensurePrivateDir(USER_DATA_DIR);
 ensurePrivateDir(PROFILE_DIR);
@@ -194,24 +193,6 @@ function ensurePrivateDir(dir) {
   // Windows chmod 不是完整 ACL 管理，但仍尽力压低 POSIX/WSL/类 Unix 环境下的目录权限。
   fs.chmodSync(dir, 0o700);
   lockDownWindowsAcl(dir, true);
-}
-
-function assertRuntimeDirsSafe() {
-  // 旧版 OpenCode MCP 配置会把 state 指向插件子目录；启动层只保证私有权限和 .gitignore，不再硬拒绝。
-}
-
-function runtimeDirInsideUnsafe(dir) {
-  // 显式 runtime dir 要按 realpath 判断；Windows junction/symlink 不能绕进 workspace 内部。
-  const target = path.resolve(dir);
-  const existing = nearestExistingPath(target);
-  const realTarget = path.resolve(fs.realpathSync.native(existing), path.relative(existing, target));
-  return runtimeUnsafeRoots().some(root => pathInside(root, target) || pathInside(fs.existsSync(root) ? fs.realpathSync.native(root) : root, realTarget));
-}
-
-function nearestExistingPath(target) {
-  let current = path.resolve(target);
-  while (!fs.existsSync(current) && path.dirname(current) !== current) current = path.dirname(current);
-  return current;
 }
 
 function ensureWorkspaceCacheDir(workspaceDir, dir) {
@@ -599,6 +580,7 @@ function writeSessionEntry(sessionID, project, url, updates = {}) {
 
 function markSessionPending(sessionID, project, url, savedResponse, options = {}) {
   // pending 是“下一次同 session 先恢复”的保护标记，即使没有文本快照也要记录远端仍可能在生成。
+  // 原生图片需要发送前 URL 快照；否则恢复 image-only 回答时会把同会话旧图重新收集一遍。
   writeSessionEntry(sessionID, project, url, {
     lost: null,
     completed: options.preserveCompleted ? undefined : null,
@@ -606,6 +588,7 @@ function markSessionPending(sessionID, project, url, savedResponse, options = {}
       status: 'generating',
       savedAt: new Date().toISOString(),
       savedResponse: savedResponse || null,
+      nativeImageURLs: Array.isArray(options.nativeImageURLs) ? options.nativeImageURLs : undefined,
     },
   });
 }
@@ -886,7 +869,7 @@ function buildResponseResult(raw, workspaceDir, sessionID, options = {}) {
  * completed 才收集 sandbox/native-image 产物；generating 只保存文本快照。这个分界很重要：
  * 如果在远端工具调用未结束时强行点下载按钮，容易把半成品或旧文件误当成本次结果。
  */
-async function persistAssistantResult({ page, project, workspaceDir, sessionID, raw, status, saveToFile, promptSent, requestHash, allowPlainUrl, notice, saveLabel, finalUrl, forceSave, forcePreview, shouldCancel = () => false, log }) {
+async function persistAssistantResult({ page, project, workspaceDir, sessionID, raw, status, saveToFile, promptSent, requestHash, allowPlainUrl, notice, saveLabel, finalUrl, forceSave, forcePreview, shouldCancel = () => false, beforeState = null, log }) {
   const dirs = sessionCacheDirs(workspaceDir, sessionID);
   ensureWorkspaceCacheDir(workspaceDir, dirs.downloads);
 
@@ -895,7 +878,7 @@ async function persistAssistantResult({ page, project, workspaceDir, sessionID, 
   const artifactSkipped = status === 'completed' && shouldCancel();
   // 已完成但调用方断连时不清 pending：下次 recovery 还应有机会收集 sandbox/native-image 产物。
   const artifactResult = status === 'completed' && !artifactSkipped
-    ? await CHATGPT_DOM.collectArtifacts(page, dirs.downloads, log, shouldCancel).catch(err => ({ downloads: [], notices: [`Artifact collection failed: ${err.message}`] }))
+    ? await CHATGPT_DOM.collectArtifacts(page, dirs.downloads, log, shouldCancel, beforeState).catch(err => ({ downloads: [], notices: [`Artifact collection failed: ${err.message}`] }))
     : { downloads: [], notices: shouldCancel() ? ['Artifact collection skipped because caller disconnected.'] : [] };
   const downloads = artifactResult.downloads || [];
   artifactNotice = (artifactResult.notices || []).join('\n') || null;
@@ -927,7 +910,7 @@ async function persistAssistantResult({ page, project, workspaceDir, sessionID, 
   }
 
   if (isChatSessionUrlForProject(finalUrl, project, { allowPlain: promptSent || allowPlainUrl })) {
-    if (resolvedStatus === 'generating') markSessionPending(sessionID, project, finalUrl, result.savedResponse);
+    if (resolvedStatus === 'generating') markSessionPending(sessionID, project, finalUrl, result.savedResponse, { nativeImageURLs: beforeState?.nativeImageURLs });
     else markSessionCompleted(
       sessionID,
       project,
@@ -953,7 +936,7 @@ async function persistAssistantResult({ page, project, workspaceDir, sessionID, 
  * 这个函数是 pending suppression 的执行点：它只读取当前 DOM，保存可见文本和产物，
  * 明确返回 `promptSent:false`。调用方传进来的新 prompt 在这里不会进入 ChatGPT 页面。
  */
-async function recoverCurrentAssistant(page, workspaceDir, sessionID, project, reason, log) {
+async function recoverCurrentAssistant(page, workspaceDir, sessionID, project, session, reason, log) {
   await CHATGPT_DOM.focus(page);
   const state = await CHATGPT_DOM.state(page);
   const unansweredUserMessage = state.userCount > state.count;
@@ -976,6 +959,7 @@ async function recoverCurrentAssistant(page, workspaceDir, sessionID, project, r
     allowPlainUrl: true,
     forceSave: !!raw,
     forcePreview: !!raw,
+    beforeState: { nativeImageURLs: Array.isArray(session?.pending?.nativeImageURLs) ? session.pending.nativeImageURLs : [] },
     log,
     saveLabel: status === 'generating'
       ? 'Current partial assistant response saved locally before returning to OpenCode'
@@ -1160,7 +1144,7 @@ async function runAsk(runtime, input, sessionID, log, shouldCancel = () => false
     const freshPending = session?.pending && isPendingFresh(session.pending);
     if (freshPending || (session?.pending && (currentState.generating || unansweredUserMessage || currentState.lastText)) || (session && (currentState.generating || unansweredUserMessage))) {
       // 已有未完成状态时，本次输入被当作“恢复请求”，不会写入 ChatGPT 页面。
-      return recoverCurrentAssistant(page, workspaceDir, sessionID, runtime.project, recoveryReason(sessionID, currentState, unansweredUserMessage, session), log);
+      return recoverCurrentAssistant(page, workspaceDir, sessionID, runtime.project, session, recoveryReason(sessionID, currentState, unansweredUserMessage, session), log);
     }
     if (session?.pending) {
       log(`Clearing stale pending marker for ${sessionID}; no recoverable DOM state is visible`);
@@ -1283,6 +1267,7 @@ async function finishAsk({ page, runtime, beforeState, sessionID, workspaceDir, 
     finalUrl: finalUrl || currentUrl,
     promptSent: true,
     shouldCancel,
+    beforeState,
     log,
     saveLabel: stillGenerating
       ? 'Current partial assistant response saved locally before returning to OpenCode'

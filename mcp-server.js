@@ -24,9 +24,9 @@ const crypto        = require('crypto');
 
 const SCRIPT = path.join(__dirname, 'chatgpt.js');
 const MCP_PROTOCOL_VERSION = '2024-11-05';
-// mode 是唯一新增的“能力开关”：把 ChatGPT Web 已实测的 composer 入口映射成小 enum。
+// mode 只保留会改变产物类型的 UI 入口；网页检索交给 prompt/ChatGPT 自己判断，避免 schema 诱导过度搜索。
 // 代理/任务/外部 App 入口暂不进 schema，因为它们会触发隐私确认、计划任务或第三方应用语义。
-const ASK_MODES = new Set(['auto', 'search', 'image']);
+const ASK_MODES = new Set(['auto', 'image']);
 const IMAGE_ASPECT_RATIOS = new Set(['auto', 'square', 'portrait', 'story', 'landscape', 'wide']);
 const CHATGPT_ASK_HTTP_TIMEOUT = positiveIntEnv('CHATGPT_ASK_HTTP_TIMEOUT_MS', 620_000);
 // 旧版 opencode config 可能只覆盖 CLI timeout，留下更长的 ask HTTP 默认值；这里自动抬高外层预算。
@@ -419,9 +419,9 @@ const TOOLS = [
         },
         mode: {
           type: 'string',
-          enum: ['auto', 'search', 'image'],
+          enum: ['auto', 'image'],
           // 这里不暴露 DOM 文案本身；模型只看到稳定语义，具体 selector 漂移由 browser adapter 吸收。
-          description: 'Optional ChatGPT composer mode. auto leaves ChatGPT in normal mode and lets it decide whether web access is useful; search explicitly selects Web Search and adds a source-backed workflow hint; image selects Create Image before sending.',
+          description: 'Optional ChatGPT composer mode. auto leaves ChatGPT in normal mode, including ordinary web/research use when the prompt asks for it or ChatGPT finds it useful; image selects Create Image before sending.',
         },
         imageAspectRatio: {
           type: 'string',

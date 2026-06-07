@@ -162,11 +162,11 @@ function createChatGPTDom({ responseTimeout, asyncDetachMs }) {
     },
 
     /** artifact 收集必须在 adapter 内串行化，防止 Chrome downloadPath 串会话。 */
-    async collectArtifacts(page, downloadDir, log, shouldCancel = () => false) {
+    async collectArtifacts(page, downloadDir, log, shouldCancel = () => false, beforeState = null) {
       return withArtifactDownloadLock(async () => {
         // sandbox 与原生图片共用 artifact 数量/字节预算；耗时由外层 ask/MCP 生命周期决定。
         const files = await downloadSandboxFiles(page, downloadDir, log, MAX_ARTIFACTS, MAX_ARTIFACT_BYTES, shouldCancel).catch(err => ({ downloads: [], notices: [`Sandbox artifact collection failed: ${err.message}`] }));
-        const images = await downloadNativeImages(page, downloadDir, log, Math.max(0, MAX_ARTIFACTS - files.downloads.length), Math.max(0, MAX_ARTIFACT_BYTES - downloadedBytes(files.downloads)), shouldCancel).catch(err => ({ downloads: [], notices: [`Native image collection failed: ${err.message}`] }));
+        const images = await downloadNativeImages(page, downloadDir, log, Math.max(0, MAX_ARTIFACTS - files.downloads.length), Math.max(0, MAX_ARTIFACT_BYTES - downloadedBytes(files.downloads)), shouldCancel, beforeState?.nativeImageURLs || []).catch(err => ({ downloads: [], notices: [`Native image collection failed: ${err.message}`] }));
         // 返回值保留成功产物和失败说明，core 可以展示部分成功结果而不是把整次回答判失败。
         return {
           downloads: [...files.downloads, ...images.downloads],
@@ -214,24 +214,26 @@ function createChatGPTDom({ responseTimeout, asyncDetachMs }) {
 
   async function selectComposerMode(page, mode, log) {
     // mode 选择必须发生在 fillPrompt 之前；ChatGPT 切模式会重排 composer，晚选可能清空已填文本。
+    // UI 文案会跟随账号语言变化；公开 API 不能要求用户把 ChatGPT 固定成中文界面。
+    // 因此 adapter 只在这一层维护中英文 label，schema 仍暴露稳定的 `image` 语义。
     const labels = {
       auto: null,
-      search: '网页搜索',
-      image: '创建图片',
+      image: ['创建图片', 'Create image'],
     };
-    const label = labels[mode || 'auto'];
-    if (!label) return;
+    const options = labels[mode || 'auto'];
+    if (!options) return;
     // plus 菜单的模式项是 role=menuitemradio，而不是 button；这是实机 DOM 探测得到的稳定入口。
     await page.waitForSelector('#composer-plus-btn', { timeout: 10_000 });
     await page.click('#composer-plus-btn');
     await sleep(600);
-    const clicked = await page.evaluate(label => {
-      const item = [...document.querySelectorAll('[role="menuitemradio"], [role="menuitem"]')]
-        .find(el => (el.innerText || el.textContent || '').trim() === label);
+    const clicked = await page.evaluate(options => {
+      const norm = value => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      const item = [...document.querySelectorAll('[role="menuitemradio"], [role="menuitem"], [role="option"], [role="radio"], button')]
+        .find(el => options.some(label => norm(el.innerText || el.textContent || el.getAttribute('aria-label')) === norm(label)));
       if (!item) return false;
       item.click();
       return true;
-    }, label);
+    }, options);
     if (!clicked) throw new Error(`Could not select ChatGPT composer mode: ${mode}`);
     await sleep(800);
     await page.keyboard.press('Escape').catch(() => {});
@@ -244,8 +246,7 @@ function createChatGPTDom({ responseTimeout, asyncDetachMs }) {
       const text = [...form.querySelectorAll('button, [role="button"]')]
         .map(el => `${el.innerText || el.textContent || ''} ${el.getAttribute('aria-label') || ''}`)
         .join(' ');
-      if (mode === 'search') return /搜索，点击以重试|\b搜索\b/.test(text);
-      if (mode === 'image') return /图片，点击以重试|选择图片宽高比|\b图片\b/.test(text);
+      if (mode === 'image') return /图片，点击以重试|选择图片宽高比|\b图片\b|image, click to retry|select image aspect ratio|\bimage\b/i.test(text);
       return true;
     }, mode);
     if (!active) throw new Error(`ChatGPT composer mode did not become active: ${mode}`);
@@ -256,35 +257,68 @@ function createChatGPTDom({ responseTimeout, asyncDetachMs }) {
     // 图片比例是“创建图片”模式下的二级 popover。每次 image ask 都显式选一次，避免沿用上次手动选择。
     if (mode !== 'image') return;
     const labels = {
-      auto: '自动',
-      square: '方形 1:1',
-      portrait: '竖版 3:4',
-      story: '故事版 9:16',
-      landscape: '横版 4:3',
-      wide: '宽屏 16:9',
+      auto: ['自动', 'Auto'],
+      square: ['方形 1:1', '正方形 1:1', 'Square 1:1'],
+      portrait: ['竖版 3:4', 'Portrait 3:4'],
+      story: ['故事版 9:16', 'Story 9:16'],
+      landscape: ['横版 4:3', 'Landscape 4:3'],
+      wide: ['宽屏 16:9', 'Wide 16:9'],
     };
-    const label = labels[ratio || 'auto'];
-    if (!label) throw new Error(`Unsupported imageAspectRatio: ${ratio}`);
-    // 先用真实鼠标事件打开 popover：实测 DOM .click() 有时只切 pill，不展开宽高比菜单。
-    await page.waitForSelector('button[aria-label="选择图片宽高比"]', { timeout: 10_000 });
-    await page.click('button[aria-label="选择图片宽高比"]');
-    await sleep(1_000);
-    const clicked = await page.evaluate(label => {
+    const options = labels[ratio || 'auto'];
+    if (!options) throw new Error(`Unsupported imageAspectRatio: ${ratio}`);
+    // 宽高比按钮本身也本地化：先在 composer 内找“比例/ratio”按钮，再用页面侧真实 click 打开 popover。
+    // 不直接依赖单个 aria-label，是因为中文界面显示“选择图片宽高比”，英文界面可能只保留 ratio 文案；
+    // 但入口匹配不能只看 Auto：composer 里还有模型/工具的 Auto 按钮，点错会打开无关菜单。
+    const openerSelector = () => {
       const norm = value => String(value || '').replace(/\s+/g, ' ').trim();
+      const input = document.querySelector('#prompt-textarea');
+      const form = input?.closest('form') || input?.parentElement?.parentElement;
+      return [...(form?.querySelectorAll('button, [role="button"]') || [])]
+        .find(item => /选择图片宽高比|image aspect ratio|aspect ratio|ratio|1:1|3:4|9:16|4:3|16:9|方形|正方形|square|竖版|portrait|故事版|story|横版|landscape|宽屏|wide/i.test(`${norm(item.innerText || item.textContent)} ${norm(item.getAttribute('aria-label'))}`)) || null;
+    };
+    await page.waitForFunction(openerSelector, { timeout: 10_000 });
+    const openerHandle = await page.evaluateHandle(openerSelector);
+    const openerElement = openerHandle.asElement();
+    if (!openerElement) throw new Error(`Could not open image aspect ratio menu`);
+    const openerText = await openerElement.evaluate(el => `${el?.innerText || el?.textContent || ''} ${el?.getAttribute('aria-label') || ''}`.replace(/\s+/g, ' ').trim()).catch(() => 'unknown');
+    // 这里必须用 Puppeteer 的 ElementHandle.click() 走真实鼠标事件；ChatGPT 的 popover 绑定在交互事件链上，
+    // 直接在 page.evaluate 里调用 DOM .click() 实测会出现“按钮被点了但菜单没有打开”的假成功。
+    await openerElement.click();
+    await openerHandle.dispose().catch(() => {});
+    await sleep(1_000);
+    const clicked = await page.evaluate(options => {
+      const norm = value => String(value || '').replace(/\s+/g, ' ').trim();
+      const numerics = options.map(label => norm(label).match(/\d+:\d+/)?.[0]).filter(Boolean);
       const item = [...document.querySelectorAll('[role="menuitemradio"], [role="menuitem"]')]
-        .find(el => [el.innerText, el.textContent, el.getAttribute('aria-label')].some(value => norm(value) === label));
+        .find(el => {
+          const text = [el.innerText, el.textContent, el.getAttribute('aria-label')].map(value => norm(value).toLowerCase()).join(' ');
+          return options.some(label => text.includes(norm(label).toLowerCase())) || numerics.some(numeric => text.includes(numeric));
+        });
       if (!item) return false;
       item.click();
       return true;
-    }, label);
-    if (!clicked) throw new Error(`Could not select image aspect ratio: ${ratio || 'auto'}`);
+    }, options);
+    if (!clicked) {
+      const available = await page.evaluate(() => [...document.querySelectorAll('[role="menuitemradio"], [role="menuitem"], [role="option"], [role="radio"], button')]
+        .map(el => `${el.innerText || el.textContent || ''} ${el.getAttribute('aria-label') || ''}`.replace(/\s+/g, ' ').trim())
+        .filter(Boolean)
+        .slice(0, 12));
+      throw new Error(`Could not select image aspect ratio: ${ratio || 'auto'}; opener: ${openerText || 'unknown'}; available: ${available.join(' | ') || 'none'}`);
+    }
     await sleep(500);
-    const active = await page.evaluate(label => {
+    const active = await page.evaluate(options => {
       // 选中后按钮可能只显示“方形/宽屏”而不显示完整比例；名称或数值命中任一即可确认。
-      const text = (document.querySelector('button[aria-label="选择图片宽高比"]')?.innerText || '').replace(/\s+/g, ' ').trim();
-      const [name, numeric] = label.split(' ');
-      return text === label || text.includes(name) || numeric && text.includes(numeric);
-    }, label);
+      const norm = value => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      const input = document.querySelector('#prompt-textarea');
+      const form = input?.closest('form') || input?.parentElement?.parentElement;
+      const text = [...(form?.querySelectorAll('button, [role="button"]') || [])]
+        .map(button => `${norm(button.innerText || button.textContent)} ${norm(button.getAttribute('aria-label'))}`)
+        .join(' ');
+      return options.some(label => {
+        const [name, numeric] = norm(label).split(' ');
+        return text.includes(norm(label)) || text.includes(name) || numeric && text.includes(numeric);
+      });
+    }, options);
     if (!active) throw new Error(`Image aspect ratio did not become active: ${ratio || 'auto'}`);
     await page.keyboard.press('Escape').catch(() => {});
     log(`Selected image aspect ratio: ${ratio || 'auto'}`);
@@ -736,13 +770,14 @@ function createChatGPTDom({ responseTimeout, asyncDetachMs }) {
         .map(button => `${button.getAttribute('aria-label') || ''} ${button.textContent || ''}`.trim())
         .filter(Boolean);
       const stopButton = !!document.querySelector('button[data-testid="stop-button"], button[aria-label*="Stop"], button[aria-label*="停止"]');
-      // 图片计数单独保留，覆盖“只有原生绘图结果、没有 assistant 文本”的完成路径。
-      // 原生绘图回答会生成 image-turn，而不是 assistant role；全页计数才能让 image-only 任务从 pending 恢复。
-      const nativeImageCount = generatedImageCount(document);
+      // 图片 URL 快照既用于完成判定，也用于下载阶段过滤旧图；复用同一 session 时不能把历史图片当本轮产物。
+      // 原生绘图回答会生成 image-turn，而不是 assistant role；全页快照才能让 image-only 任务从 pending 恢复。
+      const nativeImageURLs = generatedImageURLs(document);
       return {
         count: existingCount ?? msgs.length,
         userCount,
-        nativeImageCount,
+        nativeImageCount: nativeImageURLs.length,
+        nativeImageURLs,
         lastText,
         copyButton: assistantLabels.some(label => /copy|复制/i.test(label)),
         generating: stopButton,
@@ -758,13 +793,14 @@ function createChatGPTDom({ responseTimeout, asyncDetachMs }) {
         return msgs.length === 0 && turns.some(turn => /^(ChatGPT\s*说[:：]?|ChatGPT said[:：]?)$/.test((turn.innerText || turn.textContent || '').replace(/\s+/g, ' ').trim()));
       }
 
-      function generatedImageCount(root) {
-        if (!root) return 0;
-        return [...root.querySelectorAll('img')].filter(img => {
-          const src = img.currentSrc || img.src || '';
-          return /\/backend-api\/estuary\/content/.test(src) &&
-            (/generated image/i.test(img.alt || '') || img.naturalWidth >= 256 || img.naturalHeight >= 256);
-        }).length;
+      function generatedImageURLs(root) {
+        if (!root) return [];
+        const seen = new Set();
+        return [...root.querySelectorAll('img')]
+          .map(img => ({ src: img.currentSrc || img.src || '', alt: img.alt || '', width: img.naturalWidth || 0, height: img.naturalHeight || 0 }))
+          .filter(img => /\/backend-api\/estuary\/content/.test(img.src) && (/generated image/i.test(img.alt) || img.width >= 256 || img.height >= 256))
+          .filter(img => seen.has(img.src) ? false : (seen.add(img.src), true))
+          .map(img => img.src);
       }
     }, count);
   }
@@ -1040,16 +1076,19 @@ function createChatGPTDom({ responseTimeout, asyncDetachMs }) {
    * 原生图片不走 sandbox，也通常没有下载按钮；页面里的 estuary/content URL 需要登录态 cookie。
    * 因此只在 page.evaluate 内发现 URL，实际 fetch/write 由 Node stream 完成。
    */
-  async function downloadNativeImages(page, downloadDir, log, limit, byteBudget, shouldCancel) {
+  async function downloadNativeImages(page, downloadDir, log, limit, byteBudget, shouldCancel, previousURLs = []) {
     if (limit <= 0) return { downloads: [], notices: [] };
     ensurePrivateDir(downloadDir);
     // 只在页面里发现候选 URL；实际字节用 Node stream 写盘，避免大图经过 CDP/base64 双重放大。
     // 这样仍然复用浏览器 cookie，但大文件压力落在 Node stream/backpressure，而不是 Puppeteer 协议消息。
     const result = await page.evaluate(limits => {
       // 原生图片生成结果可能落在独立 image-generation turn，而不是 assistant role 节点。
-      // 这里扫描当前 conversation page 的 estuary 图；跨会话隔离由 core 的 page/session 绑定保证。
+      // 所以仍扫描全页，但只保存发送前快照中不存在的 URL，避免复用 session 时把老图误报成本轮产物。
+      // 这个“before snapshot -> new URL”策略比猜测 latest turn 更稳：ChatGPT 的图片 turn DOM 会变，
+      // 但同一远端 estuary URL 不会因为布局重排变成本轮新增结果。
       // 下载阶段仍按 URL 去重，避免响应式预览图、overlay 图和真实图三层 DOM 指向同一个远端对象时重复落盘。
       const seen = new Set();
+      const previous = new Set(limits.previousURLs || []);
       const candidates = [...document.querySelectorAll('img')]
         .map(img => ({ src: img.currentSrc || img.src || '', alt: img.alt || '', width: img.naturalWidth || 0, height: img.naturalHeight || 0 }))
         .filter(img => {
@@ -1058,12 +1097,13 @@ function createChatGPTDom({ responseTimeout, asyncDetachMs }) {
           catch { return false; }
         })
         .filter(img => /generated image/i.test(img.alt) || img.width >= 256 || img.height >= 256)
+        .filter(img => !previous.has(img.src))
         .filter(img => seen.has(img.src) ? false : (seen.add(img.src), true))
         .slice(0, limits.maxImages);
       const notices = [];
       // notices 只记录“看见了候选但没保存”的情况；没有候选图时保持空，避免制造噪声。
       return { images: candidates.map(image => ({ ...image, sourceID: image.src.match(/[?&]id=([^&]+)/)?.[1] || '' })), notices };
-    }, { maxImages: limit });
+    }, { maxImages: limit, previousURLs });
 
     const notices = [...(result.notices || [])];
     const downloads = [];
