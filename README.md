@@ -278,7 +278,7 @@ Inputs:
   "context": "Optional additional context",
   "git": true,
   "file": ["F:\\absolute\\path\\file.txt", "F:\\absolute\\path\\notes.docx"],
-  "mode": "auto",
+  "mode": "image",
   "imageAspectRatio": "wide",
   "saveToFile": true
 }
@@ -291,18 +291,13 @@ conversation from any OpenCode working directory.
 `git: true` attaches `git branch --show-current`, `git status --short`, and
 `git diff HEAD` from the OpenCode working directory.
 
-`mode` optionally selects a known ChatGPT composer mode before sending the
-prompt. Supported values are `auto` and `image`. `auto` keeps normal ChatGPT
-behavior, including ordinary web/research use when the prompt asks for current
-information or ChatGPT decides browsing materially improves the answer. There is
-no separate `search` mode exposed to OpenCode: live tests showed that plain
-prompts can still produce web citation pills, while a schema-level search flag
-adds another model decision branch without a reliable answer-quality benefit.
+`mode` selects only behaviors that change the ChatGPT composer itself. Supported
+values are `auto` and `image`. Use `auto` for normal text, research, file,
+sandbox, and document tasks; put any web-search/source requirement directly in
+`prompt`. Use `image` only for native ChatGPT image generation.
 
-Deep Research, Agent mode, scheduled tasks, and external app modes are not exposed
-through MCP because live UI tests showed empty-turn, privacy/onboarding,
-scheduled-task, or external-account semantics that do not fit a normal OpenCode
-ask.
+Only `auto` and `image` are exposed. Other ChatGPT UI modes are intentionally not
+part of this MCP API.
 
 `imageAspectRatio` is optional and only applies to native ChatGPT image generation.
 If it is provided without `mode`, the bridge infers `mode: "image"`. Supported
@@ -317,13 +312,13 @@ landscape  -> 横版 4:3
 wide       -> 宽屏 16:9
 ```
 
-This is useful for OpenCode workflows that need predictable visual artifacts:
-square icons, wide architecture diagrams, portrait posters, or story-sized mobile
-mockups. The ratio selector is deliberately kept out of `mode` so normal text,
-analysis, and research calls do not inherit image-generation state.
+This is useful when OpenCode needs predictable visual artifacts: square icons,
+wide architecture diagrams, portrait posters, or story-sized mobile mockups. The
+ratio selector stays separate from `mode` so normal text, analysis, and research
+calls do not inherit image-generation state.
 
 Web citations are extracted from ChatGPT's citation-pill DOM whenever ChatGPT uses
-web/research sources in normal mode. ChatGPT may show sources as site-name pills
+web/source lookup in auto mode. ChatGPT may show sources as site-name pills
 rather than literal `[1]` text, so the bridge converts those pills into local
 `[Ref n]` markers and appends a `References` section with the source URLs. This
 avoids relying on the browser clipboard copy button, which is not stable under

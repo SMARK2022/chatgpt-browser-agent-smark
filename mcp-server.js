@@ -376,14 +376,9 @@ const TOOLS = [
   {
     name: 'ask',
     description:
-      'Ask ChatGPT via the user\'s logged-in chatgpt.com browser session. ' +
-      'Use for web-backed research, current documentation, ecosystem and issue investigation, ' +
-      'repository or architecture research, debugging ideas, implementation guidance, file analysis, ' +
-      'summarization, comparison, data-analysis help, Python/sandbox analysis, regression/fitting tasks, ' +
-      'native image-generation requests, PPTX/DOCX/CSV/TXT-style document or dataset creation, ' +
-      'and other work where ChatGPT\'s web/project tools can help. When the web UI exposes detectable sandbox files or native images, they are saved under the current project cache. ' +
-      'The daemon auto-starts on first use and stays alive between calls. Different sessionIDs can run on separate browser pages; ' +
-      'if an existing session is still generating, the tool will not send the new prompt and returns/saves the current assistant snapshot instead.',
+      'Send a task to ChatGPT Web through the user\'s logged-in browser. Use for external/current-source research, repository or issue investigation, large-file review, data/sandbox analysis, document artifacts, or native image generation. ' +
+      'This bridge does not execute local commands or edit local files. Put web/source requirements in prompt text; use mode=image only for native images. Detectable sandbox files and native images are saved under the current project cache. ' +
+      'Omit sessionID for a new conversation; pass one to continue or recover it. If that session is still generating, the new prompt is not sent and the current assistant snapshot is returned/saved instead.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -391,43 +386,43 @@ const TOOLS = [
           type: 'string',
           minLength: 1,
           maxLength: 200000,
-          description: 'The question or task to send to ChatGPT',
+          description: 'Task for ChatGPT. Include web-search/source requirements directly in this text when needed.',
         },
         sessionID: {
           type: 'string',
           pattern: '^#?(?:[a-fA-F0-9]{10}|[a-fA-F0-9]{6})$',
-          description: 'Optional global ChatGPT session handle like #4fa92c9d10. Legacy 6-hex handles are accepted and migrated to 10 hex. Omit to create a new session; pass an existing ID to continue it or recover a still-generating answer.',
+          description: 'Optional ChatGPT conversation handle, e.g. #4fa92c9d10. Omit for a new conversation; pass an existing ID to continue or recover it.',
         },
         context: {
           type: 'string',
           maxLength: 200000,
-          description: 'Additional curated context to prepend to the prompt',
+          description: 'Curated local context prepended before the task. Keep it focused; large files should use file uploads.',
         },
         git: {
           type: 'boolean',
-          description: 'If true, attach git branch, status, and diff from the current OpenCode working directory as context',
+          description: 'Attach current branch, status, and bounded diff from the OpenCode working directory.',
         },
         file: {
           oneOf: [
             { type: 'string' },
             { type: 'array', maxItems: MAX_UPLOAD_FILES, items: { type: 'string' } },
           ],
-          description: 'Absolute path, or array of absolute paths, to local files to upload to ChatGPT via the attachment button',
+          description: 'Absolute path or array of absolute paths to upload through ChatGPT attachments. Paths must be staged under the current project chatgpt uploads cache or an allowed CHATGPT_UPLOAD_ROOTS entry.',
         },
         saveToFile: {
           type: 'boolean',
-          description: 'If true, save ChatGPT\'s text response under <current-project>/.opencode/cache/chatgpt/responses/<sessionID>/ and return only metadata.',
+          description: 'Save the text response under <current-project>/.opencode/cache/chatgpt/responses/<sessionID>/ and return metadata instead of inline text.',
         },
         mode: {
           type: 'string',
           enum: ['auto', 'image'],
           // 这里不暴露 DOM 文案本身；模型只看到稳定语义，具体 selector 漂移由 browser adapter 吸收。
-          description: 'Optional ChatGPT composer mode. auto leaves ChatGPT in normal mode, including ordinary web/research use when the prompt asks for it or ChatGPT finds it useful; image selects Create Image before sending.',
+          description: 'Composer mode. auto is normal ChatGPT; ask for web sources in the prompt. image selects native Create Image.',
         },
         imageAspectRatio: {
           type: 'string',
           enum: ['auto', 'square', 'portrait', 'story', 'landscape', 'wide'],
-          description: 'Optional image generation aspect ratio. Only valid with mode=image; omitted mode is inferred as image. Maps to auto, square 1:1, portrait 3:4, story 9:16, landscape 4:3, or wide 16:9.',
+          description: 'Native image aspect ratio. Use only with mode=image or omit mode so image mode is inferred; do not combine with mode=auto. Values: auto, square 1:1, portrait 3:4, story 9:16, landscape 4:3, wide 16:9.',
         },
       },
       required: ['prompt'],

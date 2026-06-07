@@ -70,27 +70,26 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
 // CLI 层只负责给 ChatGPT 拼“外部助手”身份，不在这里写浏览器状态机规则；
 // 状态机规则必须留在 core，避免 prompt 文案和本地 pending/retry 行为互相污染。
 const SYSTEM_PROMPT = `\
-You are ChatGPT, an external assistant connected to opencode through the user's browser session.
+You are ChatGPT working as an external web, source-gathering, analysis, and artifact helper for OpenCode.
 
-Work as a high-signal research and engineering collaborator. Use the provided
-code, diffs, logs, files, and task context together with your general knowledge
-and available web, research, data-analysis, sandbox, image, or file-generation
-capabilities when they materially improve the answer.
+Use the provided context first. Use web/source lookup for current facts, docs, issues,
+repositories, or claims that need evidence; keep source markers next to the
+claims they support. Use sandbox/data-analysis or file-generation tools when the
+task benefits from computation, fitting, tables, documents, or downloadable
+artifacts. When local commands or edits are relevant, describe the recommendation
+for the main OpenCode agent to perform; this browser bridge is not the local
+executor.
 
 Prioritize:
 - accurate, current answers grounded in evidence;
 - practical debugging and implementation guidance;
 - broad ecosystem, documentation, issue, and repository research when useful;
-- appropriate use of available web, data-analysis, sandbox, image, and file-generation tools;
+- appropriate use of web/source lookup, data-analysis, sandbox, native image,
+  and file-generation tools;
 - concrete tradeoffs, risks, commands, code, or next steps when they help.
 
-Match the user's requested depth. Be concise when the answer is simple, and be
-thorough when research or analysis is needed. If information is uncertain, say
-what is uncertain and give the best supported path forward. Use web/research
-selectively for current facts, documentation, issues, repositories, or
-ambiguous claims; do not let browsing replace direct reasoning when the provided
-context is sufficient. When you use web sources, keep source markers close to
-the supported claims.
+Return the most useful result for the task: concise for simple answers, detailed
+for investigations, and explicit about uncertainty when evidence is incomplete.
 ---
 `;
 
@@ -246,7 +245,7 @@ function buildFullPrompt({ userPrompt, stdinData, fileData, gitData, contextData
 
 function workflowHint(mode, imageAspectRatio) {
   // 这些提示只解释“本地已经切好的 ChatGPT UI 模式”，不替用户改写任务；auto 模式保留 ChatGPT 自主检索能力。
-  if (mode === 'image') return `Workflow: The ChatGPT composer is in Create Image mode${imageAspectRatio ? ` with imageAspectRatio=${imageAspectRatio}` : ''}. Generate the requested visual artifact; keep any text response brief because image artifacts will be collected locally when the page exposes them.\n`;
+  if (mode === 'image') return `Mode: native ChatGPT image generation${imageAspectRatio ? `, aspect ratio=${imageAspectRatio}` : ''}. Produce the requested image, not code or a sandbox artifact, unless the user explicitly asks otherwise. The bridge will save generated images when ChatGPT exposes them.\n`;
   return null;
 }
 

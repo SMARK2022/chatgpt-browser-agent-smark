@@ -59,13 +59,13 @@ function usage() {
 function buildPrompt(args) {
   // 文件材料应由主 agent 审批并放入 prompt，或走 MCP file 上传；这个 helper 不直接读项目文件。
   const prompt = [
+    'You are ChatGPT Web helping the main OpenCode agent.',
     `Task: ${args.task}`,
-    `Working directory: ${args.cwd}`,
+    `Workspace: ${args.cwd}`,
     '',
-    'You are an external ChatGPT Web helper for OpenCode.',
-    'Use web research, repository/document reasoning, sandbox analysis, data fitting, or document generation when useful.',
-    'Do not ask for local shell commands and do not emit local file-write instructions for this helper to execute.',
-    'Return findings, references, generated artifact descriptions, or analysis for the main OpenCode agent to consume.',
+    'Use web, repository/document reasoning, sandbox analysis, data fitting, or document/data artifact generation only when useful.',
+    'Return findings, sources, analysis, or artifact notes for OpenCode to apply locally.',
+    'Do not present this helper as able to run local commands or edit local files.',
   ].join('\n');
   if (prompt.length > MAX_PROMPT_CHARS) throw new Error(`Prompt exceeds ${MAX_PROMPT_CHARS} characters`);
   return prompt;

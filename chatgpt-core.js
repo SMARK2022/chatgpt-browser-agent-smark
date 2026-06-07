@@ -655,7 +655,7 @@ function validateAskInput(input) {
   if (input.newSession != null && typeof input.newSession !== 'boolean') throw new Error('newSession must be a boolean');
   if (input.mode != null && (typeof input.mode !== 'string' || !ASK_MODES.has(input.mode))) throw new Error(`mode must be one of: ${[...ASK_MODES].join(', ')}`);
   if (input.imageAspectRatio != null && (typeof input.imageAspectRatio !== 'string' || !IMAGE_ASPECT_RATIOS.has(input.imageAspectRatio))) throw new Error(`imageAspectRatio must be one of: ${[...IMAGE_ASPECT_RATIOS].join(', ')}`);
-  // 只给 imageAspectRatio 一个“隐式打开 image mode”的捷径；显式 search+ratio 必须报错，避免隐藏切换语义。
+  // 只给 imageAspectRatio 一个“隐式打开 image mode”的捷径；显式 auto+ratio 必须报错，避免文本模式隐藏切图。
   const mode = input.mode || (input.imageAspectRatio ? 'image' : 'auto');
   if (input.imageAspectRatio && mode !== 'image') throw new Error('imageAspectRatio requires mode=image or omitted mode');
   const workspaceDir = input.workspaceDir ? path.resolve(input.workspaceDir) : process.cwd();
