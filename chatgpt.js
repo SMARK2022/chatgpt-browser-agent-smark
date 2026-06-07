@@ -31,7 +31,7 @@ const { execFileSync, spawn } = require('child_process');
 // ─── Constants and System Prompt ──────────────────────────────────────────────
 
 const CHATGPT_URL = 'https://chatgpt.com';
-const CHROME_PATH = process.env.CHATGPT_BROWSER_PATH || 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
+const CHROME_PATH = process.env.CHATGPT_BROWSER_PATH || defaultBrowserPath();
 const STATE_DIR = path.resolve(process.env.CHATGPT_STATE_DIR || defaultStateDir());
 const PROFILE_DIR = path.join(STATE_DIR, 'profile');
 const BROWSER_USER_DATA_DIR = path.resolve(process.env.CHATGPT_BROWSER_USER_DATA_DIR || PROFILE_DIR);
@@ -43,7 +43,7 @@ const DAEMON_FILE = path.join(STATE_DIR, 'daemon.json');
 const DAEMON_LOCK_FILE = path.join(STATE_DIR, 'daemon.lock');
 const DAEMON_LOG = path.join(STATE_DIR, 'daemon.log');
 const DEFAULT_PROJECT = process.env.CHATGPT_PROJECT || process.env.CHATGPT_PROJECT_NAME || process.env.CHATGPT_PROJECT_URL || 'MCP';
-const DAEMON_VERSION = 17;
+const DAEMON_VERSION = 18;
 const DAEMON_START_TIMEOUT = positiveIntEnv('CHATGPT_DAEMON_START_TIMEOUT_MS', 60_000);
 const BROWSER_CONNECT_TIMEOUT_MS = positiveIntEnv('CHATGPT_BROWSER_CONNECT_TIMEOUT_MS', 3_000);
 const HTTP_TIMEOUT = positiveIntEnv('CHATGPT_HTTP_TIMEOUT_MS', 30_000);
@@ -109,6 +109,34 @@ function uploadRoots() {
 function defaultUploadRoot(workspaceDir) {
   // 默认 staging 与 responses/downloads 同根，避免项目外再散落 opencode-chatgpt-uploads 这类目录。
   return path.join(path.resolve(workspaceDir || process.cwd()), '.opencode', 'cache', 'chatgpt', 'uploads');
+}
+
+function defaultBrowserPath() {
+  // MCP 配置应尽量可迁移；浏览器可执行文件路径按平台自动发现，显式 env 仍优先。
+  // 这里故意只发现 browser binary，不推导系统默认 profile：登录态是敏感凭据，应该由 --login
+  // 写入专用 profile，或由用户显式指定 CHATGPT_BROWSER_USER_DATA_DIR 复用本机已有 profile。
+  const candidates = process.platform === 'darwin'
+    ? [
+        '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+        '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+        '/Applications/Chromium.app/Contents/MacOS/Chromium',
+      ]
+    : process.platform === 'win32'
+      ? [
+          path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+          path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+          path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+          path.join(process.env.LOCALAPPDATA || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+        ]
+      : [
+          '/usr/bin/microsoft-edge',
+          '/usr/bin/microsoft-edge-stable',
+          '/usr/bin/google-chrome',
+          '/usr/bin/google-chrome-stable',
+          '/usr/bin/chromium',
+          '/usr/bin/chromium-browser',
+        ];
+  return candidates.find(file => file && fs.existsSync(file)) || candidates.find(Boolean);
 }
 
 function defaultStateDir() {

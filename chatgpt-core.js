@@ -28,7 +28,7 @@ const { createChatGPTDom } = require('./chatgpt-dom');
 // 常量集中在 core，是因为 daemon/browser/profile/cache 必须由同一层统一决定；
 // CLI 和 MCP 只传入请求，不重新推导这些路径，避免多个入口算出不同目录。
 
-const CHROME_PATH      = process.env.CHATGPT_BROWSER_PATH || 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
+const CHROME_PATH      = process.env.CHATGPT_BROWSER_PATH || defaultBrowserPath();
 const STATE_DIR        = path.resolve(process.env.CHATGPT_STATE_DIR || defaultStateDir());
 const USER_DATA_DIR    = path.resolve(process.env.CHATGPT_SESSION_DIR || defaultUserDataDir());
 const SESSION_DIR      = USER_DATA_DIR;
@@ -46,7 +46,7 @@ const DAEMON_FILE      = path.join(STATE_DIR, 'daemon.json');
 const DAEMON_LOG       = path.join(STATE_DIR, 'daemon.log');
 const CHATGPT_URL      = 'https://chatgpt.com';
 const DEFAULT_PROJECT  = process.env.CHATGPT_PROJECT || process.env.CHATGPT_PROJECT_NAME || process.env.CHATGPT_PROJECT_URL || 'MCP';
-const DAEMON_VERSION   = 17;
+const DAEMON_VERSION   = 18;
 const RESPONSE_TIMEOUT = positiveIntEnv('CHATGPT_RESPONSE_TIMEOUT_MS', 540_000); // 大文件分析会很慢，默认给 9 分钟。
 const MAX_RETURN_CHARS = positiveIntEnv('CHATGPT_MAX_RETURN_CHARS', 6_000);
 const RESPONSE_PREVIEW_CHARS = positiveIntEnv('CHATGPT_RESPONSE_PREVIEW_CHARS', 4_000);
@@ -186,6 +186,32 @@ function positiveIntEnv(name, fallback) {
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function defaultBrowserPath() {
+  // 和 CLI 使用同一套发现顺序；Mac/Linux 不应因为 Windows 默认路径而必须额外写 MCP env。
+  const candidates = process.platform === 'darwin'
+    ? [
+        '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+        '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+        '/Applications/Chromium.app/Contents/MacOS/Chromium',
+      ]
+    : process.platform === 'win32'
+      ? [
+          path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+          path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+          path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+          path.join(process.env.LOCALAPPDATA || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+        ]
+      : [
+          '/usr/bin/microsoft-edge',
+          '/usr/bin/microsoft-edge-stable',
+          '/usr/bin/google-chrome',
+          '/usr/bin/google-chrome-stable',
+          '/usr/bin/chromium',
+          '/usr/bin/chromium-browser',
+        ];
+  return candidates.find(file => file && fs.existsSync(file)) || candidates.find(Boolean);
 }
 
 function ensurePrivateDir(dir) {

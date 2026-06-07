@@ -51,13 +51,8 @@ agent.js         No-exec one-shot ChatGPT helper CLI; no local RUN/FILE actions
 - Microsoft Edge or Google Chrome.
 - A logged-in ChatGPT account.
 
-This fork defaults to Windows Edge:
-
-```text
-C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe
-```
-
-Override it with `CHATGPT_BROWSER_PATH` if needed.
+The browser executable is auto-detected on Windows, macOS, and Linux. Override it
+with `CHATGPT_BROWSER_PATH` if needed.
 
 ## Configuration
 
@@ -95,7 +90,7 @@ CHATGPT_JSON_LOCK_TIMEOUT_MS      Session/project JSON lock wait, default 30000
 CHATGPT_SESSION_MAX_ENTRIES       Max retained ordinary session entries, default 256
 CHATGPT_SESSION_MAX_AGE_MS        Max age for ordinary completed session entries, default 7776000000
 CHATGPT_DAEMON_MAX_REQUEST_BYTES  Local daemon /ask body cap, default 26214400
-CHATGPT_WORKSPACE_ROOTS           Path-delimited allowlist for response/artifact cache roots; defaults to daemon cwd
+CHATGPT_WORKSPACE_ROOTS           Path-delimited allowlist for response/artifact cache roots; omit to trust caller workspaceDir
 CHATGPT_WORKSPACE_DIR             Optional override for current project workspace; normally omit under OpenCode
 CHATGPT_UPLOAD_ROOTS              Extra upload allowlist roots; default is <current-project>/.opencode/cache/chatgpt/uploads
 CHATGPT_MAX_UPLOAD_FILES          Per-request upload file count cap, default 12
@@ -146,6 +141,21 @@ projects.json  Resolved Project name/id/url cache
 daemon.json    Current daemon pid, port, and local bearer token
 daemon.log     Daemon startup/request logs
 ```
+
+Login state is stored in the browser profile, not in `opencode.json` or the MCP
+tool schema. Copying MCP JSON to another machine only migrates configuration; it
+does not migrate ChatGPT cookies. The profile under `CHATGPT_STATE_DIR\profile`
+or a profile selected by `CHATGPT_BROWSER_USER_DATA_DIR` contains browser cookie
+databases that Chrome/Edge encrypt through the operating-system account store,
+such as Windows DPAPI or macOS Keychain. Copying that profile across operating
+systems or users is therefore not a reliable login transfer and should be treated
+as copying credentials.
+
+For a new machine, the supported path is: copy the MCP config, install the
+project, then run `node chatgpt.js --login` once. To reuse a browser already
+logged in on that machine, point `CHATGPT_BROWSER_USER_DATA_DIR` and
+`CHATGPT_BROWSER_PROFILE_DIRECTORY` at that local browser profile, or attach to a
+browser started with a DevTools port through `CHATGPT_BROWSER_CDP_URL`.
 
 `daemon.json` contains the bearer token required by the local HTTP daemon. Prefer
 a user-private state directory outside a shared repository checkout. Any local
