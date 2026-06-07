@@ -87,12 +87,16 @@ function createChatGPTDom({ responseTimeout, asyncDetachMs }) {
     async discoverProjects(page, log) {
       // 项目发现属于 ChatGPT Web DOM/localStorage 适配，而不是 daemon 状态机。
       // 先读 localStorage，避免依赖侧边栏是否展开；失败后再点击 Show more 并扫描 project 链接。
-      await page.goto('https://chatgpt.com', { waitUntil: 'networkidle2', timeout: 30_000 });
-      await sleep(1_000);
       const cached = await cachedProjectsFromPage(page);
       if (cached.length > 0) {
         log(`Discovered cached ChatGPT projects: ${cached.map(project => project.name).join(', ')}`);
         return cached;
+      }
+
+      // 如果启动页已经是 chatgpt.com，就不要再刷新；只有不在 ChatGPT 域或 localStorage 为空时才回首页扫侧边栏。
+      if (!/^https:\/\/chatgpt\.com\/?(?:[?#].*)?$/i.test(page.url())) {
+        await page.goto('https://chatgpt.com', { waitUntil: 'networkidle2', timeout: 30_000 });
+        await sleep(1_000);
       }
 
       for (let i = 0; i < 5; i++) {

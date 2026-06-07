@@ -89,6 +89,7 @@ function askChatGPT(args) {
     encoding: 'utf8',
     timeout: CHILD_TIMEOUT,
     maxBuffer: 10 * 1024 * 1024,
+    windowsHide: true,
   });
   const output = (result.stdout || '').trim() || (result.stderr || '').trim();
   if (result.error) throw new Error(output ? `${result.error.message}\n${output}` : result.error.message);

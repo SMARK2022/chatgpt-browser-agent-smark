@@ -43,6 +43,7 @@ function runServer(lines, env = {}) {
     // wrapper 异常卡死要快速暴露；测试不能复现用户遇到的长时间阻塞。
     timeout: 5000,
     env: { ...BASE_ENV, ...env },
+    windowsHide: true,
   });
   assert.strictEqual(child.status, 0, child.stderr || child.stdout);
   return child.stdout.trim().split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
@@ -137,6 +138,7 @@ function testExistingSessionIndexStartup() {
       encoding: 'utf8',
       timeout: 5000,
       env: { ...BASE_ENV, CHATGPT_SESSION_DIR: dir, CHATGPT_STATE_DIR: path.join(dir, 'state') },
+      windowsHide: true,
     });
     assert.strictEqual(child.status, 0, child.stderr || child.stdout);
   } finally {

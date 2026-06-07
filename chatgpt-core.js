@@ -20,7 +20,7 @@ const http                = require('http');
 const net                 = require('net');
 const os                  = require('os');
 const crypto              = require('crypto');
-const { execSync }        = require('child_process');
+const { execFileSync }    = require('child_process');
 const { createChatGPTDom } = require('./chatgpt-dom');
 
 // ─── Constants and Directories ────────────────────────────────────────────────
@@ -46,7 +46,7 @@ const DAEMON_FILE      = path.join(STATE_DIR, 'daemon.json');
 const DAEMON_LOG       = path.join(STATE_DIR, 'daemon.log');
 const CHATGPT_URL      = 'https://chatgpt.com';
 const DEFAULT_PROJECT  = process.env.CHATGPT_PROJECT || process.env.CHATGPT_PROJECT_NAME || process.env.CHATGPT_PROJECT_URL || 'MCP';
-const DAEMON_VERSION   = 16;
+const DAEMON_VERSION   = 17;
 const RESPONSE_TIMEOUT = positiveIntEnv('CHATGPT_RESPONSE_TIMEOUT_MS', 540_000); // 大文件分析会很慢，默认给 9 分钟。
 const MAX_RETURN_CHARS = positiveIntEnv('CHATGPT_MAX_RETURN_CHARS', 6_000);
 const RESPONSE_PREVIEW_CHARS = positiveIntEnv('CHATGPT_RESPONSE_PREVIEW_CHARS', 4_000);
@@ -334,7 +334,7 @@ function lockDownWindowsAcl(target, directory) {
   const user = process.env.USERDOMAIN && process.env.USERNAME ? `${process.env.USERDOMAIN}\\${process.env.USERNAME}` : process.env.USERNAME;
   if (!user) return;
   const grants = directory ? [`${user}:(OI)(CI)F`, 'SYSTEM:(OI)(CI)F', 'Administrators:(OI)(CI)F'] : [`${user}:(F)`, 'SYSTEM:(F)', 'Administrators:(F)'];
-  try { execSync(`icacls ${JSON.stringify(target)} /inheritance:r ${grants.map(grant => `/grant:r ${JSON.stringify(grant)}`).join(' ')}`, { stdio: 'ignore' }); }
+  try { execFileSync('icacls', [target, '/inheritance:r', ...grants.map(grant => `/grant:r ${grant}`)], { stdio: 'ignore', windowsHide: true }); }
   catch {}
 }
 
@@ -697,7 +697,7 @@ function sameUrl(a, b) {
 function resolveWorkspaceDir(value) {
   // 优先把产物写到 git 根目录的 .opencode/cache；非 git 项目也允许使用，退回传入目录。
   const cwd = path.resolve(value || process.cwd());
-  try { return execSync('git rev-parse --show-toplevel', { cwd, encoding: 'utf8' }).trim() || cwd; }
+  try { return execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd, encoding: 'utf8', windowsHide: true }).trim() || cwd; }
   catch { return cwd; }
 }
 
@@ -789,18 +789,24 @@ function previewResponse(text) {
 
 // ─── Project Resolution ──────────────────────────────────────────────────────
 
+function resolveCachedProject(requested) {
+  // 启动热路径先读本地 projects.json；缓存命中时不打开首页、不展开侧边栏，直接进入固定 Project。
+  // 这不是安全边界，只是性能缓存；缓存缺失或失效时仍走 resolveProject 的 DOM 发现路径。
+  const value = String(requested || DEFAULT_PROJECT).trim();
+  const direct = parseProjectRef(value);
+  if (direct) return direct;
+  return readProjectCache().projects[normalizeProjectKey(value)] || null;
+}
+
 async function resolveProject(page, requested, log) {
   // Project 解析先走显式值和缓存；只有缓存缺失才打开 ChatGPT 首页扫描，减少对易变 DOM 的依赖。
   const value = String(requested || DEFAULT_PROJECT).trim();
-  const direct = parseProjectRef(value);
-  if (direct) {
-    cacheProject(direct);
-    return direct;
+  const cached = resolveCachedProject(value);
+  if (cached) {
+    cacheProject(cached);
+    return cached;
   }
-
   const key = normalizeProjectKey(value);
-  const cached = readProjectCache().projects[key];
-  if (cached) return cached;
 
   log(`Resolving ChatGPT project: ${value}`);
   const discovered = (await CHATGPT_DOM.discoverProjects(page, log))
@@ -1302,8 +1308,10 @@ async function startDaemonProcess() {
   try {
     browser = await launchBrowser(log);
     bootstrapPage = await browser.newPage();
-    // 先确认登录，再解析 Project；否则未登录首页没有项目列表，会误报“项目不存在”。
-    await bootstrapPage.goto(CHATGPT_URL, { waitUntil: 'networkidle2', timeout: 30_000 });
+    // 缓存命中时直接打开固定 Project，避免每次冷启动都先刷新首页再跳项目页。
+    // 缓存缺失才走首页发现；登录态仍在首次导航后统一确认，避免未登录时误报 Project 不存在。
+    project = resolveCachedProject(DEFAULT_PROJECT);
+    await bootstrapPage.goto(project?.url || CHATGPT_URL, { waitUntil: 'networkidle2', timeout: 30_000 });
 
     if (await CHATGPT_DOM.isLoggedOut(bootstrapPage)) {
       log('Startup error: Not logged in. Run: node chatgpt.js --login');
@@ -1311,10 +1319,14 @@ async function startDaemonProcess() {
       process.exit(1);
     }
 
-    project = await resolveProject(bootstrapPage, DEFAULT_PROJECT, log);
+    project = project || await resolveProject(bootstrapPage, DEFAULT_PROJECT, log);
 
-    log(`Navigating to fixed project: ${project.name} (${project.id})`);
-    await bootstrapPage.goto(project.url, { waitUntil: 'networkidle2', timeout: 30_000 });
+    if (!sameUrl(bootstrapPage.url(), project.url)) {
+      log(`Navigating to fixed project: ${project.name} (${project.id})`);
+      await bootstrapPage.goto(project.url, { waitUntil: 'networkidle2', timeout: 30_000 });
+    } else {
+      log(`Using fixed project from cache: ${project.name} (${project.id})`);
+    }
 
     log('Browser ready and logged in.');
   } catch (err) {

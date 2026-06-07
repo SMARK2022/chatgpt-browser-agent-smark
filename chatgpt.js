@@ -26,7 +26,7 @@ const net = require('net');
 const readline = require('readline');
 const crypto = require('crypto');
 const os = require('os');
-const { execSync, spawn } = require('child_process');
+const { execFileSync, spawn } = require('child_process');
 
 // ─── Constants and System Prompt ──────────────────────────────────────────────
 
@@ -43,7 +43,7 @@ const DAEMON_FILE = path.join(STATE_DIR, 'daemon.json');
 const DAEMON_LOCK_FILE = path.join(STATE_DIR, 'daemon.lock');
 const DAEMON_LOG = path.join(STATE_DIR, 'daemon.log');
 const DEFAULT_PROJECT = process.env.CHATGPT_PROJECT || process.env.CHATGPT_PROJECT_NAME || process.env.CHATGPT_PROJECT_URL || 'MCP';
-const DAEMON_VERSION = 16;
+const DAEMON_VERSION = 17;
 const DAEMON_START_TIMEOUT = positiveIntEnv('CHATGPT_DAEMON_START_TIMEOUT_MS', 60_000);
 const BROWSER_CONNECT_TIMEOUT_MS = positiveIntEnv('CHATGPT_BROWSER_CONNECT_TIMEOUT_MS', 3_000);
 const HTTP_TIMEOUT = positiveIntEnv('CHATGPT_HTTP_TIMEOUT_MS', 30_000);
@@ -211,11 +211,11 @@ function assertUniqueBasenames(files) {
 
 function getGitContext(cwd) {
   // git 只作为输入上下文读取，不修改 index/working tree；失败时保持静默，最后统一判断是否有内容。
-  const run = cmd => { try { return execSync(cmd, { encoding: 'utf8', cwd, maxBuffer: Math.max(1024 * 1024, MAX_GIT_DIFF_CHARS * 4) }).trim(); } catch { return ''; } };
-  if (run('git rev-parse --is-inside-work-tree') !== 'true') throw new Error('Not inside a git repo.');
-  const branch = run('git branch --show-current') || run('git rev-parse --short HEAD');
-  const status = run('git status --short');
-  const diff = run('git --no-pager -c diff.external= -c core.externalDiff=false diff --no-ext-diff --no-textconv HEAD');
+  const run = args => { try { return execFileSync('git', args, { encoding: 'utf8', cwd, windowsHide: true, maxBuffer: Math.max(1024 * 1024, MAX_GIT_DIFF_CHARS * 4) }).trim(); } catch { return ''; } };
+  if (run(['rev-parse', '--is-inside-work-tree']) !== 'true') throw new Error('Not inside a git repo.');
+  const branch = run(['branch', '--show-current']) || run(['rev-parse', '--short', 'HEAD']);
+  const status = run(['status', '--short']);
+  const diff = run(['--no-pager', '-c', 'diff.external=', '-c', 'core.externalDiff=false', 'diff', '--no-ext-diff', '--no-textconv', 'HEAD']);
   const boundedDiff = diff.length > MAX_GIT_DIFF_CHARS
     ? `${diff.slice(0, MAX_GIT_DIFF_CHARS)}\n\n[Git diff truncated locally at ${MAX_GIT_DIFF_CHARS} characters.]`
     : diff;
@@ -448,7 +448,7 @@ async function ensureDaemon() {
     process.stderr.write('[*] Starting browser daemon (first time ~15s)...\n');
     const logOffset = fs.existsSync(DAEMON_LOG) ? fs.statSync(DAEMON_LOG).size : 0;
 
-    const child = spawn(process.execPath, [__filename, '--daemon-internal'], { detached: true, stdio: ['ignore', 'ignore', 'ignore'], env: { ...process.env } });
+    const child = spawn(process.execPath, [__filename, '--daemon-internal'], { detached: true, windowsHide: true, stdio: ['ignore', 'ignore', 'ignore'], env: { ...process.env } });
     child.unref();
 
     const deadline = Date.now() + DAEMON_START_TIMEOUT;

@@ -237,6 +237,7 @@ function stopDaemon() {
     encoding: 'utf8',
     timeout: CHATGPT_STOP_TIMEOUT,
     maxBuffer: 1024 * 1024,
+    windowsHide: true,
   });
 }
 
@@ -250,7 +251,7 @@ function killProcess(pid, options = {}) {
   const tree = options.tree !== false;
   if (process.platform === 'win32' && tree) {
     // 诊断/status 类调用没有远端 prompt，可杀整棵树清理坏浏览器；ask 则只杀 CLI，保留 daemon 做 pending 恢复。
-    spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { encoding: 'utf8', timeout: CHATGPT_STOP_TIMEOUT });
+    spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { encoding: 'utf8', timeout: CHATGPT_STOP_TIMEOUT, windowsHide: true });
     return;
   }
   try { process.kill(pid, 'SIGTERM'); } catch {}
