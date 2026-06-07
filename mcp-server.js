@@ -24,7 +24,13 @@ const crypto        = require('crypto');
 
 const SCRIPT = path.join(__dirname, 'chatgpt.js');
 const MCP_PROTOCOL_VERSION = '2024-11-05';
-const CHATGPT_CLI_TIMEOUT = positiveIntEnv('CHATGPT_CLI_TIMEOUT_MS', 635_000);
+// mode 是唯一新增的“能力开关”：把 ChatGPT Web 已实测的 composer 入口映射成小 enum。
+// 代理/任务/外部 App 入口暂不进 schema，因为它们会触发隐私确认、计划任务或第三方应用语义。
+const ASK_MODES = new Set(['auto', 'search', 'image']);
+const IMAGE_ASPECT_RATIOS = new Set(['auto', 'square', 'portrait', 'story', 'landscape', 'wide']);
+const CHATGPT_ASK_HTTP_TIMEOUT = positiveIntEnv('CHATGPT_ASK_HTTP_TIMEOUT_MS', 620_000);
+// 旧版 opencode config 可能只覆盖 CLI timeout，留下更长的 ask HTTP 默认值；这里自动抬高外层预算。
+const CHATGPT_CLI_TIMEOUT = cliTimeout();
 const CHATGPT_STOP_TIMEOUT = positiveIntEnv('CHATGPT_STOP_TIMEOUT_MS', 30_000);
 const MCP_MAX_RETURN_CHARS = positiveIntEnv('CHATGPT_MCP_MAX_RETURN_CHARS', 8_000);
 const MCP_CHILD_OUTPUT_MAX_BYTES = positiveIntEnv('CHATGPT_MCP_CHILD_OUTPUT_MAX_BYTES', 12 * 1024 * 1024);
@@ -37,7 +43,6 @@ const MAX_TOTAL_UPLOAD_BYTES = positiveIntEnv('CHATGPT_MAX_TOTAL_UPLOAD_BYTES', 
 const EXPLICIT_UPLOAD_ROOTS = uploadRoots();
 const WORKSPACE_ROOTS = workspaceRoots();
 const WORKSPACE_DIR = process.env.CHATGPT_WORKSPACE_DIR ? path.resolve(process.env.CHATGPT_WORKSPACE_DIR) : null;
-validateTimeoutLadder();
 
 // ─── Active Call Registry ────────────────────────────────────────────────────
 
@@ -60,10 +65,10 @@ function positiveIntEnv(name, fallback) {
   return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
-function validateTimeoutLadder() {
+function cliTimeout() {
   // wrapper 必须晚于 chatgpt.js 的 /ask HTTP 超时，否则外层先杀进程，core 没机会返回 pending/recovery 状态。
-  const askHTTP = positiveIntEnv('CHATGPT_ASK_HTTP_TIMEOUT_MS', 620_000);
-  if (askHTTP >= CHATGPT_CLI_TIMEOUT) throw new Error('CHATGPT_ASK_HTTP_TIMEOUT_MS must be lower than CHATGPT_CLI_TIMEOUT_MS');
+  // 这里不在启动期 throw：MCP server 一旦退出，OpenCode 只能看到 Connection closed，反而丢失可诊断性。
+  return Math.max(positiveIntEnv('CHATGPT_CLI_TIMEOUT_MS', 635_000), CHATGPT_ASK_HTTP_TIMEOUT + 15_000);
 }
 
 function uploadRoots() {
@@ -131,6 +136,13 @@ function normalizeSessionID(value) {
   throw new Error('sessionID must be a short handle like #4fa92c9d10');
 }
 
+function normalizeImageAspectRatio(value) {
+  if (!value) return null;
+  const text = String(value).trim();
+  if (IMAGE_ASPECT_RATIOS.has(text)) return text;
+  throw new Error(`imageAspectRatio must be one of: ${[...IMAGE_ASPECT_RATIOS].join(', ')}`);
+}
+
 function createSessionID() {
   return `#${crypto.randomBytes(5).toString('hex')}`;
 }
@@ -166,7 +178,7 @@ function assertUploadFileSafe(file) {
 
 function buildAskRequest(args) {
   if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('arguments must be an object');
-  const allowed = new Set(['prompt', 'sessionID', 'context', 'git', 'file', 'saveToFile']);
+  const allowed = new Set(['prompt', 'sessionID', 'context', 'git', 'file', 'saveToFile', 'mode', 'imageAspectRatio']);
   const unknown = Object.keys(args).filter(key => !allowed.has(key));
   if (unknown.length > 0) throw new Error(`Unknown ask argument(s): ${unknown.join(', ')}`);
   if (typeof args.prompt !== 'string' || !args.prompt.trim()) throw new Error('prompt must be a non-empty string');
@@ -175,6 +187,10 @@ function buildAskRequest(args) {
   if (args.context != null && args.context.length > 200_000) throw new Error('context is too long; limit is 200000 characters');
   if (args.git != null && typeof args.git !== 'boolean') throw new Error('git must be a boolean');
   if (args.saveToFile != null && typeof args.saveToFile !== 'boolean') throw new Error('saveToFile must be a boolean');
+  if (args.mode != null && (typeof args.mode !== 'string' || !ASK_MODES.has(args.mode))) throw new Error(`mode must be one of: ${[...ASK_MODES].join(', ')}`);
+  const imageAspectRatio = normalizeImageAspectRatio(args.imageAspectRatio);
+  const mode = args.mode || (imageAspectRatio ? 'image' : 'auto');
+  if (imageAspectRatio && mode !== 'image') throw new Error('imageAspectRatio requires mode=image or omitted mode');
   const workspace = currentWorkspaceDir();
   const files = normalizeFiles(args.file);
   if (files.length > MAX_UPLOAD_FILES) throw new Error(`file accepts at most ${MAX_UPLOAD_FILES} paths`);
@@ -195,6 +211,8 @@ function buildAskRequest(args) {
     git: !!args.git,
     file: safeFiles,
     saveToFile: !!args.saveToFile,
+    mode,
+    imageAspectRatio,
     workspace,
     cwd: workspace,
   };
@@ -399,6 +417,17 @@ const TOOLS = [
           type: 'boolean',
           description: 'If true, save ChatGPT\'s text response under <current-project>/.opencode/cache/chatgpt/responses/<sessionID>/ and return only metadata.',
         },
+        mode: {
+          type: 'string',
+          enum: ['auto', 'search', 'image'],
+          // 这里不暴露 DOM 文案本身；模型只看到稳定语义，具体 selector 漂移由 browser adapter 吸收。
+          description: 'Optional ChatGPT composer mode. auto leaves ChatGPT in normal mode and lets it decide whether web access is useful; search explicitly selects Web Search and adds a source-backed workflow hint; image selects Create Image before sending.',
+        },
+        imageAspectRatio: {
+          type: 'string',
+          enum: ['auto', 'square', 'portrait', 'story', 'landscape', 'wide'],
+          description: 'Optional image generation aspect ratio. Only valid with mode=image; omitted mode is inferred as image. Maps to auto, square 1:1, portrait 3:4, story 9:16, landscape 4:3, or wide 16:9.',
+        },
       },
       required: ['prompt'],
       additionalProperties: false,
@@ -463,6 +492,18 @@ async function handleRequest(req, emit = send) {
   // ── Tool discovery ─────────────────────────────────────────────────────────
   if (method === 'tools/list') {
     emit({ jsonrpc: '2.0', id, result: { tools: TOOLS } });
+    return;
+  }
+
+  if (method === 'resources/list') {
+    // opencode 会探测可选 MCP surface；本桥只提供工具，不提供独立资源，返回空列表比 -32601 更干净。
+    emit({ jsonrpc: '2.0', id, result: { resources: [] } });
+    return;
+  }
+
+  if (method === 'prompts/list') {
+    // Prompt 模板会和本地 agent 的职责边界打架；显式返回空列表，避免 host 把缺省能力当错误记录。
+    emit({ jsonrpc: '2.0', id, result: { prompts: [] } });
     return;
   }
 

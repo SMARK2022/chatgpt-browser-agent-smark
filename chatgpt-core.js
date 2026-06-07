@@ -46,7 +46,7 @@ const DAEMON_FILE      = path.join(STATE_DIR, 'daemon.json');
 const DAEMON_LOG       = path.join(STATE_DIR, 'daemon.log');
 const CHATGPT_URL      = 'https://chatgpt.com';
 const DEFAULT_PROJECT  = process.env.CHATGPT_PROJECT || process.env.CHATGPT_PROJECT_NAME || process.env.CHATGPT_PROJECT_URL || 'MCP';
-const DAEMON_VERSION   = 7;
+const DAEMON_VERSION   = 10;
 const RESPONSE_TIMEOUT = positiveIntEnv('CHATGPT_RESPONSE_TIMEOUT_MS', 540_000); // 大文件分析会很慢，默认给 9 分钟。
 const MAX_RETURN_CHARS = positiveIntEnv('CHATGPT_MAX_RETURN_CHARS', 6_000);
 const RESPONSE_PREVIEW_CHARS = positiveIntEnv('CHATGPT_RESPONSE_PREVIEW_CHARS', 4_000);
@@ -63,6 +63,9 @@ const MAX_UPLOAD_FILES = positiveIntEnv('CHATGPT_MAX_UPLOAD_FILES', 12);
 const MAX_UPLOAD_BYTES = positiveIntEnv('CHATGPT_MAX_UPLOAD_BYTES', 400 * 1024 * 1024);
 const MAX_TOTAL_UPLOAD_BYTES = positiveIntEnv('CHATGPT_MAX_TOTAL_UPLOAD_BYTES', 800 * 1024 * 1024);
 const MAX_FULL_PROMPT_CHARS = positiveIntEnv('CHATGPT_MAX_FULL_PROMPT_CHARS', 500_000);
+const ASK_MODES = new Set(['auto', 'search', 'image']);
+// 图片比例来自实测的 ChatGPT image popover；保存语义枚举，DOM 本地化标签留给 adapter 翻译。
+const IMAGE_ASPECT_RATIOS = new Set(['auto', 'square', 'portrait', 'story', 'landscape', 'wide']);
 const EXPLICIT_UPLOAD_ROOTS = uploadRoots();
 const WORKSPACE_ROOTS = workspaceRoots();
 const CHATGPT_DOM = createChatGPTDom({
@@ -667,6 +670,11 @@ function validateAskInput(input) {
   if (uploads.length > MAX_UPLOAD_FILES) throw new Error(`uploadPaths accepts at most ${MAX_UPLOAD_FILES} files`);
   if (input.workspaceDir != null && typeof input.workspaceDir !== 'string') throw new Error('workspaceDir must be a string');
   if (input.newSession != null && typeof input.newSession !== 'boolean') throw new Error('newSession must be a boolean');
+  if (input.mode != null && (typeof input.mode !== 'string' || !ASK_MODES.has(input.mode))) throw new Error(`mode must be one of: ${[...ASK_MODES].join(', ')}`);
+  if (input.imageAspectRatio != null && (typeof input.imageAspectRatio !== 'string' || !IMAGE_ASPECT_RATIOS.has(input.imageAspectRatio))) throw new Error(`imageAspectRatio must be one of: ${[...IMAGE_ASPECT_RATIOS].join(', ')}`);
+  // 只给 imageAspectRatio 一个“隐式打开 image mode”的捷径；显式 search+ratio 必须报错，避免隐藏切换语义。
+  const mode = input.mode || (input.imageAspectRatio ? 'image' : 'auto');
+  if (input.imageAspectRatio && mode !== 'image') throw new Error('imageAspectRatio requires mode=image or omitted mode');
   const workspaceDir = input.workspaceDir ? path.resolve(input.workspaceDir) : process.cwd();
   if (!path.isAbsolute(workspaceDir)) throw new Error(`workspaceDir must be absolute: ${workspaceDir}`);
   const safeWorkspaceDir = validateWorkspaceDir(workspaceDir);
@@ -678,6 +686,8 @@ function validateAskInput(input) {
     workspaceDir: safeWorkspaceDir,
     saveToFile: input.saveToFile === true,
     newSession: input.newSession === true || !input.sessionID,
+    mode,
+    imageAspectRatio: input.imageAspectRatio || null,
   };
 }
 
@@ -744,11 +754,14 @@ function textStats(text) {
  * 给“刚完成的同一请求”做短期幂等指纹。
  *
  * 这里刻意不引入 MCP request id：JSON-RPC id 只在一次连接内稳定，host 超时重试时
- * 往往会换 id。真正能表达“这是同一条用户意图”的，是展开后的 prompt 以及附件的
- * 本地路径/大小/mtime。hash 只进 registry，不保存 prompt 和附件内容。
+ * 往往会换 id。真正能表达“这是同一条用户意图”的，是展开后的 prompt、composer mode
+ * 以及附件的本地路径/大小/mtime。hash 只进 registry，不保存 prompt 和附件内容。
  */
-function requestHash(fullPrompt, files) {
+function requestHash(fullPrompt, files, mode = 'auto', imageAspectRatio = null) {
   const hash = crypto.createHash('sha256');
+  hash.update(`mode:${mode || 'auto'}\0`);
+  // 同一 prompt 生成方图和宽屏图不是同一次意图；ratio 必须进入短期幂等指纹。
+  hash.update(`imageAspectRatio:${imageAspectRatio || ''}\0`);
   hash.update(fullPrompt);
   for (const file of files) {
     const stat = fs.statSync(file);
@@ -886,7 +899,10 @@ async function persistAssistantResult({ page, project, workspaceDir, sessionID, 
     : { downloads: [], notices: shouldCancel() ? ['Artifact collection skipped because caller disconnected.'] : [] };
   const downloads = artifactResult.downloads || [];
   artifactNotice = (artifactResult.notices || []).join('\n') || null;
-  const resolvedStatus = artifactSkipped ? 'generating' : raw || downloads.length > 0 ? status : 'generating';
+  // 某些 ChatGPT tool/mode 会生成空 assistant turn：页面已无 stop，但没有文本/文件。
+  // 这应清掉 pending 并让调用方看到“空完成”，否则同一 #sessionID 会被永久恢复卡住。
+  const emptyCompleted = status === 'completed' && !raw && downloads.length === 0 && !shouldCancel();
+  const resolvedStatus = artifactSkipped ? 'generating' : raw || downloads.length > 0 || emptyCompleted ? status : 'generating';
   const result = buildResponseResult(raw, workspaceDir, sessionID, {
     saveToFile,
     downloads,
@@ -902,6 +918,8 @@ async function persistAssistantResult({ page, project, workspaceDir, sessionID, 
     // 纯图片/文件产物没有 assistant 正文是正常情况；无文本无产物才说明远端仍可能在工具调用中。
     result.response = downloads.length > 0
       ? 'Assistant artifact saved locally.'
+      : resolvedStatus === 'completed'
+        ? 'Assistant completed without text or downloadable artifacts.'
       : 'No assistant text is available yet. ChatGPT may still be generating or processing a tool request.';
     result.savedResponse = downloads.length > 0 && (saveToFile || forceSave)
       ? saveResponseToFile([result.response, ...downloads.map(file => `- ${file.name}: ${file.path}`)].join('\n'), workspaceDir, sessionID)
@@ -940,11 +958,12 @@ async function recoverCurrentAssistant(page, workspaceDir, sessionID, project, r
   const state = await CHATGPT_DOM.state(page);
   const unansweredUserMessage = state.userCount > state.count;
   const completedImageOnlyTurn = state.nativeImageCount > 0 && !state.generating && !state.placeholder;
+  const completedEmptyAssistantTurn = state.emptyAssistantTurn && !state.generating && !state.placeholder;
   // 有未回答 user 消息时，lastText 属于上一轮 assistant；不能把旧回答当成本轮 recovery 结果。
   const raw = !unansweredUserMessage && state.lastText
     ? await CHATGPT_DOM.extractAssistant(page).catch(() => state.lastText)
     : '';
-  const status = completedImageOnlyTurn ? 'completed' : state.generating || state.placeholder || unansweredUserMessage ? 'generating' : 'completed';
+  const status = completedImageOnlyTurn || completedEmptyAssistantTurn ? 'completed' : state.generating || state.placeholder || unansweredUserMessage ? 'generating' : 'completed';
   const result = await persistAssistantResult({
     page,
     project,
@@ -1098,7 +1117,7 @@ async function runAsk(runtime, input, sessionID, log, shouldCancel = () => false
   const page = await runtime.pageFor(sessionID);
   const files = normalizePathList(input.uploadPaths || input.uploadPath);
   const workspaceDir = input.workspaceDir || process.cwd();
-  const hash = requestHash(input.fullPrompt, files);
+  const hash = requestHash(input.fullPrompt, files, input.mode, input.imageAspectRatio);
   const index = readSessionIndex();
   let session = readSessionEntry(sessionID, runtime.project);
   if (input.newSession && session) throw new Error(`sessionID collision for ${sessionID}; retry the request`);
@@ -1110,12 +1129,12 @@ async function runAsk(runtime, input, sessionID, log, shouldCancel = () => false
     session = readSessionEntry(sessionID, runtime.project);
   }
   if (session?.lost) throw new Error(`Session ${sessionID} previously sent a prompt but lost its conversation URL; cannot safely send another prompt. Start a new sessionID.`);
-  log(`ask: sessionID=${sessionID} saveToFile=${!!input.saveToFile} uploads=${files.length || 'none'} workspace=${workspaceDir} len=${input.fullPrompt.length}`);
+  log(`ask: sessionID=${sessionID} mode=${input.mode || 'auto'} imageAspectRatio=${input.imageAspectRatio || 'default'} saveToFile=${!!input.saveToFile} uploads=${files.length || 'none'} workspace=${workspaceDir} len=${input.fullPrompt.length}`);
 
   if (!session) {
     const beforeState = await runtime.withNewConversationLock(async () => {
       await restoreSessionPage(page, runtime.project, null, sessionID, log);
-      return submitAsk(page, input.fullPrompt, files, workspaceDir, sessionID, runtime.project, log, shouldCancel);
+      return submitAsk(page, input.fullPrompt, files, workspaceDir, input.mode, input.imageAspectRatio, sessionID, runtime.project, log, shouldCancel);
     });
     log('Prompt sent, waiting for response...');
     return finishAsk({
@@ -1154,7 +1173,7 @@ async function runAsk(runtime, input, sessionID, log, shouldCancel = () => false
       log(`Completed replay snapshot for ${sessionID} is missing; accepting the prompt as a deliberate new turn`);
     }
 
-    const beforeState = await submitAsk(page, input.fullPrompt, files, workspaceDir, sessionID, runtime.project, log, shouldCancel);
+    const beforeState = await submitAsk(page, input.fullPrompt, files, workspaceDir, input.mode, input.imageAspectRatio, sessionID, runtime.project, log, shouldCancel);
     log('Prompt sent, waiting for response...');
 
     return finishAsk({
@@ -1188,10 +1207,10 @@ function recoveryReason(sessionID, state, unansweredUserMessage, session) {
   return `session ${sessionID} is not ready for a new prompt`;
 }
 
-async function submitAsk(page, fullPrompt, files, workspaceDir, sessionID, project, log, shouldCancel) {
+async function submitAsk(page, fullPrompt, files, workspaceDir, mode, imageAspectRatio, sessionID, project, log, shouldCancel) {
   let beforeState;
   try {
-    beforeState = await CHATGPT_DOM.submit(page, fullPrompt, files, workspaceDir, log, shouldCancel, () => markSessionLost(sessionID, project, 'Prompt send click started but no conversation URL has been recorded yet.'));
+    beforeState = await CHATGPT_DOM.submit(page, fullPrompt, files, workspaceDir, mode, imageAspectRatio, log, shouldCancel, () => markSessionLost(sessionID, project, 'Prompt send click started but no conversation URL has been recorded yet.'));
   } catch (err) {
     if (err.promptMayHaveBeenSent) markSessionLost(sessionID, project, `Prompt may have been submitted while clickSend failed: ${err.message}`);
     throw err;

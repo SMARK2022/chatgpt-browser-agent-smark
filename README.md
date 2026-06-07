@@ -274,6 +274,8 @@ Inputs:
   "context": "Optional additional context",
   "git": true,
   "file": ["F:\\absolute\\path\\file.txt", "F:\\absolute\\path\\notes.docx"],
+  "mode": "auto",
+  "imageAspectRatio": "wide",
   "saveToFile": true
 }
 ```
@@ -284,6 +286,41 @@ conversation from any OpenCode working directory.
 
 `git: true` attaches `git branch --show-current`, `git status --short`, and
 `git diff HEAD` from the OpenCode working directory.
+
+`mode` optionally selects a known ChatGPT composer mode before sending the
+prompt. Supported values are `auto`, `search`, and `image`.
+This is based on the live ChatGPT DOM where these modes are exposed as
+`role="menuitemradio"` entries under the composer plus menu. `auto` keeps the
+normal ChatGPT behavior and lets ChatGPT decide whether web access is useful.
+`search` explicitly selects Web Search before sending and adds a small workflow
+hint asking ChatGPT to keep source markers near sourced claims. Deep Research,
+Agent mode, scheduled tasks, and external app modes are not exposed through MCP
+because live UI tests showed empty-turn, privacy/onboarding, scheduled-task, or
+external-account semantics that do not fit a normal OpenCode ask.
+
+`imageAspectRatio` is optional and only applies to native ChatGPT image generation.
+If it is provided without `mode`, the bridge infers `mode: "image"`. Supported
+values map to the live ChatGPT image-ratio popover:
+
+```text
+auto       -> 自动
+square     -> 方形 1:1
+portrait   -> 竖版 3:4
+story      -> 故事版 9:16
+landscape  -> 横版 4:3
+wide       -> 宽屏 16:9
+```
+
+This is useful for OpenCode workflows that need predictable visual artifacts:
+square icons, wide architecture diagrams, portrait posters, or story-sized mobile
+mockups. The ratio selector is deliberately kept out of `mode` so normal search
+and text analysis calls do not inherit image-generation state.
+
+Search citations are extracted from ChatGPT's citation-pill DOM. ChatGPT may show
+sources as site-name pills rather than literal `[1]` text, so the bridge converts
+those pills into local `[Ref n]` markers and appends a `References` section with
+the source URLs. This avoids relying on the browser clipboard copy button, which
+is not stable under automation and would modify the user's system clipboard.
 
 MCP `file` means browser attachment upload, not CLI `--file` text embedding. It
 uploads one local file or an array of local files through the ChatGPT attachment

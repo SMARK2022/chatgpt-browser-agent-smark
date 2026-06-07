@@ -118,13 +118,15 @@ function createChatGPTDom({ responseTimeout, asyncDetachMs }) {
     },
 
     /** 提交 prompt 前总是 bringToFront，降低后台 tab “已生成但 DOM 未刷新”的概率。 */
-    async submit(page, prompt, files, workspaceDir, log, shouldCancel = () => false, beforeSend = () => {}) {
+    async submit(page, prompt, files, workspaceDir, mode = 'auto', imageAspectRatio = null, log, shouldCancel = () => false, beforeSend = () => {}) {
       await page.bringToFront().catch(() => {});
       let sent = false;
       try {
         // 每次提交都从“无附件 composer”开始；新附件随后重新上传，避免任何上一轮 stale chip 串入本轮。
         await clearComposerAttachments(page, log);
         await assertNoComposerAttachments(page);
+        await selectComposerMode(page, mode, log);
+        await selectImageAspectRatio(page, mode, imageAspectRatio, log);
         await uploadFiles(page, files, workspaceDir, log, shouldCancel);
         if (shouldCancel()) throw new Error('Ask cancelled before prompt fill');
         const expectedPrompt = await fillPrompt(page, prompt);
@@ -209,6 +211,84 @@ function createChatGPTDom({ responseTimeout, asyncDetachMs }) {
   }
 
   // ─── Upload and Submit ────────────────────────────────────────────────────
+
+  async function selectComposerMode(page, mode, log) {
+    // mode 选择必须发生在 fillPrompt 之前；ChatGPT 切模式会重排 composer，晚选可能清空已填文本。
+    const labels = {
+      auto: null,
+      search: '网页搜索',
+      image: '创建图片',
+    };
+    const label = labels[mode || 'auto'];
+    if (!label) return;
+    // plus 菜单的模式项是 role=menuitemradio，而不是 button；这是实机 DOM 探测得到的稳定入口。
+    await page.waitForSelector('#composer-plus-btn', { timeout: 10_000 });
+    await page.click('#composer-plus-btn');
+    await sleep(600);
+    const clicked = await page.evaluate(label => {
+      const item = [...document.querySelectorAll('[role="menuitemradio"], [role="menuitem"]')]
+        .find(el => (el.innerText || el.textContent || '').trim() === label);
+      if (!item) return false;
+      item.click();
+      return true;
+    }, label);
+    if (!clicked) throw new Error(`Could not select ChatGPT composer mode: ${mode}`);
+    await sleep(800);
+    await page.keyboard.press('Escape').catch(() => {});
+    const active = await page.evaluate(mode => {
+      // 选中状态没有固定 data-testid，只能读 composer pill 的本地化文本/aria。
+      // 这里用“可见 pill + 点击以重试”而不是菜单状态，避免菜单关闭后丢失判断依据。
+      const input = document.querySelector('#prompt-textarea');
+      const form = input?.closest('form') || input?.parentElement?.parentElement;
+      if (!form) return false;
+      const text = [...form.querySelectorAll('button, [role="button"]')]
+        .map(el => `${el.innerText || el.textContent || ''} ${el.getAttribute('aria-label') || ''}`)
+        .join(' ');
+      if (mode === 'search') return /搜索，点击以重试|\b搜索\b/.test(text);
+      if (mode === 'image') return /图片，点击以重试|选择图片宽高比|\b图片\b/.test(text);
+      return true;
+    }, mode);
+    if (!active) throw new Error(`ChatGPT composer mode did not become active: ${mode}`);
+    log(`Selected ChatGPT composer mode: ${mode}`);
+  }
+
+  async function selectImageAspectRatio(page, mode, ratio, log) {
+    // 图片比例是“创建图片”模式下的二级 popover。每次 image ask 都显式选一次，避免沿用上次手动选择。
+    if (mode !== 'image') return;
+    const labels = {
+      auto: '自动',
+      square: '方形 1:1',
+      portrait: '竖版 3:4',
+      story: '故事版 9:16',
+      landscape: '横版 4:3',
+      wide: '宽屏 16:9',
+    };
+    const label = labels[ratio || 'auto'];
+    if (!label) throw new Error(`Unsupported imageAspectRatio: ${ratio}`);
+    // 先用真实鼠标事件打开 popover：实测 DOM .click() 有时只切 pill，不展开宽高比菜单。
+    await page.waitForSelector('button[aria-label="选择图片宽高比"]', { timeout: 10_000 });
+    await page.click('button[aria-label="选择图片宽高比"]');
+    await sleep(1_000);
+    const clicked = await page.evaluate(label => {
+      const norm = value => String(value || '').replace(/\s+/g, ' ').trim();
+      const item = [...document.querySelectorAll('[role="menuitemradio"], [role="menuitem"]')]
+        .find(el => [el.innerText, el.textContent, el.getAttribute('aria-label')].some(value => norm(value) === label));
+      if (!item) return false;
+      item.click();
+      return true;
+    }, label);
+    if (!clicked) throw new Error(`Could not select image aspect ratio: ${ratio || 'auto'}`);
+    await sleep(500);
+    const active = await page.evaluate(label => {
+      // 选中后按钮可能只显示“方形/宽屏”而不显示完整比例；名称或数值命中任一即可确认。
+      const text = (document.querySelector('button[aria-label="选择图片宽高比"]')?.innerText || '').replace(/\s+/g, ' ').trim();
+      const [name, numeric] = label.split(' ');
+      return text === label || text.includes(name) || numeric && text.includes(numeric);
+    }, label);
+    if (!active) throw new Error(`Image aspect ratio did not become active: ${ratio || 'auto'}`);
+    await page.keyboard.press('Escape').catch(() => {});
+    log(`Selected image aspect ratio: ${ratio || 'auto'}`);
+  }
 
   /**
    * 通过隐藏的 file input 上传一个或多个文件。
@@ -651,6 +731,7 @@ function createChatGPTDom({ responseTimeout, asyncDetachMs }) {
       const userCount = document.querySelectorAll('[data-message-author-role="user"]').length;
       const lastText = msgs.length > 0 ? (msgs[msgs.length - 1].innerText || '').trim() : '';
       const lastAssistant = msgs.length > 0 ? msgs[msgs.length - 1] : null;
+      const emptyAssistantTurn = emptyUnroleAssistantTurn();
       const assistantLabels = [...(lastAssistant?.querySelectorAll('button') || [])]
         .map(button => `${button.getAttribute('aria-label') || ''} ${button.textContent || ''}`.trim())
         .filter(Boolean);
@@ -666,8 +747,16 @@ function createChatGPTDom({ responseTimeout, asyncDetachMs }) {
         copyButton: assistantLabels.some(label => /copy|复制/i.test(label)),
         generating: stopButton,
         placeholder: /^(thinking|thinking\.\.\.|思考中|正在思考)$/i.test(lastText.replace(/\s+/g, ' ').trim()),
+        emptyAssistantTurn,
         url: location.href,
       };
+
+      function emptyUnroleAssistantTurn() {
+        // Deep Research 实测会留下一个只有“ChatGPT 说：”的 turn，但没有 assistant role 节点。
+        // stop button 已消失时，它不应让同一个 session 永久 pending。
+        const turns = [...document.querySelectorAll('[data-testid^="conversation-turn"]')];
+        return msgs.length === 0 && turns.some(turn => /^(ChatGPT\s*说[:：]?|ChatGPT said[:：]?)$/.test((turn.innerText || turn.textContent || '').replace(/\s+/g, ' ').trim()));
+      }
 
       function generatedImageCount(root) {
         if (!root) return 0;
@@ -707,8 +796,8 @@ function createChatGPTDom({ responseTimeout, asyncDetachMs }) {
    * 把最后一条 assistant 回答转换成 Markdown。
    *
    * 直接 innerText 会丢掉代码块语言、表格结构和链接语义；完全模拟复制按钮又依赖浏览器
-   * clipboard 权限。这里做的是“信息量等价”的本地转换：保留正文结构，过滤按钮、SVG、
-   * citation pill 等 UI 噪音，并把末尾 reference 行压成更短的可读链接。
+   * clipboard 权限。这里做的是“信息量等价”的本地转换：保留正文结构，过滤按钮/SVG，
+   * 同时把网页 citation pill 转成 `[Ref n]`，并在末尾补全本地 References 清单。
    */
   async function extractAssistant(page) {
     // 不直接返回 innerText：需要保留代码块、表格、列表和链接，同时过滤按钮/SVG/citation pill 噪音。
@@ -718,20 +807,22 @@ function createChatGPTDom({ responseTimeout, asyncDetachMs }) {
         ? msgs[msgs.length - 1].querySelector('.markdown, .prose') || msgs[msgs.length - 1]
         : [...document.querySelectorAll('.markdown, .prose')].at(-1);
       if (!root) return null;
+      const citations = citationRegistry();
       const text = cleanup([...root.childNodes].map(node => block(node, 0)).join(''));
-      return normalizeReferences(text, root) || root.innerText.trim();
+      return appendCitationReferences(normalizeReferences(text, root), citations.items()) || root.innerText.trim();
 
       function cleanup(value) {
         return value.replace(/\u00a0/g, ' ').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
       }
       function inlineChildren(el) { return [...el.childNodes].map(inline).join(''); }
       function inline(node) {
-        // inline 层只处理行内语义；按钮、SVG 和 citation pill 是 UI 噪音，不能进入 Markdown 正文。
+        // inline 层只处理行内语义；citation pill 不是正文文字，但它承载来源 URL，必须转成稳定引用占位。
         if (node.nodeType === Node.TEXT_NODE) return node.textContent || '';
         if (node.nodeType !== Node.ELEMENT_NODE) return '';
         const el = node;
         const tag = el.tagName.toLowerCase();
-        if (el.getAttribute('data-testid') === 'webpage-citation-pill' || el.closest('[data-testid="webpage-citation-pill"]')) return '';
+        const pill = el.getAttribute('data-testid') === 'webpage-citation-pill' ? el : el.closest('[data-testid="webpage-citation-pill"]');
+        if (pill) return citationRef(pill);
         if (tag === 'br') return '\n';
         if (tag === 'button' || tag === 'svg') return '';
         if (tag === 'code' && !el.closest('pre')) return inlineCode(el.textContent || '');
@@ -814,6 +905,34 @@ function createChatGPTDom({ responseTimeout, asyncDetachMs }) {
           const clean = cleanHref(href, text);
           return `[${index}] [${labels.get(clean) || shortLinkLabel(clean)}](${clean})`;
         });
+      }
+      function citationRegistry() {
+        // 引用编号必须由本地分配：ChatGPT UI 的 pill 只保证 URL，不保证正文里出现稳定 `[1]`。
+        // 按首次出现顺序编号，能同时服务“正文旁标注”和末尾 References，且不会依赖远端文案格式。
+        const refs = [];
+        return {
+          index(href, label) {
+            const clean = cleanHref(href, label || '');
+            const found = refs.findIndex(ref => ref.href === clean);
+            if (found >= 0) return found + 1;
+            refs.push({ href: clean, label: cleanup(label || '') || shortLinkLabel(clean) });
+            return refs.length;
+          },
+          items() { return refs; },
+        };
+      }
+      function citationRef(pill) {
+        // pill 内层 anchor 才是真正来源；外层 span 的站点名只适合作展示标签，不能当作 URL。
+        const link = pill.querySelector?.('a[href]') || (pill.tagName?.toLowerCase() === 'a' ? pill : null);
+        return link?.href ? `[Ref ${citations.index(link.href, link.textContent || link.href)}]` : '';
+      }
+      function appendCitationReferences(markdown, refs) {
+        if (!refs.length) return markdown;
+        const missing = refs.filter(ref => !markdown.includes(ref.href));
+        if (missing.length === 0) return markdown;
+        // 不点击“复制回复”：Puppeteer 实测 clipboard 不稳定，还会污染用户系统剪贴板。
+        // 直接从 DOM anchor 补表，信息量比复制按钮更可控，也更适合 OpenCode 工具输出。
+        return `${markdown}\n\nReferences:\n${missing.map((ref, index) => `[Ref ${refs.indexOf(ref) + 1}] [${ref.label}](${ref.href})`).join('\n')}`;
       }
       function cleanHref(href, text) {
         try {

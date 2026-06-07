@@ -43,7 +43,7 @@ const DAEMON_FILE = path.join(STATE_DIR, 'daemon.json');
 const DAEMON_LOCK_FILE = path.join(STATE_DIR, 'daemon.lock');
 const DAEMON_LOG = path.join(STATE_DIR, 'daemon.log');
 const DEFAULT_PROJECT = process.env.CHATGPT_PROJECT || process.env.CHATGPT_PROJECT_NAME || process.env.CHATGPT_PROJECT_URL || 'MCP';
-const DAEMON_VERSION = 7;
+const DAEMON_VERSION = 10;
 const DAEMON_START_TIMEOUT = positiveIntEnv('CHATGPT_DAEMON_START_TIMEOUT_MS', 60_000);
 const BROWSER_CONNECT_TIMEOUT_MS = positiveIntEnv('CHATGPT_BROWSER_CONNECT_TIMEOUT_MS', 3_000);
 const HTTP_TIMEOUT = positiveIntEnv('CHATGPT_HTTP_TIMEOUT_MS', 30_000);
@@ -243,8 +243,10 @@ function getGitContext(cwd) {
  * 本地材料里的句子被误当成最新指令，同时也让 web 检索、sandbox 分析和附件
  * 审阅都围绕同一个明确任务展开。
  */
-function buildFullPrompt({ userPrompt, stdinData, fileData, gitData, contextData }) {
+function buildFullPrompt({ userPrompt, stdinData, fileData, gitData, contextData, mode, imageAspectRatio }) {
   const parts = [SYSTEM_PROMPT];
+  const hint = workflowHint(mode, imageAspectRatio);
+  if (hint) parts.push(hint);
   if (contextData) parts.push(`Context:\n${contextData}\n`);
   if (gitData) parts.push(`Git context:\n${gitData}\n`);
   if (fileData) parts.push(fencedBlock('File content', fileData));
@@ -253,6 +255,13 @@ function buildFullPrompt({ userPrompt, stdinData, fileData, gitData, contextData
   const prompt = parts.join('\n');
   if (prompt.length > MAX_FULL_PROMPT_CHARS) throw new Error(`Full prompt is too large after context expansion; limit is ${MAX_FULL_PROMPT_CHARS} characters`);
   return prompt;
+}
+
+function workflowHint(mode, imageAspectRatio) {
+  // 这些提示只解释“本地已经切好的 ChatGPT UI 模式”，不替用户改写任务；auto 模式保持完全中性。
+  if (mode === 'search') return 'Workflow: The ChatGPT composer is in Web Search mode. Use current web results when useful, keep source markers close to sourced claims, and say when no source supports an answer.\n';
+  if (mode === 'image') return `Workflow: The ChatGPT composer is in Create Image mode${imageAspectRatio ? ` with imageAspectRatio=${imageAspectRatio}` : ''}. Generate the requested visual artifact; keep any text response brief because image artifacts will be collected locally when the page exposes them.\n`;
+  return null;
 }
 
 function fencedBlock(label, text) {
@@ -525,7 +534,7 @@ function projectURL(value) {
 function parseArgs(argv) {
   // 参数解析只做机械映射，不做业务校验；真正的会话、上传和保存策略由 daemon 统一判断。
   const args = argv.slice(2);
-  const opts = { login: false, file: null, upload: [], git: false, context: null, stop: false, status: false, raw: false, saveToFile: false, sessionID: null, newSession: false, daemonInternal: false, cwd: null, workspace: null, requestJSON: null, prompt: [] };
+  const opts = { login: false, file: null, upload: [], git: false, context: null, stop: false, status: false, raw: false, saveToFile: false, sessionID: null, newSession: false, daemonInternal: false, cwd: null, workspace: null, requestJSON: null, mode: null, imageAspectRatio: null, prompt: [] };
   let i = 0;
   const value = flag => {
     const next = args[++i];
@@ -545,6 +554,9 @@ function parseArgs(argv) {
       case '--upload': opts.upload.push(value('--upload')); break;
       case '--session-id': opts.sessionID = value('--session-id'); break;
       case '--context': opts.context = value('--context'); break;
+      case '--mode': opts.mode = value('--mode'); break;
+      // 图片比例不是独立模式：CLI 只把用户意图传给 daemon，最终由 core 统一推导 mode=image。
+      case '--image-aspect-ratio': opts.imageAspectRatio = value('--image-aspect-ratio'); break;
       case '--cwd': opts.cwd = value('--cwd'); break;
       case '--workspace': opts.workspace = value('--workspace'); break;
       case '--request-json': opts.requestJSON = value('--request-json'); break;
@@ -565,7 +577,7 @@ function loadRequestJSON(opts) {
   // workspace/cwd 固定为 OpenCode 启动目录，用于 git 上下文和项目 cache 落盘；真实 ChatGPT URL 不进入 schema。
   if (!opts.requestJSON) return opts;
   const request = JSON.parse(opts.requestJSON === '-' ? readStdinLimited() : fs.readFileSync(opts.requestJSON, 'utf8'));
-  return { ...opts, prompt: [String(request.prompt || '')], context: request.context ?? opts.context, git: !!request.git, upload: normalizePathList(request.file), workspace: request.workspace || opts.workspace, cwd: request.cwd || opts.cwd, sessionID: request.sessionID || opts.sessionID, newSession: !!request.newSession, saveToFile: !!request.saveToFile };
+  return { ...opts, prompt: [String(request.prompt || '')], context: request.context ?? opts.context, git: !!request.git, upload: normalizePathList(request.file), workspace: request.workspace || opts.workspace, cwd: request.cwd || opts.cwd, sessionID: request.sessionID || opts.sessionID, newSession: !!request.newSession, saveToFile: !!request.saveToFile, mode: request.mode || opts.mode, imageAspectRatio: request.imageAspectRatio || opts.imageAspectRatio };
 }
 
 function readStdinLimited() {
@@ -617,6 +629,8 @@ Usage:
   node chatgpt.js --raw "prompt"                        # print tool output without CLI framing
   node chatgpt.js --git "write a commit message"        # attach git diff/status
   node chatgpt.js --context "we use Effect v4" "prompt" # inline context
+  node chatgpt.js --mode search "prompt"              # force a known ChatGPT composer mode
+  node chatgpt.js --mode image --image-aspect-ratio wide "prompt"
   node chatgpt.js --request-json -                       # internal MCP payload mode over stdin
   cat error.log | node chatgpt.js "what is wrong"       # pipe input
   node chatgpt.js --status                              # check if daemon is running
@@ -669,19 +683,23 @@ async function main(argv = process.argv) {
   // sessionID 在本地预分配，这样即使长回答超时，错误输出仍能告诉用户用哪个 #id 恢复。
   const sessionID = opts.sessionID || createSessionID();
 
+  const requestMode = opts.mode || (opts.imageAspectRatio ? 'image' : 'auto');
   const fullPrompt = buildFullPrompt({
     userPrompt: opts.prompt.join(' '),
     stdinData: opts.requestJSON ? null : await readStdin(),
     fileData: opts.file ? readFile(opts.file) : null,
     gitData: opts.git ? getGitContext(opts.cwd || process.cwd()) : null,
     contextData: opts.context || null,
+    mode: requestMode,
+    imageAspectRatio: opts.imageAspectRatio,
   });
 
   try {
     const daemon = await ensureDaemon();
     // CLI 只提交已归一化的请求；上传、等待、pending、落盘都由 daemon 在同一状态机里处理。
     const workspaceDir = opts.workspace || opts.cwd || process.cwd();
-    const result = await httpJSON(daemon, 'POST', '/ask', { fullPrompt, uploadPaths: validateUploadPaths(opts.upload, workspaceDir), workspaceDir, sessionID, newSession: opts.newSession || !opts.sessionID, saveToFile: opts.saveToFile }, ASK_HTTP_TIMEOUT);
+    // imageAspectRatio 能隐式打开 image mode；这样 OpenCode agent 只要表达“宽屏图”，不必重复传两个字段。
+    const result = await httpJSON(daemon, 'POST', '/ask', { fullPrompt, uploadPaths: validateUploadPaths(opts.upload, workspaceDir), workspaceDir, sessionID, newSession: opts.newSession || !opts.sessionID, saveToFile: opts.saveToFile, mode: requestMode, imageAspectRatio: opts.imageAspectRatio || null }, ASK_HTTP_TIMEOUT);
     if (!result.ok) throw new Error(result.error || 'Daemon returned an error');
     const responseText = formatResponse(result);
     if (opts.raw) console.log(responseText);

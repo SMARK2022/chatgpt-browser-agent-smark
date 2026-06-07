@@ -7,6 +7,9 @@
  * 这些测试只覆盖 wrapper 层能确定的协议不变量：JSON-RPC id、batch、tool schema、
  * 超大 stdin 行和 notification。它们故意不发送真正 ask，避免 CI/本地检查依赖登录态、
  * ChatGPT Web DOM 或浏览器窗口。
+ *
+ * 这里还固定覆盖 OpenCode 全局 config 深合并留下旧环境变量的回归路径：wrapper
+ * 不应因为部署层 timeout 组合陈旧就在启动期退出，否则 host 只能看到 Connection closed。
  */
 
 const assert = require('assert');
@@ -26,6 +29,7 @@ const BASE_ENV = {
 
 function main() {
   testBasicProtocol();
+  testLegacyTimeoutEnv();
   testArgumentValidation();
   testOversizedLineRecovery();
   testExistingSessionIndexStartup();
@@ -50,6 +54,8 @@ function testBasicProtocol() {
   const responses = runServer([
     JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }),
     JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' }),
+    JSON.stringify({ jsonrpc: '2.0', id: 'resources', method: 'resources/list' }),
+    JSON.stringify({ jsonrpc: '2.0', id: 'prompts', method: 'prompts/list' }),
     JSON.stringify({ jsonrpc: '2.0', id: { bad: true }, method: 'ping' }),
     JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'unknown' }),
     JSON.stringify([
@@ -62,11 +68,23 @@ function testBasicProtocol() {
   const batch = responses.find(Array.isArray);
   assert.ok(responses.some(item => item.id === 1 && item.result?.capabilities?.tools));
   assert.ok(responses.some(item => item.id === 2 && item.result?.tools?.some(tool => tool.name === 'ask')));
+  assert.ok(responses.find(item => item.id === 2).result.tools.find(tool => tool.name === 'ask').inputSchema.properties.imageAspectRatio);
+  assert.ok(responses.some(item => item.id === 'resources' && Array.isArray(item.result?.resources)));
+  assert.ok(responses.some(item => item.id === 'prompts' && Array.isArray(item.result?.prompts)));
   assert.ok(responses.some(item => item.id === null && item.error?.code === -32600));
   assert.ok(responses.some(item => item.id === 3 && item.error?.code === -32601));
   assert.ok(batch?.some(item => item.id === 4 && item.result));
   assert.ok(batch?.some(item => item.id === 5 && item.result?.isError));
   assert.ok(batch?.some(item => item.id === 6 && item.error?.code === -32600));
+}
+
+function testLegacyTimeoutEnv() {
+  // 旧全局配置常见形态：只把 CLI timeout 设成 610s，却没有同步覆盖 ask HTTP 620s。
+  // wrapper 应自动抬高外层预算，而不是在 OpenCode 启动期直接 Connection closed。
+  const responses = runServer([
+    JSON.stringify({ jsonrpc: '2.0', id: 'legacy-timeout', method: 'tools/list' }),
+  ], { CHATGPT_ASK_HTTP_TIMEOUT_MS: '620000', CHATGPT_CLI_TIMEOUT_MS: '610000' });
+  assert.ok(responses.some(item => item.id === 'legacy-timeout' && item.result?.tools?.some(tool => tool.name === 'ask')));
 }
 
 function testArgumentValidation() {
@@ -76,10 +94,20 @@ function testArgumentValidation() {
     JSON.stringify({ jsonrpc: '2.0', id: 'status-args', method: 'tools/call', params: { name: 'status', arguments: { verbose: true } } }),
     JSON.stringify({ jsonrpc: '2.0', id: 'ask-extra', method: 'tools/call', params: { name: 'ask', arguments: { prompt: 'x', onlyCode: true } } }),
     JSON.stringify({ jsonrpc: '2.0', id: 'ask-bad-file', method: 'tools/call', params: { name: 'ask', arguments: { prompt: 'x', file: ['relative.txt'] } } }),
+    // mode 只允许已实测的低副作用 composer 入口；agent/task 类入口不能被模型随手打开。
+    JSON.stringify({ jsonrpc: '2.0', id: 'ask-bad-mode', method: 'tools/call', params: { name: 'ask', arguments: { prompt: 'x', mode: 'agent' } } }),
+    JSON.stringify({ jsonrpc: '2.0', id: 'ask-deep-research-mode', method: 'tools/call', params: { name: 'ask', arguments: { prompt: 'x', mode: 'deepResearch' } } }),
+    // 比例参数是 image mode 的窄能力，必须既拒绝未知比例，也拒绝和 search 这类文本模式混用。
+    JSON.stringify({ jsonrpc: '2.0', id: 'ask-bad-ratio', method: 'tools/call', params: { name: 'ask', arguments: { prompt: 'x', imageAspectRatio: 'cinema' } } }),
+    JSON.stringify({ jsonrpc: '2.0', id: 'ask-ratio-search-conflict', method: 'tools/call', params: { name: 'ask', arguments: { prompt: 'x', mode: 'search', imageAspectRatio: 'wide' } } }),
   ]);
   assert.ok(responses.every(item => item.result?.isError));
   assert.match(responses.find(item => item.id === 'ask-extra').result.content[0].text, /Unknown ask argument/);
   assert.match(responses.find(item => item.id === 'ask-bad-file').result.content[0].text, /absolute path/);
+  assert.match(responses.find(item => item.id === 'ask-bad-mode').result.content[0].text, /mode must be one of/);
+  assert.match(responses.find(item => item.id === 'ask-deep-research-mode').result.content[0].text, /mode must be one of/);
+  assert.match(responses.find(item => item.id === 'ask-bad-ratio').result.content[0].text, /imageAspectRatio must be one of/);
+  assert.match(responses.find(item => item.id === 'ask-ratio-search-conflict').result.content[0].text, /imageAspectRatio requires mode=image/);
 }
 
 function testOversizedLineRecovery() {
