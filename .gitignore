@@ -1,4 +1,30 @@
 node_modules/
 .env
+.env.*
 *.log
-.chatgpt-poc/
+*.key
+*.pem
+*.p12
+*.pfx
+cookies.json
+cookies.txt
+token.json
+token.txt
+*.token
+.chatgpt-poc/*
+!.chatgpt-poc/README.md
+.opencode/
+profile/
+daemon.json
+daemon.run.json
+daemon.lock
+projects.json
+sessions.json
+session/
+Local State
+Default/Cookies
+Default/Login Data
+Default/History
+Default/Network/
+Default/Local Storage/
+Default/Session Storage/
