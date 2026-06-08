@@ -70,7 +70,6 @@ CHATGPT_PROJECT                   Fixed ChatGPT Project name, id, or URL
 CHATGPT_STATE_DIR                 Browser profile, project cache, daemon, and log directory
 CHATGPT_SESSION_DIR               Optional user-level #xxxxxxxxxx session registry directory
 CHATGPT_RESPONSE_TIMEOUT_MS       Browser response wait timeout, default 540000
-CHATGPT_ASYNC_DETACH_MS           Concurrent-session detach threshold, default 12000
 CHATGPT_HTTP_TIMEOUT_MS           Short local daemon HTTP timeout for status/stop, default 30000
 CHATGPT_ASK_HTTP_TIMEOUT_MS       Long local daemon HTTP timeout for ask, default 620000
 CHATGPT_HTTP_RESPONSE_MAX_BYTES   Local daemon response body cap, default 10485760
@@ -427,10 +426,10 @@ the pool exceeds `CHATGPT_MAX_SESSION_PAGES`.
 
 New ChatGPT conversations are created through a short create lock because the
 Project home composer is shared by the web app. After a conversation has a real
-`/c/...` URL, the session can run on its own page. If several sessions are active
-and a page does not produce text within `CHATGPT_ASYNC_DETACH_MS`, the daemon
-returns `Status: generating` instead of blocking until a hard timeout; the caller
-can reuse the same `sessionID` to recover the final response later.
+`/c/...` URL, the session runs on its own page and waits normally. The daemon only
+returns `Status: generating` when the caller disconnects, the outer timeout is hit,
+or ChatGPT is still visibly processing; the caller can reuse the same `sessionID`
+to recover the final response later.
 
 Artifact downloads are serialized because Chrome's download directory is a
 browser-context side effect. This prevents sandbox files from different pages

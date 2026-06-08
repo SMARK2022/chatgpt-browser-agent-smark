@@ -46,11 +46,10 @@ const DAEMON_FILE      = path.join(STATE_DIR, 'daemon.json');
 const DAEMON_LOG       = path.join(STATE_DIR, 'daemon.log');
 const CHATGPT_URL      = 'https://chatgpt.com';
 const DEFAULT_PROJECT  = process.env.CHATGPT_PROJECT || process.env.CHATGPT_PROJECT_NAME || process.env.CHATGPT_PROJECT_URL || 'MCP';
-const DAEMON_VERSION   = 18;
+const DAEMON_VERSION   = 22;
 const RESPONSE_TIMEOUT = positiveIntEnv('CHATGPT_RESPONSE_TIMEOUT_MS', 540_000); // 大文件分析会很慢，默认给 9 分钟。
 const MAX_RETURN_CHARS = positiveIntEnv('CHATGPT_MAX_RETURN_CHARS', 6_000);
 const RESPONSE_PREVIEW_CHARS = positiveIntEnv('CHATGPT_RESPONSE_PREVIEW_CHARS', 4_000);
-const ASYNC_DETACH_MS = positiveIntEnv('CHATGPT_ASYNC_DETACH_MS', 12_000);
 const MAX_SESSION_PAGES = positiveIntEnv('CHATGPT_MAX_SESSION_PAGES', 8);
 const MAX_DAEMON_REQUEST_BYTES = positiveIntEnv('CHATGPT_DAEMON_MAX_REQUEST_BYTES', 25 * 1024 * 1024);
 const PENDING_TTL_MS = positiveIntEnv('CHATGPT_PENDING_TTL_MS', 12 * 60 * 60 * 1000);
@@ -70,7 +69,6 @@ const EXPLICIT_UPLOAD_ROOTS = uploadRoots();
 const WORKSPACE_ROOTS = workspaceRoots();
 const CHATGPT_DOM = createChatGPTDom({
   responseTimeout: RESPONSE_TIMEOUT,
-  asyncDetachMs: ASYNC_DETACH_MS,
 });
 
 // 运行状态和会话索引分离：浏览器 profile/daemon 放插件状态目录，#xxxxxxxxxx 会话索引放用户级 opencode 数据目录。
@@ -723,7 +721,7 @@ function sameUrl(a, b) {
 function resolveWorkspaceDir(value) {
   // 优先把产物写到 git 根目录的 .opencode/cache；非 git 项目也允许使用，退回传入目录。
   const cwd = path.resolve(value || process.cwd());
-  try { return execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd, encoding: 'utf8', windowsHide: true }).trim() || cwd; }
+  try { return execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd, encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }).trim() || cwd; }
   catch { return cwd; }
 }
 
@@ -1017,8 +1015,6 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
   const sessionPages = new Map();
   const sessionLocks = new Map();
   let conversationCreateQueue = Promise.resolve();
-  let concurrentDetachUntil = 0;
-  let activeGenerations = 0;
   let pageCreateQueue = Promise.resolve();
   let sparePage = bootstrapPage;
 
@@ -1104,18 +1100,9 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
       finally { release(); }
     },
     async waitForResponse(page, beforeState, waitOptions, log) {
-      // 并发时给 DOM 层一个 detach 窗口：确认 prompt 已提交后可返回 generating，后续靠同 sessionID 恢复。
-      activeGenerations++;
-      if (activeGenerations > 1) concurrentDetachUntil = Date.now() + RESPONSE_TIMEOUT;
-      try {
-        return await CHATGPT_DOM.waitForResponse(page, beforeState, {
-          ...waitOptions,
-          detachWhenBusy: () => activeGenerations > 1 && Date.now() < concurrentDetachUntil,
-        }, log);
-      } finally {
-        activeGenerations--;
-        if (activeGenerations === 0) concurrentDetachUntil = 0;
-      }
+      // 不同 sessionID 已经绑定不同 tab；并发不再主动 detach，避免两个 ask 同跑时其中一个只拿到 partial。
+      // 后台 tab 偶尔不刷新 DOM，DOM 层会按低频节奏 bringToFront，真正超时仍由 pending/recovery 兜底。
+      return CHATGPT_DOM.waitForResponse(page, beforeState, { ...waitOptions, foregroundPulseMs: 4_000 }, log);
     },
   };
 }
@@ -1213,7 +1200,8 @@ async function restoreSessionPage(page, project, session, sessionID, log) {
   const targetUrl = session?.url || project.url;
   if (sameUrl(page.url(), targetUrl)) return;
   log(session ? `Restoring session ${sessionID}` : `Starting session ${sessionID} in ${project.name}`);
-  await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 30_000 });
+  // ChatGPT 页面会长期保持流式/预取连接；等待 networkidle 容易误判超时，composer 自己再等具体 selector。
+  await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
 }
 
 function recoveryReason(sessionID, state, unansweredUserMessage, session) {
@@ -1244,6 +1232,7 @@ async function finishAsk({ page, runtime, beforeState, sessionID, workspaceDir, 
     const failedUrl = isChatSessionUrlForProject(page.url(), runtime.project)
       ? page.url()
       : await rememberCurrentSessionUrl(page, runtime.project, sessionID, log, 3_000);
+    await CHATGPT_DOM.focus(page).catch(() => {});
     const state = await CHATGPT_DOM.state(page).catch(() => null);
     const hasNewAssistantText = state?.lastText && state.lastText !== beforeState.lastText;
     // wait failure 不能把上一轮 assistant 当成本轮 partial；只有 DOM 出现新 assistant 证据才保存文本。
@@ -1278,9 +1267,10 @@ async function finishAsk({ page, runtime, beforeState, sessionID, workspaceDir, 
 
   const stillGenerating = waitResult.status === 'generating';
   let extractionNotice = null;
+  await CHATGPT_DOM.focus(page).catch(() => {});
   const fallbackState = await CHATGPT_DOM.state(page).catch(() => null);
   const hasNewAssistantText = fallbackState?.lastText && fallbackState.lastText !== beforeState.lastText;
-  // submitted-no-assistant / concurrent-detach 场景只落 pending，不拿上一轮 assistant 充当 partial。
+  // submitted-no-assistant / timeout 场景只落 pending，不拿上一轮 assistant 充当 partial。
   const raw = hasNewAssistantText ? await CHATGPT_DOM.extractAssistant(page).catch(err => {
     extractionNotice = `Markdown extraction failed; saved visible assistant text instead: ${err.message}`;
     log(extractionNotice);
@@ -1337,7 +1327,7 @@ async function startDaemonProcess() {
     // 缓存命中时直接打开固定 Project，避免每次冷启动都先刷新首页再跳项目页。
     // 缓存缺失才走首页发现；登录态仍在首次导航后统一确认，避免未登录时误报 Project 不存在。
     project = resolveCachedProject(DEFAULT_PROJECT);
-    await bootstrapPage.goto(project?.url || CHATGPT_URL, { waitUntil: 'networkidle2', timeout: 30_000 });
+    await bootstrapPage.goto(project?.url || CHATGPT_URL, { waitUntil: 'domcontentloaded', timeout: 45_000 });
 
     if (await CHATGPT_DOM.isLoggedOut(bootstrapPage)) {
       log('Startup error: Not logged in. Run: node chatgpt.js --login');
@@ -1349,7 +1339,7 @@ async function startDaemonProcess() {
 
     if (!sameUrl(bootstrapPage.url(), project.url)) {
       log(`Navigating to fixed project: ${project.name} (${project.id})`);
-      await bootstrapPage.goto(project.url, { waitUntil: 'networkidle2', timeout: 30_000 });
+      await bootstrapPage.goto(project.url, { waitUntil: 'domcontentloaded', timeout: 45_000 });
     } else {
       log(`Using fixed project from cache: ${project.name} (${project.id})`);
     }

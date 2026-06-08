@@ -43,7 +43,7 @@ const DAEMON_FILE = path.join(STATE_DIR, 'daemon.json');
 const DAEMON_LOCK_FILE = path.join(STATE_DIR, 'daemon.lock');
 const DAEMON_LOG = path.join(STATE_DIR, 'daemon.log');
 const DEFAULT_PROJECT = process.env.CHATGPT_PROJECT || process.env.CHATGPT_PROJECT_NAME || process.env.CHATGPT_PROJECT_URL || 'MCP';
-const DAEMON_VERSION = 18;
+const DAEMON_VERSION = 22;
 const DAEMON_START_TIMEOUT = positiveIntEnv('CHATGPT_DAEMON_START_TIMEOUT_MS', 60_000);
 const BROWSER_CONNECT_TIMEOUT_MS = positiveIntEnv('CHATGPT_BROWSER_CONNECT_TIMEOUT_MS', 3_000);
 const HTTP_TIMEOUT = positiveIntEnv('CHATGPT_HTTP_TIMEOUT_MS', 30_000);
@@ -238,7 +238,7 @@ function assertUniqueBasenames(files) {
 
 function getGitContext(cwd) {
   // git 只作为输入上下文读取，不修改 index/working tree；失败时保持静默，最后统一判断是否有内容。
-  const run = args => { try { return execFileSync('git', args, { encoding: 'utf8', cwd, windowsHide: true, maxBuffer: Math.max(1024 * 1024, MAX_GIT_DIFF_CHARS * 4) }).trim(); } catch { return ''; } };
+  const run = args => { try { return execFileSync('git', args, { encoding: 'utf8', cwd, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: Math.max(1024 * 1024, MAX_GIT_DIFF_CHARS * 4) }).trim(); } catch { return ''; } };
   if (run(['rev-parse', '--is-inside-work-tree']) !== 'true') throw new Error('Not inside a git repo.');
   const branch = run(['branch', '--show-current']) || run(['rev-parse', '--short', 'HEAD']);
   const status = run(['status', '--short']);
@@ -455,12 +455,7 @@ function daemonStartupErrorSince(offset) {
  */
 async function ensureDaemon() {
   let state = readDaemonState();
-  if (state && state.version !== DAEMON_VERSION) {
-    await httpJSON(state, 'POST', '/stop', {}, 3_000).catch(() => {});
-    unlinkDaemonFiles();
-    state = null;
-  }
-  if (state && await isDaemonReachable(state)) return state;
+  if (state && state.version === DAEMON_VERSION && await isDaemonReachable(state)) return state;
 
   await assertBrowserReuseCanStart();
 
@@ -470,7 +465,11 @@ async function ensureDaemon() {
 
   try {
     state = readDaemonState();
-    if (state && await isDaemonReachable(state)) return state;
+    if (state && state.version === DAEMON_VERSION && await isDaemonReachable(state)) return state;
+    if (state && state.version !== DAEMON_VERSION) {
+      // 版本升级会关闭旧 daemon；必须在启动锁内做，避免并发 ask 中一个 child 关掉另一个正在使用的浏览器连接。
+      await httpJSON(state, 'POST', '/stop', {}, 3_000).catch(() => {});
+    }
     unlinkDaemonFiles(); // 清理上次崩溃留下的过期端口文件。
     process.stderr.write('[*] Starting browser daemon (first time ~15s)...\n');
     const logOffset = fs.existsSync(DAEMON_LOG) ? fs.statSync(DAEMON_LOG).size : 0;

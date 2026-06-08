@@ -55,7 +55,7 @@ function pathInside(root, target) {
  * 不是单个 page 的局部状态。多个会话可以并发生成文本，但下载阶段必须串行，否则一个会话
  * 设置的下载目录可能被另一个会话覆盖。
  */
-function createChatGPTDom({ responseTimeout, asyncDetachMs }) {
+function createChatGPTDom({ responseTimeout }) {
   let artifactDownloadQueue = Promise.resolve();
 
   // ─── Public Adapter Surface ────────────────────────────────────────────────
@@ -95,7 +95,7 @@ function createChatGPTDom({ responseTimeout, asyncDetachMs }) {
 
       // 如果启动页已经是 chatgpt.com，就不要再刷新；只有不在 ChatGPT 域或 localStorage 为空时才回首页扫侧边栏。
       if (!/^https:\/\/chatgpt\.com\/?(?:[?#].*)?$/i.test(page.url())) {
-        await page.goto('https://chatgpt.com', { waitUntil: 'networkidle2', timeout: 30_000 });
+        await page.goto('https://chatgpt.com', { waitUntil: 'domcontentloaded', timeout: 45_000 });
         await sleep(1_000);
       }
 
@@ -126,6 +126,7 @@ function createChatGPTDom({ responseTimeout, asyncDetachMs }) {
       await page.bringToFront().catch(() => {});
       let sent = false;
       try {
+        await waitForComposer(page, log);
         // 每次提交都从“无附件 composer”开始；新附件随后重新上传，避免任何上一轮 stale chip 串入本轮。
         await clearComposerAttachments(page, log);
         await assertNoComposerAttachments(page);
@@ -438,6 +439,13 @@ function createChatGPTDom({ responseTimeout, asyncDetachMs }) {
     }
   }
 
+  async function waitForComposer(page, log) {
+    // domcontentloaded 只保证 HTML 到达；ChatGPT 的 composer 是 React 后续 hydrate 的，慢网/后台 tab 下会晚很多。
+    await page.bringToFront().catch(() => {});
+    await page.waitForSelector('#prompt-textarea', { visible: true, timeout: 45_000 });
+    log?.('Composer ready');
+  }
+
   async function assertNoComposerAttachments(page) {
     const count = await attachmentCount(page);
     if (count > 0) throw new Error(`Composer still has ${count} attachment(s) after cleanup; refusing to send prompt`);
@@ -600,7 +608,7 @@ function createChatGPTDom({ responseTimeout, asyncDetachMs }) {
     // execCommand('insertText') 能触发 contenteditable/React 的输入路径，比直接改 innerText 更稳定。
     // 插入后必须读回 composer 内容：ChatGPT 页面重渲染、焦点丢失或隐藏 composer 都可能让 insertText 静默失败。
     const expected = normalizeComposerText(text);
-    await page.waitForSelector('#prompt-textarea', { timeout: 10_000 });
+    await page.waitForSelector('#prompt-textarea', { visible: true, timeout: 45_000 });
     const actual = await page.evaluate(value => {
       const el = document.querySelector('#prompt-textarea');
       el.focus();
@@ -677,6 +685,7 @@ function createChatGPTDom({ responseTimeout, asyncDetachMs }) {
     // 等待拆成“开始”和“稳定”两段：先确认远端收下 prompt，再判断回答是否完成。
     before = before || await assistantState(page);
     log(`waitForResponse: beforeCount=${before.count}`);
+    options.foreground = foregroundPulse(page, options.foregroundPulseMs || 0);
     const startedAt = Date.now();
     // responseTimeout 是整次浏览器等待总预算；start/settle 共享同一个 deadline，避免外层 CLI 先超时。
     const deadline = startedAt + responseTimeout;
@@ -687,6 +696,7 @@ function createChatGPTDom({ responseTimeout, asyncDetachMs }) {
 
   async function waitUntilResponseStarts(page, before, options, startedAt, deadline, log) {
     while (true) {
+      await options.foreground?.();
       const current = await assistantState(page).catch(() => null);
       if (current) {
         const submitted = current.userCount > before.userCount;
@@ -694,11 +704,6 @@ function createChatGPTDom({ responseTimeout, asyncDetachMs }) {
         // 原生图片可能没有 assistant 文本；图片数量增长也说明回答已经开始出现。
         if (submitted && current.nativeImageCount > before.nativeImageCount) return;
         if (submitted && ((current.count > before.count && current.lastText) || (current.lastText && current.lastText !== before.lastText))) return;
-        if (shouldDetach(options, startedAt) && submitted) {
-          // 并发生成时只要确认用户消息已提交，就允许本地先返回 generating，后续再 recovery。
-          log('waitForResponse: detaching submitted session before assistant text appears');
-          return { status: 'generating', reason: 'concurrent-detach-no-assistant' };
-        }
       }
       if (Date.now() > deadline) {
         // 超时日志保存页面摘要，定位是 selector 漂移、未提交、仍在生成还是无 assistant 节点。
@@ -727,6 +732,7 @@ function createChatGPTDom({ responseTimeout, asyncDetachMs }) {
       }
 
       await sleep(750);
+      await options.foreground?.();
       const state = await assistantState(page);
       const submitted = state.userCount > before.userCount;
       // 未看到新 user 消息前，任何 assistant DOM 变化都可能是旧回答重排，不能归属给本轮请求。
@@ -738,10 +744,6 @@ function createChatGPTDom({ responseTimeout, asyncDetachMs }) {
       const hasNewText = (state.count > before.count && len > 0) || (state.lastText && state.lastText !== before.lastText);
       const responseLen = hasNewText ? len : 0;
       const hasNewNativeImage = state.nativeImageCount > before.nativeImageCount;
-      if (shouldDetach(options, startedAt)) {
-        if (!hasNewText && !hasNewNativeImage) return { status: 'generating', reason: 'concurrent-detach-no-assistant' };
-        if (hasNewText || hasNewNativeImage) return { status: 'generating', reason: 'concurrent-detach-partial' };
-      }
       if (responseLen !== lastLen || state.nativeImageCount !== lastImageCount) {
         lastLen = responseLen;
         lastImageCount = state.nativeImageCount;
@@ -758,8 +760,16 @@ function createChatGPTDom({ responseTimeout, asyncDetachMs }) {
     }
   }
 
-  function shouldDetach(options, startedAt) {
-    return options.detachWhenBusy && options.detachWhenBusy() && Date.now() - startedAt > asyncDetachMs;
+  function foregroundPulse(page, intervalMs) {
+    // ChatGPT Web 有些内容在后台 tab 不会完整 hydrate；等待期间低频轮流激活页面，避免只抽到引用/空 assistant。
+    // 频率不能太高，否则并发会话会互相抢前台；4s 级别足够触发渲染，又不会像 polling 一样打扰用户。
+    let last = 0;
+    return async () => {
+      if (!intervalMs || Date.now() - last < intervalMs) return;
+      last = Date.now();
+      await page.bringToFront().catch(() => {});
+      await sleep(150);
+    };
   }
 
   async function assistantState(page, count) {
@@ -968,10 +978,10 @@ function createChatGPTDom({ responseTimeout, asyncDetachMs }) {
       }
       function appendCitationReferences(markdown, refs) {
         if (!refs.length) return markdown;
-        const missing = refs.filter(ref => !markdown.includes(ref.href));
+        const missing = refs.filter((ref, index) => !new RegExp(`^\\[Ref ${index + 1}\\]\\s+\\[`, 'm').test(markdown));
         if (missing.length === 0) return markdown;
         // 不点击“复制回复”：Puppeteer 实测 clipboard 不稳定，还会污染用户系统剪贴板。
-        // 直接从 DOM anchor 补表，信息量比复制按钮更可控，也更适合 OpenCode 工具输出。
+        // 只看正文 URL 会误判：用户任务里常自带链接；必须看是否已有本地 Ref 清单行。
         return `${markdown}\n\nReferences:\n${missing.map((ref, index) => `[Ref ${refs.indexOf(ref) + 1}] [${ref.label}](${ref.href})`).join('\n')}`;
       }
       function cleanHref(href, text) {
