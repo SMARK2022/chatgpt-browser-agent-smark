@@ -34,6 +34,7 @@ async function main() {
   testArgumentValidation();
   testVoiceTranscribeIsPrivate();
   testTranscribeFileCliValidation();
+  await testDirectVoiceTranscribeSkipsComposerWait();
   testOversizedLineRecovery();
   testExistingSessionIndexStartup();
   await testStatusReportsDisconnectedBrowser();
@@ -153,6 +154,44 @@ function testTranscribeFileCliValidation() {
   });
   assert.notStrictEqual(missingFile.status, 0);
   assert.match(missingFile.stderr, /Voice file does not exist/);
+}
+
+async function testDirectVoiceTranscribeSkipsComposerWait() {
+  // direct upload 只需要同源登录态和 /backend-api/transcribe；成功路径不能再等待 composer 或安装 fake mic。
+  // 这个测试用 fake page 观察 adapter 的公开行为，不启动浏览器，也不依赖 ChatGPT 真实 DOM。
+  const { createChatGPTDom } = require('./chatgpt-dom');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-direct-voice-'));
+  const voice = path.join(dir, 'voice with spaces.wav');
+  const projectUrl = 'https://chatgpt.com/g/g-p-test-project/project';
+  const calls = { goto: [], waitForSelector: 0, evaluateOnNewDocument: 0, evaluate: 0 };
+  writeTinyWav(voice);
+  try {
+    const page = {
+      bringToFront: async () => {},
+      // goto 记录调用 URL，证明 voice adapter 使用 daemon 已解析的 Project URL，而不是退回普通首页。
+      goto: async url => { calls.goto.push(url); },
+      waitForSelector: async () => {
+        calls.waitForSelector++;
+        throw new Error('direct voice transcription should not wait for composer');
+      },
+      // direct 成功路径不应安装 getUserMedia patch；一旦调用这里就说明又退回了 fake mic 语义。
+      evaluateOnNewDocument: async () => { calls.evaluateOnNewDocument++; },
+      evaluate: async (_fn, config) => {
+        calls.evaluate++;
+        // direct upload 的唯一 page.evaluate 输入应包含音频 bytes 配置；其它 evaluate 代表意外触碰 DOM fallback。
+        if (config?.audioBase64) return { text: 'direct transcript', elapsedMs: 7 };
+        throw new Error('unexpected page.evaluate before direct upload');
+      },
+    };
+    const text = await createChatGPTDom({ responseTimeout: 1000 }).transcribeAudioFile(page, voice, projectUrl, () => {});
+    assert.strictEqual(text, 'direct transcript');
+    assert.deepStrictEqual(calls.goto, [projectUrl]);
+    // composer wait 和 fake mic 都是 fallback-only 行为；direct 成功时必须保持为零以避免固定 3 秒浪费。
+    assert.strictEqual(calls.waitForSelector, 0);
+    assert.strictEqual(calls.evaluateOnNewDocument, 0);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 function testOversizedLineRecovery() {

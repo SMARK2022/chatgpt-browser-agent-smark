@@ -163,13 +163,10 @@ function createChatGPTDom({ responseTimeout }) {
       await page.bringToFront().catch(() => {});
       // Node 侧只读取一次文件；direct upload 和 fallback fake mic 共用同一份 base64，避免两次磁盘读取产生 TOCTOU 窗口。
       const audioBase64 = fs.readFileSync(file).toString('base64');
-      // 语音转写不需要固定 Project 的会话状态机；首页 composer 的登录态足够调用 ChatGPT 自己的 batch 转写接口。
-      // 先走 direct upload，避免把已录好的本地音频再实时重放给网页麦克风；失败时保留旧 UI 路径兜底。
+      // 语音 direct upload 只需要 ChatGPT 同源登录态；固定 Project URL 来自 daemon 启动期解析，避免再次打开普通首页。
+      // direct path 不等 composer，也不安装 fake mic；只有私有转写接口失败时才进入慢速 UI fallback。
       // direct path 仍在 ChatGPT 页面上下文内执行，复用用户登录态，不新增本地 HTTP/MCP 暴露面。
-      // 这里仍等待 composer，是为了确认页面登录态和基础 React shell 已经可用，再调用同源 backend-api。
       await page.goto(voiceUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-      await sleep(3_000);
-      await waitForComposer(page, log);
       try {
         // direct upload 是性能优化路径：成功时不触碰听写按钮，也不污染 composer 文本。
         const direct = await transcribeAudioFileDirect(page, audioBase64, file);
@@ -181,6 +178,9 @@ function createChatGPTDom({ responseTimeout }) {
         // fallback 日志只记录错误信息，不记录 token、请求体或音频内容，避免把登录态材料写进 daemon.log。
         log(`Direct voice transcription failed, falling back to dictation UI: ${err.message}`);
       }
+      // fallback 才依赖 React composer 和听写按钮；把等待放在这里，避免 direct 成功路径浪费固定 3 秒。
+      await sleep(3_000);
+      await waitForComposer(page, log);
       // fallback 从这里才安装 getUserMedia patch；direct 成功时页面不会获得任何 mock 麦克风能力。
       await installVoiceAudioInput(page, audioBase64);
       // fallback 使用 ChatGPT composer 作为转写结果承载；进入前清空它，避免旧草稿和听写结果混在一起。

@@ -1172,7 +1172,8 @@ async function runVoiceTranscribe(runtime, input, log) {
   const page = await runtime.voicePage();
   try {
     log(`voice: transcribing ${path.basename(input.file)} bytes=${fs.statSync(input.file).size}`);
-    const text = await CHATGPT_DOM.transcribeAudioFile(page, input.file, CHATGPT_URL, log);
+    // voice direct upload 只需要同源登录态；复用启动期固定 Project URL，避免临时页再绕普通首页。
+    const text = await CHATGPT_DOM.transcribeAudioFile(page, input.file, runtime.project.url, log);
     return { ok: true, text };
   } finally {
     await page.close().catch(() => {});
