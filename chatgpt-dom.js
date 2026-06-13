@@ -25,6 +25,9 @@ const MAX_ARTIFACTS = 16;
 const MAX_UPLOAD_BYTES = positiveIntEnv('CHATGPT_MAX_UPLOAD_BYTES', 400 * 1024 * 1024);
 const MAX_TOTAL_UPLOAD_BYTES = positiveIntEnv('CHATGPT_MAX_TOTAL_UPLOAD_BYTES', 800 * 1024 * 1024);
 const MAX_ARTIFACT_BYTES = positiveIntEnv('CHATGPT_MAX_ARTIFACT_BYTES', 4 * 1024 * 1024 * 1024);
+const VOICE_DICTATION_TIMEOUT_MS = positiveIntEnv('CHATGPT_VOICE_DICTATION_TIMEOUT_MS', 45_000);
+const VOICE_STOP_DELAY_MS = positiveIntEnv('CHATGPT_VOICE_STOP_DELAY_MS', 6_000);
+const VOICE_STREAM_CHUNK_MS = positiveIntEnv('CHATGPT_VOICE_STREAM_CHUNK_MS', 250);
 // sandbox 文件和原生图片共享同一个总数预算；ChatGPT 生成产物按原名保存，不额外改扩展名。
 // 产物不按类型裁剪，也不额外做固定下载超时；只保留总量护栏和外层 ask 取消信号。
 
@@ -154,6 +157,51 @@ function createChatGPTDom({ responseTimeout }) {
         if (!sent && files.length > 0) await clearComposerAttachments(page, log).catch(cleanup => log(`Attachment cleanup failed: ${cleanup.message}`));
         throw err;
       }
+    },
+
+    async transcribeAudioFile(page, file, voiceUrl, log) {
+      await page.bringToFront().catch(() => {});
+      // Node 侧只读取一次文件；direct upload 和 fallback fake mic 共用同一份 base64，避免两次磁盘读取产生 TOCTOU 窗口。
+      const audioBase64 = fs.readFileSync(file).toString('base64');
+      // 语音转写不需要固定 Project 的会话状态机；首页 composer 的登录态足够调用 ChatGPT 自己的 batch 转写接口。
+      // 先走 direct upload，避免把已录好的本地音频再实时重放给网页麦克风；失败时保留旧 UI 路径兜底。
+      // direct path 仍在 ChatGPT 页面上下文内执行，复用用户登录态，不新增本地 HTTP/MCP 暴露面。
+      // 这里仍等待 composer，是为了确认页面登录态和基础 React shell 已经可用，再调用同源 backend-api。
+      await page.goto(voiceUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+      await sleep(3_000);
+      await waitForComposer(page, log);
+      try {
+        // direct upload 是性能优化路径：成功时不触碰听写按钮，也不污染 composer 文本。
+        const direct = await transcribeAudioFileDirect(page, audioBase64, file);
+        log(`Direct voice transcription finished in ${direct.elapsedMs}ms`);
+        // direct 成功时直接返回文本，让 TUI 插入光标位置；不需要模拟 ChatGPT composer 的听写结果。
+        return direct.text;
+      } catch (err) {
+        // ChatGPT Web 的私有 endpoint/header 可能随前端版本调整；fallback 继续用已验证的听写 UI，避免一次网页变更让语音输入彻底不可用。
+        // fallback 日志只记录错误信息，不记录 token、请求体或音频内容，避免把登录态材料写进 daemon.log。
+        log(`Direct voice transcription failed, falling back to dictation UI: ${err.message}`);
+      }
+      // fallback 从这里才安装 getUserMedia patch；direct 成功时页面不会获得任何 mock 麦克风能力。
+      await installVoiceAudioInput(page, audioBase64);
+      // fallback 使用 ChatGPT composer 作为转写结果承载；进入前清空它，避免旧草稿和听写结果混在一起。
+      await clearComposerText(page);
+      const button = await clickDictationButton(page);
+      // 找不到按钮时输出可见控件快照，便于定位 ChatGPT UI 文案漂移，而不是静默回空文本。
+      if (!button) throw new Error(`Could not find ChatGPT dictation button. Visible controls: ${JSON.stringify(await voiceControlSnapshot(page))}`);
+      log(`Clicked dictation control: ${button.label || button.index}`);
+      await waitForInjectedVoiceAudio(page);
+      log('Injected voice audio finished');
+      // ChatGPT 听写不是本地同步解码：fake mic 音频结束后还要给页面/远端识别链路一点时间，
+      // 否则过早点击 stop 会得到空 composer。默认值对齐此前 probe 中成功识别 hello-world 的观察窗口。
+      await sleep(VOICE_STOP_DELAY_MS);
+      const stop = await clickStopDictation(page);
+      if (stop) log(`Clicked stop dictation control: ${stop.label || stop.index}`);
+      const text = await waitForComposerText(page);
+      // 成功后清空 composer，让 TUI 侧只接收返回文本，不把 probe/fallback 残留留给下一次 prompt。
+      await clearComposerText(page);
+      // 空白结果说明网页听写链路失败；抛错比把空字符串插入用户输入框更可诊断。
+      if (!text.trim()) throw new Error('ChatGPT dictation returned empty text');
+      return text;
     },
 
     /** 等待只返回状态，不保存文本；core 会基于状态决定 completed/pending 的落盘策略。 */
@@ -444,6 +492,300 @@ function createChatGPTDom({ responseTimeout }) {
     await page.bringToFront().catch(() => {});
     await page.waitForSelector('#prompt-textarea', { visible: true, timeout: 45_000 });
     log?.('Composer ready');
+  }
+
+  async function installVoiceAudioInput(page, audioBase64) {
+    // getUserMedia patch 只装在当前 voice page：它不进入普通 session page，且每次转写都会覆盖上一次音频。
+    // 音频以 data buffer 进入浏览器 AudioContext，避免把本地文件路径暴露给网页脚本。
+    await page.evaluateOnNewDocument(applyVoiceInputPatch, { audioBase64, streamChunkMs: VOICE_STREAM_CHUNK_MS });
+    await page.evaluate(applyVoiceInputPatch, { audioBase64, streamChunkMs: VOICE_STREAM_CHUNK_MS }).catch(() => {});
+  }
+
+  async function transcribeAudioFileDirect(page, audioBase64, file) {
+    return page.evaluate(async config => {
+      const startedAt = performance.now();
+      // ChatGPT 的 /backend-api/transcribe 不是纯 cookie 接口；必须先从页面 session 取短期 access token。
+      const sessionResponse = await fetch('/api/auth/session', { credentials: 'include' });
+      // session JSON 结构由 ChatGPT Web 控制；解析失败按无 token 处理，让外层走 fallback 而不是崩掉 daemon。
+      const session = await sessionResponse.json().catch(() => null);
+      const accessToken = session?.accessToken || session?.access_token || '';
+      // 不把 accessToken 返回 Node：token 只在页面上下文当前请求中使用，降低日志和本地进程暴露面。
+      // 缺 token 通常代表登录态过期或 ChatGPT session schema 漂移；此时 fallback 比猜 header 更安全。
+      if (!accessToken) throw new Error(`ChatGPT session did not expose an access token: status=${sessionResponse.status}`);
+      // base64 是从 Node 传入的音频字节；页面只看到 bytes/File，不知道本地绝对路径。
+      const bytes = Uint8Array.from(atob(config.audioBase64), char => char.charCodeAt(0));
+      const form = new FormData();
+      // FormData 字段名必须是 file，保持和 ChatGPT 前端 Rlr.transcribe client 的请求形状一致。
+      // 这里复用 ChatGPT 前端 batch fallback 的 /backend-api/transcribe 语义：上传一个 File，由网页会话 bearer token 授权。
+      // 只传文件名和 MIME，不传本地绝对路径；token 只用于当前请求，永远不返回到 Node 日志。
+      form.append('file', new File([bytes], config.name, { type: config.mimeType }));
+      // credentials=include 保持和 ChatGPT 前端 client 一致；Authorization 负责真正的 backend-api 鉴权。
+      const response = await fetch('/backend-api/transcribe', {
+        method: 'POST',
+        body: form,
+        credentials: 'include',
+        headers: {
+          // accept/oai-language 对齐网页端 transcribe client，避免后端把请求当成非浏览器调用路径。
+          accept: 'application/json',
+          'oai-language': navigator.language || 'en-US',
+          authorization: `Bearer ${accessToken}`,
+        },
+      });
+      // 先取 text 再 JSON.parse：非 JSON 错误体也要能给外层一个稳定 fallback 错误。
+      const body = await response.text();
+      let json = null;
+      // JSON parse 失败不记录完整 body，避免后端错误页里混入敏感账号或实验信息。
+      try { json = JSON.parse(body); }
+      catch {}
+      // HTTP 失败多半是私有接口或鉴权漂移；抛错触发 fake mic fallback，保证功能可用优先于性能。
+      if (!response.ok) throw new Error(`ChatGPT direct transcribe returned HTTP ${response.status}`);
+      // 空文本视为失败，避免把“成功但无内容”的网页异常插入到用户光标位置。
+      if (!json || typeof json.text !== 'string' || !json.text.trim()) throw new Error('ChatGPT direct transcribe returned empty text');
+      // elapsedMs 只用于本地诊断日志；不参与业务判断，避免慢网下误判为失败。
+      return { text: json.text, elapsedMs: Math.round(performance.now() - startedAt) };
+    }, {
+      // 传给 page.evaluate 的对象保持最小字段，避免把 Node 侧 workspace/path 结构暴露给网页。
+      audioBase64,
+      // basename 只用于 File.name；真实路径校验已经在 daemon/client 边界完成。
+      name: path.basename(file),
+      // MIME 单独传入，避免页面上下文重新推导本地路径扩展名。
+      mimeType: audioMimeType(file),
+    });
+  }
+
+  function audioMimeType(file) {
+    // MIME 只按扩展名声明上传格式；真正文件合法性仍由上游 voice file/WAV 校验负责。
+    const ext = path.extname(file).toLowerCase();
+    // ChatGPT 前端 bundle 明确接受这些音频类型；保留枚举比把任意扩展转成 audio/* 更安全。
+    if (ext === '.wav') return 'audio/wav';
+    // webm 是浏览器 MediaRecorder 常见输出，保留它便于未来复用已有录音文件测试。
+    if (ext === '.webm') return 'audio/webm';
+    if (ext === '.m4a') return 'audio/m4a';
+    // mp3 用 audio/mpeg 而不是 audio/mp3，贴近浏览器和后端更通用的 MIME 识别。
+    if (ext === '.mp3') return 'audio/mpeg';
+    if (ext === '.ogg') return 'audio/ogg';
+    if (ext === '.flac') return 'audio/flac';
+    // 未知扩展交给后端判断；这里不猜测 MIME，避免错误声明导致转写结果不可预测。
+    return 'application/octet-stream';
+  }
+
+  function applyVoiceInputPatch(config) {
+    // __opencodeVoiceInput 只用于本次 page 的诊断事件；不跨页面持久化，避免长期保存音频注入状态。
+    window.__opencodeVoiceInput = { events: [] };
+    const push = event => {
+      try { window.__opencodeVoiceInput.events.push({ at: Date.now(), ...event }); }
+      catch {}
+    };
+    const originalPermissionsQuery = navigator.permissions?.query?.bind(navigator.permissions);
+    if (originalPermissionsQuery) {
+      // 只把 microphone 权限伪装成 granted；其它权限查询必须透传原始浏览器实现。
+      navigator.permissions.query = descriptor => descriptor?.name === 'microphone'
+        ? Promise.resolve({ state: 'granted', onchange: null, addEventListener() {}, removeEventListener() {}, dispatchEvent() { return false; } })
+        : originalPermissionsQuery(descriptor);
+    }
+    const original = navigator.mediaDevices?.getUserMedia?.bind(navigator.mediaDevices);
+    if (!original) throw new Error('getUserMedia is not available');
+    navigator.mediaDevices.getUserMedia = async constraints => {
+      push({ type: 'getUserMedia-called', constraints });
+      // 非音频 getUserMedia 不是本功能的边界，必须交回原实现，避免影响 ChatGPT 其它媒体能力。
+      if (!constraints?.audio) return original(constraints);
+      const stream = await injectedAudioStream(config, push);
+      // 记录 track 状态用于 fallback 诊断；不包含音频数据本身，避免日志泄露录音内容。
+      push({ type: 'getUserMedia-resolved', tracks: stream.getTracks().map(track => ({ kind: track.kind, readyState: track.readyState })) });
+      return stream;
+    };
+
+    async function injectedAudioStream(config, push) {
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextClass) throw new Error('AudioContext is not available');
+      const audioContext = new AudioContextClass();
+      await audioContext.resume().catch(() => {});
+      // decodeAudioData 在浏览器内解码 bytes，避免 Node 侧额外引入 ffmpeg/sox 这类外部工具。
+      const bytes = Uint8Array.from(atob(config.audioBase64), char => char.charCodeAt(0));
+      const audioBuffer = await audioContext.decodeAudioData(bytes.buffer.slice(0));
+      const destination = audioContext.createMediaStreamDestination();
+      // 静音 oscillator 保持 stream live；没有持续 track 时 ChatGPT 可能在音频播放前就认为麦克风结束。
+      const silence = audioContext.createOscillator();
+      const gain = audioContext.createGain();
+      gain.gain.value = 0;
+      silence.connect(gain).connect(destination);
+      silence.start();
+      const chunkFrames = Math.max(1, Math.round(audioBuffer.sampleRate * Math.max(1, config.streamChunkMs || 250) / 1000));
+      const chunks = Math.ceil(audioBuffer.length / chunkFrames);
+      for (let index = 0; index < chunks; index++) {
+        // 分块调度保留真实时间轴，作为 direct upload 失效时的兼容 fallback，而不是性能优先路径。
+        const startFrame = index * chunkFrames;
+        const frameCount = Math.min(chunkFrames, audioBuffer.length - startFrame);
+        // 每个 chunk 重新建 BufferSource，因为 Web Audio 的 BufferSource 只能 start 一次，不能循环复用。
+        const chunk = audioContext.createBuffer(audioBuffer.numberOfChannels, frameCount, audioBuffer.sampleRate);
+        for (let channel = 0; channel < audioBuffer.numberOfChannels; channel++) {
+          chunk.copyToChannel(audioBuffer.getChannelData(channel).slice(startFrame, startFrame + frameCount), channel);
+        }
+        const source = audioContext.createBufferSource();
+        source.buffer = chunk;
+        source.connect(destination);
+        source.onended = () => {
+          source.disconnect();
+          // 只在最后一个 chunk 报 ended，waitForInjectedVoiceAudio 才能把“音频播放完”作为单一同步点。
+          if (index === chunks - 1) push({ type: 'injected-audio-ended', duration: audioBuffer.duration, sampleRate: audioBuffer.sampleRate, channels: audioBuffer.numberOfChannels, chunks });
+        };
+        source.start(audioContext.currentTime + 0.05 + startFrame / audioBuffer.sampleRate);
+      }
+      push({ type: 'injected-audio-started', duration: audioBuffer.duration, sampleRate: audioBuffer.sampleRate, channels: audioBuffer.numberOfChannels, chunks, chunkMs: config.streamChunkMs || 250 });
+      return destination.stream;
+    }
+  }
+
+  async function clickDictationButton(page) {
+    const deadline = Date.now() + VOICE_DICTATION_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      const clicked = await page.evaluate(() => {
+        const controls = visibleControls(document);
+        const dictation = controls.find(button => /dictat|speech to text|voice input|start voice input|microphone|\bmic\b|语音输入|语音识别|听写|麦克风/i.test(button.label) && !/voice mode|voice chat|conversation|call|通话|语音对话|实时对话|send|submit|发送|提交/i.test(button.label));
+        const fallback = controls
+          .filter(button => /voice|speech|microphone|\bmic\b|listen|语音|麦克风|听写/i.test(button.label) && !/voice mode|voice chat|conversation|call|通话|语音对话|实时对话|send|submit|发送|提交/i.test(button.label))
+          .sort((a, b) => a.x - b.x || a.y - b.y)[0];
+        const selected = dictation || fallback;
+        if (!selected) return null;
+        selected.element.scrollIntoView({ block: 'center', inline: 'center' });
+        selected.element.click();
+        return { index: selected.index, label: selected.label };
+
+        function visibleControls(root) {
+          return [...root.querySelectorAll('button, [role="button"]')]
+            .map((element, index) => {
+              const rect = element.getBoundingClientRect();
+              return {
+                element,
+                index,
+                label: normalize([element.getAttribute('aria-label'), element.getAttribute('title'), element.getAttribute('data-testid'), element.innerText, element.textContent].filter(Boolean).join(' ')),
+                visible: rect.width > 0 && rect.height > 0 && !element.disabled && element.getAttribute('aria-disabled') !== 'true',
+                x: Math.round(rect.x),
+                y: Math.round(rect.y),
+              };
+            })
+            .filter(item => item.visible);
+        }
+
+        function normalize(value) {
+          return String(value || '').normalize('NFKC').replace(/[ \t]+/g, ' ').replace(/[ \t]*\n[ \t]*/g, '\n').trim();
+        }
+      });
+      if (clicked) return clicked;
+      await sleep(500);
+    }
+    return null;
+  }
+
+  async function voiceControlSnapshot(page) {
+    return page.evaluate(() => {
+      return [...document.querySelectorAll('button, [role="button"]')]
+        .map((element, index) => {
+          const rect = element.getBoundingClientRect();
+          const label = normalize([element.getAttribute('aria-label'), element.getAttribute('title'), element.getAttribute('data-testid'), element.innerText, element.textContent].filter(Boolean).join(' '));
+          return {
+            index,
+            label,
+            visible: rect.width > 0 && rect.height > 0,
+            disabled: Boolean(element.disabled) || element.getAttribute('aria-disabled') === 'true',
+            x: Math.round(rect.x),
+            y: Math.round(rect.y),
+          };
+        })
+        .filter(item => item.visible && (item.x > 250 || /voice|speech|microphone|dictat|listen|talk|语音|麦克风|听写|朗读|说话|通话/i.test(item.label)))
+        .slice(0, 80);
+
+      function normalize(value) {
+        return String(value || '').normalize('NFKC').replace(/[ \t]+/g, ' ').replace(/[ \t]*\n[ \t]*/g, '\n').trim();
+      }
+    });
+  }
+
+  async function waitForInjectedVoiceAudio(page) {
+    const wait = page.waitForFunction(() => {
+      const events = window.__opencodeVoiceInput?.events || [];
+      return events.some(event => event.type === 'injected-audio-ended');
+    }, { timeout: 0 });
+    const timedOut = await Promise.race([
+      wait.then(() => false),
+      sleep(VOICE_DICTATION_TIMEOUT_MS).then(() => true),
+    ]);
+    if (timedOut) {
+      wait.catch(() => {});
+      const events = await page.evaluate(() => window.__opencodeVoiceInput?.events || []).catch(() => []);
+      throw new Error(`Voice audio injection did not finish within ${VOICE_DICTATION_TIMEOUT_MS}ms: ${JSON.stringify(events)}`);
+    }
+  }
+
+  async function clickStopDictation(page) {
+    const deadline = Date.now() + VOICE_DICTATION_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      const clicked = await page.evaluate(() => {
+        const controls = [...document.querySelectorAll('button, [role="button"]')]
+          .map((element, index) => {
+            const rect = element.getBoundingClientRect();
+            return {
+              element,
+              index,
+              label: normalize([element.getAttribute('aria-label'), element.getAttribute('title'), element.getAttribute('data-testid'), element.innerText, element.textContent].filter(Boolean).join(' ')),
+              visible: rect.width > 0 && rect.height > 0 && !element.disabled && element.getAttribute('aria-disabled') !== 'true',
+            };
+          })
+          .filter(item => item.visible);
+        const stop = controls.find(item => /提交听写|完成听写|停止听写|结束听写|submit dictation|finish dictation|done dictation|stop dictation|stop listening|stop voice input|停止语音|结束语音/i.test(item.label) && !/stop generating|停止生成|send|发送/i.test(item.label));
+        if (!stop) return null;
+        stop.element.scrollIntoView({ block: 'center', inline: 'center' });
+        stop.element.click();
+        return { index: stop.index, label: stop.label };
+
+        function normalize(value) {
+          return String(value || '').normalize('NFKC').replace(/[ \t]+/g, ' ').replace(/[ \t]*\n[ \t]*/g, '\n').trim();
+        }
+      });
+      if (clicked) return clicked;
+      await sleep(500);
+    }
+    return null;
+  }
+
+  async function waitForComposerText(page) {
+    const wait = page.waitForFunction(() => {
+      const input = document.querySelector('#prompt-textarea');
+      return normalize((input?.innerText || input?.textContent || '').replace(/\r\n?/g, '\n')).trim().length > 0;
+
+      function normalize(value) {
+        return String(value || '').replace(/[ \t]+/g, ' ').replace(/[ \t]*\n[ \t]*/g, '\n').replace(/\n+/g, '\n').trim();
+      }
+    }, { timeout: 0 });
+    const timedOut = await Promise.race([
+      wait.then(() => false),
+      sleep(VOICE_DICTATION_TIMEOUT_MS).then(() => true),
+    ]);
+    if (timedOut) {
+      wait.catch(() => {});
+      const events = await page.evaluate(() => window.__opencodeVoiceInput?.events || []).catch(() => []);
+      const controls = await voiceControlSnapshot(page).catch(() => []);
+      throw new Error(`ChatGPT dictation did not write composer text within ${VOICE_DICTATION_TIMEOUT_MS}ms: events=${JSON.stringify(events)} controls=${JSON.stringify(controls)}`);
+    }
+    return page.evaluate(() => {
+      const input = document.querySelector('#prompt-textarea');
+      return normalize((input?.innerText || input?.textContent || '').replace(/\r\n?/g, '\n'));
+
+      function normalize(value) {
+        return String(value || '').replace(/[ \t]+/g, ' ').replace(/[ \t]*\n[ \t]*/g, '\n').replace(/\n+/g, '\n').trim();
+      }
+    });
+  }
+
+  async function clearComposerText(page) {
+    await page.evaluate(() => {
+      const input = document.querySelector('#prompt-textarea');
+      if (!input) return;
+      input.focus();
+      document.execCommand('selectAll', false, null);
+      document.execCommand('delete', false, null);
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContent' }));
+    });
   }
 
   async function assertNoComposerAttachments(page) {

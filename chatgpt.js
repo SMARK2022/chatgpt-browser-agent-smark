@@ -43,7 +43,7 @@ const DAEMON_FILE = path.join(STATE_DIR, 'daemon.json');
 const DAEMON_LOCK_FILE = path.join(STATE_DIR, 'daemon.lock');
 const DAEMON_LOG = path.join(STATE_DIR, 'daemon.log');
 const DEFAULT_PROJECT = process.env.CHATGPT_PROJECT || process.env.CHATGPT_PROJECT_NAME || process.env.CHATGPT_PROJECT_URL || 'MCP';
-const DAEMON_VERSION = 22;
+const DAEMON_VERSION = 23;
 const DAEMON_START_TIMEOUT = positiveIntEnv('CHATGPT_DAEMON_START_TIMEOUT_MS', 60_000);
 const BROWSER_CONNECT_TIMEOUT_MS = positiveIntEnv('CHATGPT_BROWSER_CONNECT_TIMEOUT_MS', 3_000);
 const HTTP_TIMEOUT = positiveIntEnv('CHATGPT_HTTP_TIMEOUT_MS', 30_000);
@@ -56,6 +56,7 @@ const MAX_FULL_PROMPT_CHARS = positiveIntEnv('CHATGPT_MAX_FULL_PROMPT_CHARS', 50
 const MAX_UPLOAD_FILES = positiveIntEnv('CHATGPT_MAX_UPLOAD_FILES', 12);
 const MAX_UPLOAD_BYTES = positiveIntEnv('CHATGPT_MAX_UPLOAD_BYTES', 400 * 1024 * 1024);
 const MAX_TOTAL_UPLOAD_BYTES = positiveIntEnv('CHATGPT_MAX_TOTAL_UPLOAD_BYTES', 800 * 1024 * 1024);
+const MAX_VOICE_FILE_BYTES = positiveIntEnv('CHATGPT_VOICE_FILE_MAX_BYTES', 50 * 1024 * 1024);
 const EXPLICIT_UPLOAD_ROOTS = uploadRoots();
 let activeStartLock = null;
 
@@ -230,6 +231,25 @@ function validateUploadPaths(files, workspaceDir) {
   return safe;
 }
 
+function validateVoiceFile(filePath) {
+  // 语音入口只接受本地录音产出的 WAV 文件路径；这里不走 shell，也不读取任意 prompt 文本。
+  // CLI 先做快速文件校验，避免缺参/坏路径误触发 daemon 启动和浏览器窗口。
+  if (!filePath) throw new Error('transcribe-file requires --file <wav>');
+  const abs = path.resolve(filePath);
+  let real;
+  try { real = fs.realpathSync.native(abs); }
+  catch { throw new Error(`Voice file does not exist: ${filePath}`); }
+  const stat = fs.statSync(real);
+  if (!stat.isFile()) throw new Error(`Voice path is not a regular file: ${filePath}`);
+  if (stat.size > MAX_VOICE_FILE_BYTES) throw new Error(`Voice file is too large: ${real}; limit is ${MAX_VOICE_FILE_BYTES} bytes`);
+  const fd = fs.openSync(real, 'r');
+  const header = Buffer.alloc(12);
+  try { fs.readSync(fd, header, 0, header.length, 0); }
+  finally { fs.closeSync(fd); }
+  if (header.length < 12 || header.toString('ascii', 0, 4) !== 'RIFF' || header.toString('ascii', 8, 12) !== 'WAVE') throw new Error(`Voice file must be a WAV file: ${real}`);
+  return real;
+}
+
 function assertUniqueBasenames(files) {
   const names = files.map(file => path.basename(file).toLowerCase());
   const duplicate = names.find((name, index) => names.indexOf(name) !== index);
@@ -323,8 +343,13 @@ function httpJSON(daemon, method, endpoint, body, timeout = HTTP_TIMEOUT) {
         let parsed;
         try { parsed = JSON.parse(raw); }
         catch { reject(new Error('Invalid JSON from daemon')); return; }
-        if (res.statusCode >= 400) reject(new Error(parsed.error || `Daemon HTTP ${res.statusCode}`));
-        else resolve(parsed);
+        if (res.statusCode >= 400) {
+          const error = new Error(parsed.error || `Daemon HTTP ${res.statusCode}`);
+          // daemon 的结构化 code 只用于本地生命周期决策；错误正文仍保持原样输出给用户。
+          if (parsed.code) error.code = parsed.code;
+          error.statusCode = res.statusCode;
+          reject(error);
+        } else resolve(parsed);
       });
     });
     req.on('error', reject);
@@ -344,12 +369,39 @@ async function isDaemonReachable(state) {
   catch { return false; }
 }
 
+async function isDaemonBrowserReady(state) {
+  try {
+    // browserConnected 来自有 bearer 的 /status；/ping 保持无副作用 identity check，不能承担 browser health 语义。
+    // 这里故意不把 /status 失败当作可用：HTTP 活着但状态不可读时，同样不能安全驱动浏览器。
+    const status = await httpJSON(state, 'GET', '/status', undefined, 3_000);
+    // 同版本 daemon 必须显式声明 browser 健康；缺字段说明状态协议不完整，不能继续复用旧浏览器连接。
+    return status.browserConnected === true;
+  } catch {
+    return false;
+  }
+}
+
+async function isDaemonUsable(state) {
+  // usable 比 reachable 更严格：HTTP daemon 活着但 browser 已断开时，业务请求仍然不能复用它。
+  // 这个函数只在真实 ask/voice 启动路径使用；status 命令继续保持只读，不调用这里修复状态。
+  return await isDaemonReachable(state) && await isDaemonBrowserReady(state);
+}
+
+async function retireDaemon(state) {
+  // stale daemon 可能已经失去 browser 连接；/stop 失败也要清掉本地索引，让下一次启动不再复用假活端口。
+  // 这里不杀任意 PID，只通过持有 bearer token 的本地 HTTP 请求通知对应 daemon，避免误伤同机其它 node 进程。
+  await httpJSON(state, 'POST', '/stop', {}, 3_000).catch(() => {});
+  unlinkDaemonFiles();
+}
+
 async function acquireDaemonStartLock() {
   ensureStateDirForDaemon();
   const deadline = Date.now() + DAEMON_START_TIMEOUT;
   while (Date.now() < deadline) {
     const state = readDaemonState();
-    if (state?.version === DAEMON_VERSION && await isDaemonReachable(state)) return { state };
+    // 启动锁等待期间也要看 browser health；否则等锁的调用方会拿到刚被用户关掉浏览器的 stale daemon。
+    // 只有确认 daemon 与 browser 都可用时才复用 state；其余情况必须争抢启动锁进入清理/重启路径。
+    if (state?.version === DAEMON_VERSION && await isDaemonUsable(state)) return { state };
     try {
       const token = `${process.pid}:${crypto.randomBytes(8).toString('hex')}`;
       const fd = fs.openSync(DAEMON_LOCK_FILE, 'wx');
@@ -455,9 +507,7 @@ function daemonStartupErrorSince(offset) {
  */
 async function ensureDaemon() {
   let state = readDaemonState();
-  if (state && state.version === DAEMON_VERSION && await isDaemonReachable(state)) return state;
-
-  await assertBrowserReuseCanStart();
+  if (state && state.version === DAEMON_VERSION && await isDaemonUsable(state)) return state;
 
   const acquired = await acquireDaemonStartLock();
   if (acquired.state) return acquired.state;
@@ -465,12 +515,14 @@ async function ensureDaemon() {
 
   try {
     state = readDaemonState();
-    if (state && state.version === DAEMON_VERSION && await isDaemonReachable(state)) return state;
-    if (state && state.version !== DAEMON_VERSION) {
-      // 版本升级会关闭旧 daemon；必须在启动锁内做，避免并发 ask 中一个 child 关掉另一个正在使用的浏览器连接。
-      await httpJSON(state, 'POST', '/stop', {}, 3_000).catch(() => {});
+    if (state && state.version === DAEMON_VERSION && await isDaemonUsable(state)) return state;
+    if (state && await isDaemonReachable(state)) {
+      // 版本升级或 browser 已断开都会淘汰旧 daemon；必须在启动锁内做，避免并发 ask 互相关闭新旧浏览器连接。
+      await retireDaemon(state);
     }
     unlinkDaemonFiles(); // 清理上次崩溃留下的过期端口文件。
+    // preflight 放在 stale 清理之后：即使外部 profile 当前不可启动，也不能继续留下旧 daemon 索引误导后续调用。
+    await assertBrowserReuseCanStart();
     process.stderr.write('[*] Starting browser daemon (first time ~15s)...\n');
     const logOffset = fs.existsSync(DAEMON_LOG) ? fs.statSync(DAEMON_LOG).size : 0;
 
@@ -481,7 +533,7 @@ async function ensureDaemon() {
     while (Date.now() < deadline) {
       await sleep(1_000);
       state = readDaemonState();
-      if (state && await isDaemonReachable(state)) {
+      if (state && await isDaemonUsable(state)) {
         await sleep(300); // 给 HTTP server 一小段时间完成端口绑定。
         process.stderr.write('[*] Daemon ready.\n');
         return state;
@@ -546,8 +598,12 @@ function projectURL(value) {
 function parseArgs(argv) {
   // 参数解析只做机械映射，不做业务校验；真正的会话、上传和保存策略由 daemon 统一判断。
   const args = argv.slice(2);
-  const opts = { login: false, file: null, upload: [], git: false, context: null, stop: false, status: false, raw: false, saveToFile: false, sessionID: null, newSession: false, daemonInternal: false, cwd: null, workspace: null, requestJSON: null, mode: null, imageAspectRatio: null, prompt: [] };
+  const opts = { login: false, file: null, upload: [], git: false, context: null, stop: false, status: false, raw: false, json: false, saveToFile: false, sessionID: null, newSession: false, daemonInternal: false, transcribeFile: false, cwd: null, workspace: null, requestJSON: null, mode: null, imageAspectRatio: null, prompt: [] };
   let i = 0;
+  if (args[0] === 'transcribe-file') {
+    opts.transcribeFile = true;
+    i = 1;
+  }
   const value = flag => {
     const next = args[++i];
     if (!next || next.startsWith('--')) throw new Error(`${flag} requires a value`);
@@ -560,6 +616,7 @@ function parseArgs(argv) {
       case '--stop': opts.stop = true; break;
       case '--status': opts.status = true; break;
       case '--raw': opts.raw = true; break;
+      case '--json': opts.json = true; break;
       case '--save-to-file': opts.saveToFile = true; break;
       case '--daemon-internal': opts.daemonInternal = true; break;
       case '--file': opts.file = value('--file'); break;
@@ -642,6 +699,7 @@ Usage:
   node chatgpt.js --git "write a commit message"        # attach git diff/status
   node chatgpt.js --context "we use Effect v4" "prompt" # inline context
   node chatgpt.js --mode image --image-aspect-ratio wide "prompt"
+  node chatgpt.js transcribe-file --file <wav> --json # private TUI voice transcription
   node chatgpt.js --request-json -                       # internal MCP payload mode over stdin
   cat error.log | node chatgpt.js "what is wrong"       # pipe input
   node chatgpt.js --status                              # check if daemon is running
@@ -652,8 +710,8 @@ Usage:
 /**
  * CLI 的唯一入口。
  *
- * 这里故意保持线性分支：daemon internal、login、stop、status、ask。stop/status
- * 是生命周期诊断，不会隐式发送 prompt；ask 才会启动 daemon 并进入 core 的状态机。
+ * 这里故意保持线性分支：daemon internal、login、stop、status、transcribe、ask。
+ * stop/status 是生命周期诊断，transcribe 是 TUI 私有 side-channel；只有 ask 才发送 prompt。
  */
 async function main(argv = process.argv) {
   const opts = parseArgs(argv);
@@ -680,12 +738,41 @@ async function main(argv = process.argv) {
       const detail = await httpJSON(state, 'GET', '/status');
       console.log(`[*] Daemon running — PID ${detail.pid || state.pid}, port ${state.port}`);
       if (detail.project) console.log(`Project: ${detail.project}`);
+      if (detail.browserConnected !== undefined) {
+        // status 是诊断命令，只报告 browser 健康；真实 ask/voice 才会按需淘汰 stale daemon 并启动新浏览器。
+        console.log(`Browser: ${detail.browserConnected ? 'connected' : 'disconnected'}`);
+      }
       console.log(`Pages: ${detail.pageCount ?? (detail.pages || []).length}; pending: ${detail.pendingPageCount ?? (detail.pendingPages || []).length}`);
       if (detail.pages) console.log(`Session pages: ${detail.pages.join(', ') || 'none'}`);
       console.log(`Active locks: ${detail.activeLocks || 0}`);
     } catch (err) {
       console.log(`[*] Daemon state exists but HTTP status is unreachable or stale — PID ${state.pid}, port ${state.port}`);
       console.log(`Error: ${err.message}`);
+    }
+    return;
+  }
+
+  if (opts.transcribeFile) {
+    try {
+      const file = validateVoiceFile(opts.file);
+      let daemon = await ensureDaemon();
+      let result;
+      try {
+        result = await httpJSON(daemon, 'POST', '/voice/transcribe-file', { file }, ASK_HTTP_TIMEOUT);
+      } catch (err) {
+        if (err.code !== 'BROWSER_DISCONNECTED') throw err;
+        // voice 请求在 daemon 创建工作页前断开还没有远端副作用；淘汰 stale daemon 后安全重试一次。
+        // 不对普通 Protocol error 文本重试，避免在转写已经进入网页/网络阶段时掩盖真实失败。
+        await retireDaemon(daemon);
+        daemon = await ensureDaemon();
+        result = await httpJSON(daemon, 'POST', '/voice/transcribe-file', { file }, ASK_HTTP_TIMEOUT);
+      }
+      if (!result.ok) throw new Error(result.error || 'Daemon returned an error');
+      if (opts.json) console.log(JSON.stringify({ text: result.text || '' }));
+      else console.log(result.text || '');
+    } catch (err) {
+      console.error('[ERROR]', err.message);
+      process.exit(1);
     }
     return;
   }
@@ -706,11 +793,21 @@ async function main(argv = process.argv) {
   });
 
   try {
-    const daemon = await ensureDaemon();
+    let daemon = await ensureDaemon();
     // CLI 只提交已归一化的请求；上传、等待、pending、落盘都由 daemon 在同一状态机里处理。
     const workspaceDir = opts.workspace || opts.cwd || process.cwd();
     // imageAspectRatio 能隐式打开 image mode；这样 OpenCode agent 只要表达“宽屏图”，不必重复传两个字段。
-    const result = await httpJSON(daemon, 'POST', '/ask', { fullPrompt, uploadPaths: validateUploadPaths(opts.upload, workspaceDir), workspaceDir, sessionID, newSession: opts.newSession || !opts.sessionID, saveToFile: opts.saveToFile, mode: requestMode, imageAspectRatio: opts.imageAspectRatio || null }, ASK_HTTP_TIMEOUT);
+    let result;
+    try {
+      result = await httpJSON(daemon, 'POST', '/ask', { fullPrompt, uploadPaths: validateUploadPaths(opts.upload, workspaceDir), workspaceDir, sessionID, newSession: opts.newSession || !opts.sessionID, saveToFile: opts.saveToFile, mode: requestMode, imageAspectRatio: opts.imageAspectRatio || null }, ASK_HTTP_TIMEOUT);
+    } catch (err) {
+      if (err.code !== 'BROWSER_DISCONNECTED') throw err;
+      // core 只在 page 创建前返回这个 code；此时 prompt 尚未提交，重启 daemon 后复用同一个 sessionID 安全重试一次。
+      // 如果断连发生在 DOM 提交之后，core 不会使用这个 code，CLI 也不会自动重发 prompt。
+      await retireDaemon(daemon);
+      daemon = await ensureDaemon();
+      result = await httpJSON(daemon, 'POST', '/ask', { fullPrompt, uploadPaths: validateUploadPaths(opts.upload, workspaceDir), workspaceDir, sessionID, newSession: opts.newSession || !opts.sessionID, saveToFile: opts.saveToFile, mode: requestMode, imageAspectRatio: opts.imageAspectRatio || null }, ASK_HTTP_TIMEOUT);
+    }
     if (!result.ok) throw new Error(result.error || 'Daemon returned an error');
     const responseText = formatResponse(result);
     if (opts.raw) console.log(responseText);

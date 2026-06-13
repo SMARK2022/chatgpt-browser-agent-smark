@@ -46,7 +46,7 @@ const DAEMON_FILE      = path.join(STATE_DIR, 'daemon.json');
 const DAEMON_LOG       = path.join(STATE_DIR, 'daemon.log');
 const CHATGPT_URL      = 'https://chatgpt.com';
 const DEFAULT_PROJECT  = process.env.CHATGPT_PROJECT || process.env.CHATGPT_PROJECT_NAME || process.env.CHATGPT_PROJECT_URL || 'MCP';
-const DAEMON_VERSION   = 22;
+const DAEMON_VERSION   = 23;
 const RESPONSE_TIMEOUT = positiveIntEnv('CHATGPT_RESPONSE_TIMEOUT_MS', 540_000); // 大文件分析会很慢，默认给 9 分钟。
 const MAX_RETURN_CHARS = positiveIntEnv('CHATGPT_MAX_RETURN_CHARS', 6_000);
 const RESPONSE_PREVIEW_CHARS = positiveIntEnv('CHATGPT_RESPONSE_PREVIEW_CHARS', 4_000);
@@ -61,12 +61,14 @@ const SESSION_MAX_AGE_MS = positiveIntEnv('CHATGPT_SESSION_MAX_AGE_MS', 90 * 24 
 const MAX_UPLOAD_FILES = positiveIntEnv('CHATGPT_MAX_UPLOAD_FILES', 12);
 const MAX_UPLOAD_BYTES = positiveIntEnv('CHATGPT_MAX_UPLOAD_BYTES', 400 * 1024 * 1024);
 const MAX_TOTAL_UPLOAD_BYTES = positiveIntEnv('CHATGPT_MAX_TOTAL_UPLOAD_BYTES', 800 * 1024 * 1024);
+const MAX_VOICE_FILE_BYTES = positiveIntEnv('CHATGPT_VOICE_FILE_MAX_BYTES', 50 * 1024 * 1024);
 const MAX_FULL_PROMPT_CHARS = positiveIntEnv('CHATGPT_MAX_FULL_PROMPT_CHARS', 500_000);
 const ASK_MODES = new Set(['auto', 'image']);
 // 图片比例来自实测的 ChatGPT image popover；保存语义枚举，DOM 本地化标签留给 adapter 翻译。
 const IMAGE_ASPECT_RATIOS = new Set(['auto', 'square', 'portrait', 'story', 'landscape', 'wide']);
 const EXPLICIT_UPLOAD_ROOTS = uploadRoots();
 const WORKSPACE_ROOTS = workspaceRoots();
+const VOICE_FILE_ROOTS = voiceFileRoots();
 const CHATGPT_DOM = createChatGPTDom({
   responseTimeout: RESPONSE_TIMEOUT,
 });
@@ -258,6 +260,13 @@ function workspaceRoots() {
   // 因此 workspace allowlist 只能是显式部署策略，不能默认锁死到“第一个启动 daemon 的项目”。
   const value = process.env.CHATGPT_WORKSPACE_ROOTS || '';
   return value.split(path.delimiter).map(item => item.trim()).filter(Boolean).map(item => path.resolve(item));
+}
+
+function voiceFileRoots() {
+  // voice route 只服务 OpenCode TUI 录音临时文件；默认 root 与 opencode Global.Path.tmp/voice 对齐。
+  // 额外 root 必须显式配置，避免 bearer token 持有者把任意 WAV 路径发给 ChatGPT 听写。
+  const explicit = (process.env.CHATGPT_VOICE_FILE_ROOTS || '').split(path.delimiter).map(item => item.trim()).filter(Boolean).map(item => path.resolve(item));
+  return [path.join(os.tmpdir(), 'opencode', 'voice'), ...explicit].map(root => path.resolve(root));
 }
 
 function realWorkspaceRoots() {
@@ -698,6 +707,27 @@ function validateAskInput(input) {
   };
 }
 
+function validateVoiceInput(input) {
+  // /voice/transcribe-file 是 TUI 私有 side-channel，不经过 MCP schema；daemon 仍要当作本地 HTTP API 校验。
+  // 这里只接受一个已存在的 WAV 文件，避免 bearer token 持有者把任意路径当作 prompt 或附件读取。
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('/voice/transcribe-file body must be an object');
+  if (typeof input.file !== 'string' || !input.file.trim()) throw new Error('file must be a non-empty string');
+  const abs = path.resolve(input.file);
+  let real;
+  try { real = fs.realpathSync.native(abs); }
+  catch { throw new Error(`Voice file does not exist: ${input.file}`); }
+  if (!VOICE_FILE_ROOTS.some(root => pathInside(root, real))) throw new Error(`Voice file is outside allowed roots: ${input.file}`);
+  const stat = fs.statSync(real);
+  if (!stat.isFile()) throw new Error(`Voice path is not a regular file: ${input.file}`);
+  if (stat.size > MAX_VOICE_FILE_BYTES) throw new Error(`Voice file is too large: ${real}; limit is ${MAX_VOICE_FILE_BYTES} bytes`);
+  const fd = fs.openSync(real, 'r');
+  const header = Buffer.alloc(12);
+  try { fs.readSync(fd, header, 0, header.length, 0); }
+  finally { fs.closeSync(fd); }
+  if (header.toString('ascii', 0, 4) !== 'RIFF' || header.toString('ascii', 8, 12) !== 'WAVE') throw new Error(`Voice file must be a WAV file: ${real}`);
+  return { file: real };
+}
+
 function safeUploadPaths(uploads, workspaceDir) {
   const safe = uploads.map(file => assertUploadFileSafe(file, workspaceDir));
   assertUniqueBasenames(safe);
@@ -1016,10 +1046,21 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
   const sessionLocks = new Map();
   let conversationCreateQueue = Promise.resolve();
   let pageCreateQueue = Promise.resolve();
+  let voiceLock = Promise.resolve();
   let sparePage = bootstrapPage;
 
   // pending 会话仍可能承载远端生成 DOM；registry 防重发，tab 保留则服务后续 artifact/text recovery。
   const pageCanBeClosed = id => !sessionLocks.has(id) && !isPendingFresh(readSessionEntry(id, project)?.pending);
+
+  function assertBrowserConnected() {
+    // browser 是 daemon 的核心资源；用户手动关掉窗口后继续复用 page handle 只会得到 Puppeteer 协议错误。
+    // 在创建/复用页面前改成结构化错误，让 CLI 能安全丢弃 stale daemon，并只在无远端副作用的边界重试。
+    if (browser.isConnected()) return;
+    // BROWSER_DISCONNECTED 是 daemon/client 的本地协议码，不暴露给 ChatGPT，也不依赖 Puppeteer 错误文案。
+    const error = new Error('Browser was closed; retry the request to start a new daemon.');
+    error.code = 'BROWSER_DISCONNECTED';
+    throw error;
+  }
 
   const closeIdlePageIfNeeded = async () => {
     if (sessionPages.size < MAX_SESSION_PAGES) return true;
@@ -1044,6 +1085,9 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
       const pendingPages = pages.filter(id => isPendingFresh(readSessionEntry(id, project)?.pending));
       // status 默认只给数量，不泄露 #sessionID；调试句柄需要显式打开环境变量。
       return {
+        // browserConnected 区分“Node daemon 还活着”和“可继续驱动 ChatGPT 页面”；status 仍只读，不触发重启。
+        browserConnected: browser.isConnected(),
+        // 下面仍保留原有 session 计数语义，避免 browser health 字段改变 status 的既有诊断输出结构。
         pageCount: pages.length,
         pendingPageCount: pendingPages.length,
         activeLocks: sessionLocks.size,
@@ -1052,6 +1096,7 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
       };
     },
     async pageFor(sessionID) {
+      assertBrowserConnected();
       const current = sessionPages.get(sessionID);
       if (current && !current.isClosed()) {
         sessionPages.delete(sessionID);
@@ -1079,6 +1124,13 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
         release();
       }
     },
+    async voicePage() {
+      // 语音听写页是 TUI 私有工作页，不能放入 sessionPages；否则普通 ask 的 page cap、pending
+      // recovery 和 #sessionID LRU 都会把一次转写误认为一条 ChatGPT conversation。每次新建页面也避免
+      // evaluateOnNewDocument 中携带的 base64 音频在长期复用页里累积。
+      assertBrowserConnected();
+      return browser.newPage();
+    },
     withSession(sessionID, task) {
       // 同一会话串行；不同会话可以并发。这个 seam 是 daemon 并发语义的唯一入口。
       const previous = sessionLocks.get(sessionID) || Promise.resolve();
@@ -1088,6 +1140,13 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
         if (sessionLocks.get(sessionID) === stored) sessionLocks.delete(sessionID);
       });
       sessionLocks.set(sessionID, stored);
+      return run;
+    },
+    withVoice(task) {
+      // 同一个 ChatGPT composer 同时只能有一次听写；串行化能避免两段音频互相抢 getUserMedia patch 和输入框文本。
+      const previous = voiceLock;
+      const run = previous.then(task, task);
+      voiceLock = run.catch(() => {});
       return run;
     },
     async withNewConversationLock(task) {
@@ -1105,6 +1164,19 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
       return CHATGPT_DOM.waitForResponse(page, beforeState, { ...waitOptions, foregroundPulseMs: 4_000 }, log);
     },
   };
+}
+
+// ─── Voice Flow ──────────────────────────────────────────────────────────────
+
+async function runVoiceTranscribe(runtime, input, log) {
+  const page = await runtime.voicePage();
+  try {
+    log(`voice: transcribing ${path.basename(input.file)} bytes=${fs.statSync(input.file).size}`);
+    const text = await CHATGPT_DOM.transcribeAudioFile(page, input.file, CHATGPT_URL, log);
+    return { ok: true, text };
+  } finally {
+    await page.close().catch(() => {});
+  }
 }
 
 // ─── Ask Flow ────────────────────────────────────────────────────────────────
@@ -1306,11 +1378,55 @@ async function finishAsk({ page, runtime, beforeState, sessionID, workspaceDir, 
 
 // ─── Daemon Process ───────────────────────────────────────────────────────────
 
+function readDaemonJsonBody(req, label, log) {
+  // voice route 的 body 只有 `{ file }`，但它仍是本地 HTTP 边界：做字节上限和 30s 读超时，
+  // 避免 token 持有者用半开连接占住 daemon socket。/ask 继续保留自己的长请求/取消逻辑。
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let bytes = 0;
+    let done = false;
+    const finish = (error, value) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      req.setTimeout(0);
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const timer = setTimeout(() => {
+      log(`Error: ${label} request body total deadline exceeded`);
+      finish(new Error('Request body total deadline exceeded'));
+      setImmediate(() => req.destroy());
+    }, 30_000);
+    req.setTimeout(30_000, () => {
+      log(`Error: ${label} request body timed out`);
+      finish(new Error('Request body timed out'));
+      setImmediate(() => req.destroy());
+    });
+    req.on('data', chunk => {
+      bytes += chunk.length;
+      if (done) return;
+      if (bytes > MAX_DAEMON_REQUEST_BYTES) {
+        finish(new Error(`Request body too large; limit is ${MAX_DAEMON_REQUEST_BYTES} bytes`));
+        setImmediate(() => req.destroy());
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('error', err => finish(err));
+    req.on('end', () => {
+      if (done) return;
+      try { finish(null, JSON.parse(Buffer.concat(chunks, bytes).toString('utf8') || '{}')); }
+      catch { finish(new Error('Request body must be JSON')); }
+    });
+  });
+}
+
 /**
  * 启动长期运行的 daemon 进程。
  *
  * 启动阶段必须先解析固定 Project 并确认登录态，成功后再写 daemon.json；否则 CLI 可能拿到
- * 一个尚不可用的端口。HTTP 层只暴露 /status、/stop、/ask，业务错误统一回 JSON，
+ * 一个尚不可用的端口。HTTP 层只暴露 /status、/stop、/ask 和 TUI 私有 /voice/transcribe-file，业务错误统一回 JSON，
  * 进程级错误写入 daemon.log 供本地诊断。
  */
 async function startDaemonProcess() {
@@ -1354,8 +1470,34 @@ async function startDaemonProcess() {
   const runtime = createDaemonRuntime({ browser, bootstrapPage, project });
   const daemonToken = crypto.randomBytes(18).toString('hex');
   const daemonID = crypto.randomBytes(12).toString('hex');
+  let server;
+  let shuttingDown = false;
 
-  const server = http.createServer(async (req, res) => {
+  const shutdownOnce = async (message, options = {}) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    log(message);
+    // daemon.json/daemon.run.json 都是客户端发现入口；browser 已断开时必须删除，避免后续 CLI 复用假活 daemon。
+    // 只清理索引文件，不碰 profile、sessions、downloads；用户关闭浏览器不应丢失登录态或会话恢复资料。
+    for (const file of [DAEMON_FILE, path.join(STATE_DIR, 'daemon.run.json')]) {
+      try { if (fs.existsSync(file)) fs.unlinkSync(file); } catch {}
+    }
+    if (server) server.close();
+    // browser disconnected 回调里不再 close browser：连接已断开，重复 close 只会制造无意义的协议错误。
+    if (options.closeBrowser !== false) await browser.close().catch(() => {});
+    process.exit(options.exitCode ?? 0);
+  };
+
+  browser.on('disconnected', () => {
+    // 用户手动关闭浏览器代表当前 daemon 不再可服务页面请求；不自动重开，下一次 ask/voice 再按需启动。
+    // 这里退出 daemon 而不是内部重启 browser，避免用户刚关闭窗口又被后台进程立即重新弹出。
+    shutdownOnce('Browser disconnected; shutting down daemon.', { closeBrowser: false }).catch(err => {
+      log(`Shutdown error after browser disconnect: ${err.message}`);
+      process.exit(1);
+    });
+  });
+
+  server = http.createServer(async (req, res) => {
     const send = (status, obj) => {
       res.writeHead(status, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(obj));
@@ -1382,11 +1524,21 @@ async function startDaemonProcess() {
 
     if (req.method === 'POST' && req.url === '/stop') {
       send(200, { ok: true });
-      log('Shutting down...');
-      server.close();
-      await browser.close().catch(() => {});
-      if (fs.existsSync(DAEMON_FILE)) fs.unlinkSync(DAEMON_FILE);
-      process.exit(0);
+      await shutdownOnce('Shutting down...', { closeBrowser: true });
+    }
+
+    if (req.method === 'POST' && req.url === '/voice/transcribe-file') {
+      try {
+        res.setTimeout(RESPONSE_TIMEOUT + 60_000);
+        const parsed = validateVoiceInput(await readDaemonJsonBody(req, '/voice/transcribe-file', log));
+        const result = await runtime.withVoice(() => runVoiceTranscribe(runtime, parsed, log));
+        send(200, result);
+      } catch (err) {
+        log(`Error: ${err.message}`);
+        // 503 表示本地 browser 生命周期失效而非用户输入错误；CLI 只对这个结构化 code 做一次安全重试。
+        send(err.code === 'BROWSER_DISCONNECTED' ? 503 : /body|file|WAV|regular|large|exist/i.test(err.message) ? 400 : 500, { ok: false, ...(err.code ? { code: err.code } : {}), error: err.message });
+      }
+      return;
     }
 
     if (req.method === 'POST' && req.url === '/ask') {
@@ -1467,11 +1619,12 @@ async function startDaemonProcess() {
             reply(200, result);
           } catch (err) {
             log(`Error: ${err.message}`);
-            reply(500, { ok: false, error: err.message });
+            // /ask 只有在 runAsk 创建 page 前才会带 BROWSER_DISCONNECTED；提交后的异常不能自动重发。
+            reply(err.code === 'BROWSER_DISCONNECTED' ? 503 : 500, { ok: false, ...(err.code ? { code: err.code } : {}), error: err.message });
           }
         }).catch(err => {
           log(`Error: ${err.message}`);
-          reply(500, { ok: false, error: err.message });
+          reply(err.code === 'BROWSER_DISCONNECTED' ? 503 : 500, { ok: false, ...(err.code ? { code: err.code } : {}), error: err.message });
         });
       });
       return;
@@ -1496,11 +1649,8 @@ async function startDaemonProcess() {
   });
 
   const shutdown = async signal => {
-    // 退出路径尽量清理 daemon.json；下次 CLI 看到无状态文件就会启动新的 daemon。
-    log(`${signal} received, shutting down`);
-    if (fs.existsSync(DAEMON_FILE)) fs.unlinkSync(DAEMON_FILE);
-    await browser.close().catch(() => {});
-    process.exit(0);
+    // 信号退出和 browser 断开共用同一清理边界，保证 daemon.json 不会在任意退出路径遗留 stale bearer token。
+    await shutdownOnce(`${signal} received, shutting down`, { closeBrowser: true });
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT',  () => shutdown('SIGINT'));
