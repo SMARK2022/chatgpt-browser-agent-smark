@@ -947,11 +947,32 @@ function createChatGPTDom({ responseTimeout }) {
   }
 
   async function fillPrompt(page, text) {
-    // execCommand('insertText') 能触发 contenteditable/React 的输入路径，比直接改 innerText 更稳定。
-    // 插入后必须读回 composer 内容：ChatGPT 页面重渲染、焦点丢失或隐藏 composer 都可能让 insertText 静默失败。
+    // 不能从空 composer 直接插入完整 prompt：ChatGPT/ProseMirror 会把 Markdown 风格的
+    // “- item\n  continuation” 自动格式化，续行前两个普通空格会变成 “NBSP + space”。
+    // 先提交一个短 sentinel，让编辑器进入普通文本替换事务，再整体替换成真实 prompt；
+    // 这样修的是写入路径本身，而不是用“+2 也算通过”的宽松校验掩盖问题。
     const expected = normalizeComposerText(text);
     await page.waitForSelector('#prompt-textarea', { visible: true, timeout: 45_000 });
-    const actual = await page.evaluate(value => {
+    await replaceComposerText(page, 'x');
+    await page.waitForFunction(value => {
+      const input = document.querySelector('#prompt-textarea');
+      return composerText(input) === value;
+
+      function composerText(input) {
+        return normalize((input?.innerText || input?.textContent || '').replace(/\r\n?/g, '\n'));
+      }
+
+      function normalize(value) {
+        return String(value || '').replace(/[ \t]+/g, ' ').replace(/[ \t]*\n[ \t]*/g, '\n').replace(/\n+/g, '\n').trim();
+      }
+    }, { timeout: 5_000 }, 'x');
+    const actual = await replaceComposerText(page, text);
+    if (actual !== expected) throw new Error(`Composer fill verification failed: expected ${expected.length} chars, got ${actual.length}; ${promptDiff(expected, actual)}`);
+    return expected;
+  }
+
+  async function replaceComposerText(page, text) {
+    return page.evaluate(value => {
       const el = document.querySelector('#prompt-textarea');
       el.focus();
       document.execCommand('selectAll', false, null);
@@ -966,8 +987,14 @@ function createChatGPTDom({ responseTimeout }) {
         return String(value || '').replace(/[ \t]+/g, ' ').replace(/[ \t]*\n[ \t]*/g, '\n').replace(/\n+/g, '\n').trim();
       }
     }, text);
-    if (actual !== expected) throw new Error(`Composer fill verification failed: expected ${expected.length} chars, got ${actual.length}`);
-    return expected;
+  }
+
+  function promptDiff(expected, actual) {
+    const max = Math.max(expected.length, actual.length);
+    let index = 0;
+    while (index < max && expected[index] === actual[index]) index++;
+    if (index >= max) return 'no visible diff';
+    return `first diff at ${index}: expected ${JSON.stringify(expected.slice(Math.max(0, index - 24), index + 48))}, got ${JSON.stringify(actual.slice(Math.max(0, index - 24), index + 48))}`;
   }
 
   async function clickSend(page, expectedPrompt, beforeClick) {
