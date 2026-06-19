@@ -48,6 +48,9 @@ const DAEMON_START_TIMEOUT = positiveIntEnv('CHATGPT_DAEMON_START_TIMEOUT_MS', 6
 const BROWSER_CONNECT_TIMEOUT_MS = positiveIntEnv('CHATGPT_BROWSER_CONNECT_TIMEOUT_MS', 3_000);
 const HTTP_TIMEOUT = positiveIntEnv('CHATGPT_HTTP_TIMEOUT_MS', 30_000);
 const ASK_HTTP_TIMEOUT = positiveIntEnv('CHATGPT_ASK_HTTP_TIMEOUT_MS', 620_000);
+// voice 转写是短音频（通常 <30s 录音），direct API 正常路径几秒内返回。
+// 即使 fallback 到听写 UI，也应在 120s 内完成；复用 620s 的 ASK 超时会让空音频/网络抖动 hang 近 10 分钟。
+const VOICE_HTTP_TIMEOUT = positiveIntEnv('CHATGPT_VOICE_HTTP_TIMEOUT_MS', 120_000);
 const HTTP_RESPONSE_MAX_BYTES = positiveIntEnv('CHATGPT_HTTP_RESPONSE_MAX_BYTES', 10 * 1024 * 1024);
 const MAX_TEXT_FILE_BYTES = positiveIntEnv('CHATGPT_TEXT_FILE_MAX_BYTES', 2 * 1024 * 1024);
 const MAX_GIT_DIFF_CHARS = positiveIntEnv('CHATGPT_GIT_DIFF_MAX_CHARS', 100_000);
@@ -758,14 +761,14 @@ async function main(argv = process.argv) {
       let daemon = await ensureDaemon();
       let result;
       try {
-        result = await httpJSON(daemon, 'POST', '/voice/transcribe-file', { file }, ASK_HTTP_TIMEOUT);
+        result = await httpJSON(daemon, 'POST', '/voice/transcribe-file', { file }, VOICE_HTTP_TIMEOUT);
       } catch (err) {
         if (err.code !== 'BROWSER_DISCONNECTED') throw err;
         // voice 请求在 daemon 创建工作页前断开还没有远端副作用；淘汰 stale daemon 后安全重试一次。
         // 不对普通 Protocol error 文本重试，避免在转写已经进入网页/网络阶段时掩盖真实失败。
         await retireDaemon(daemon);
         daemon = await ensureDaemon();
-        result = await httpJSON(daemon, 'POST', '/voice/transcribe-file', { file }, ASK_HTTP_TIMEOUT);
+        result = await httpJSON(daemon, 'POST', '/voice/transcribe-file', { file }, VOICE_HTTP_TIMEOUT);
       }
       if (!result.ok) throw new Error(result.error || 'Daemon returned an error');
       if (opts.json) console.log(JSON.stringify({ text: result.text || '' }));

@@ -539,8 +539,10 @@ function createChatGPTDom({ responseTimeout }) {
       catch {}
       // HTTP 失败多半是私有接口或鉴权漂移；抛错触发 fake mic fallback，保证功能可用优先于性能。
       if (!response.ok) throw new Error(`ChatGPT direct transcribe returned HTTP ${response.status}`);
-      // 空文本视为失败，避免把“成功但无内容”的网页异常插入到用户光标位置。
-      if (!json || typeof json.text !== 'string' || !json.text.trim()) throw new Error('ChatGPT direct transcribe returned empty text');
+      // direct API 返回 200 但 text 为空字符串时，代表音频确实没有可识别的语音内容（例如纯静音或纯噪声）。
+      // 这是 API 的正常响应，不应触发慢速听写 UI fallback——fallback 会播放空音频并等满 dictation 超时，造成 ~90s 卡死。
+      // 只有 API 结构异常（非 JSON、缺 text 字段）才视为失败并 fallback。
+      if (!json || typeof json.text !== 'string') throw new Error('ChatGPT direct transcribe returned invalid response');
       // elapsedMs 只用于本地诊断日志；不参与业务判断，避免慢网下误判为失败。
       return { text: json.text, elapsedMs: Math.round(performance.now() - startedAt) };
     }, {
