@@ -78,7 +78,8 @@ CHATGPT_MCP_CHILD_OUTPUT_MAX_BYTES Child stdout/stderr cap, default 12582912
 CHATGPT_MCP_STDIN_LINE_MAX_BYTES  MCP JSON-RPC line cap before parsing, default 26214400
 CHATGPT_MCP_MAX_ACTIVE_CALLS      Concurrent ask cap, default 4
 CHATGPT_MCP_TIMEOUT_RECOVERY_HOLD_MS Stop-safety hold after ask timeout, default 120000
-CHATGPT_DAEMON_START_TIMEOUT_MS   Daemon startup timeout, default 60000
+CHATGPT_DAEMON_START_TIMEOUT_MS   Daemon startup timeout, default derived from login wait + 60s buffer
+CHATGPT_LOGIN_WAIT_TIMEOUT_MS     Login wait window when cookies expire, default 120000. Must stay below CHATGPT_CLI_TIMEOUT_MS
 CHATGPT_MAX_RETURN_CHARS          Safe response return threshold, default 6000
 CHATGPT_RESPONSE_PREVIEW_CHARS    Preview length returned after local save, default 4000
 CHATGPT_MCP_MAX_RETURN_CHARS      Final MCP wrapper output cap, default 8000
@@ -204,6 +205,11 @@ as "This browser or app may not be secure".
 
 After the ChatGPT page is fully logged in, close the browser window and press
 Enter in the terminal.
+
+If login cookies expire during use, the daemon will keep the browser window open
+and wait for you to log in again (default 2 minutes). Email/password login works
+directly; for Google OAuth, close the window and run `node chatgpt.js --login`
+instead.
 
 ## CLI Usage
 

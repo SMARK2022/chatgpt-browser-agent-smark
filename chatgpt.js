@@ -44,7 +44,11 @@ const DAEMON_LOCK_FILE = path.join(STATE_DIR, 'daemon.lock');
 const DAEMON_LOG = path.join(STATE_DIR, 'daemon.log');
 const DEFAULT_PROJECT = process.env.CHATGPT_PROJECT || process.env.CHATGPT_PROJECT_NAME || process.env.CHATGPT_PROJECT_URL || 'MCP';
 const DAEMON_VERSION = 23;
-const DAEMON_START_TIMEOUT = positiveIntEnv('CHATGPT_DAEMON_START_TIMEOUT_MS', 60_000);
+// 登录等待超时必须和 core 一致；client 用它推导 DAEMON_START_TIMEOUT，保证登录等待期间不提前放弃。
+const LOGIN_WAIT_TIMEOUT_MS = positiveIntEnv('CHATGPT_LOGIN_WAIT_TIMEOUT_MS', 120_000);
+// daemon 启动超时必须覆盖登录等待窗口；登录等待期间 daemon 活着但未写 daemon.json，
+// client 只能靠 deadline 等待。硬故障（browser 崩溃等）仍由 daemonStartupErrorSince 在 1-2s 内检出。
+const DAEMON_START_TIMEOUT = positiveIntEnv('CHATGPT_DAEMON_START_TIMEOUT_MS', LOGIN_WAIT_TIMEOUT_MS + 60_000);
 const BROWSER_CONNECT_TIMEOUT_MS = positiveIntEnv('CHATGPT_BROWSER_CONNECT_TIMEOUT_MS', 3_000);
 const HTTP_TIMEOUT = positiveIntEnv('CHATGPT_HTTP_TIMEOUT_MS', 30_000);
 const ASK_HTTP_TIMEOUT = positiveIntEnv('CHATGPT_ASK_HTTP_TIMEOUT_MS', 620_000);
@@ -501,6 +505,14 @@ function daemonStartupErrorSince(offset) {
   } catch { return null; }
 }
 
+// 检测 daemon 是否正处于登录等待状态；ensureDaemon 据此向用户输出可见提示。
+// "Login required;" 标记不含 "Startup error:"，不会被 daemonStartupErrorSince 误判为错误。
+function daemonLoginRequiredSince(offset) {
+  try {
+    return fs.readFileSync(DAEMON_LOG, 'utf8').slice(offset).includes('Login required;');
+  } catch { return false; }
+}
+
 /**
  * 确保本地 browser daemon 已经可用，并返回端口与本地 bearer token。
  *
@@ -529,10 +541,13 @@ async function ensureDaemon() {
     process.stderr.write('[*] Starting browser daemon (first time ~15s)...\n');
     const logOffset = fs.existsSync(DAEMON_LOG) ? fs.statSync(DAEMON_LOG).size : 0;
 
-    const child = spawn(process.execPath, [__filename, '--daemon-internal'], { detached: true, windowsHide: true, stdio: ['ignore', 'ignore', 'ignore'], env: { ...process.env } });
+    // 测试可通过 CHATGPT_DAEMON_INTERNAL_SCRIPT 注入 stub daemon 脚本，覆盖真实浏览器启动。
+    const daemonScript = process.env.CHATGPT_DAEMON_INTERNAL_SCRIPT || __filename;
+    const child = spawn(process.execPath, [daemonScript, '--daemon-internal'], { detached: true, windowsHide: true, stdio: ['ignore', 'ignore', 'ignore'], env: { ...process.env } });
     child.unref();
 
     const deadline = Date.now() + DAEMON_START_TIMEOUT;
+    let loginNotified = false;
     while (Date.now() < deadline) {
       await sleep(1_000);
       state = readDaemonState();
@@ -543,6 +558,13 @@ async function ensureDaemon() {
       }
       const startupError = daemonStartupErrorSince(logOffset);
       if (startupError) throw new Error(`${startupError} Check log: ${DAEMON_LOG}`);
+      // 登录等待不是错误：daemon 活着但需要用户手动登录。
+      // 向 stderr 输出一次提示（含 --login 建议），让 Google OAuth 用户知道有替代方案。
+      if (!loginNotified && daemonLoginRequiredSince(logOffset)) {
+        loginNotified = true;
+        const minutes = Math.round(LOGIN_WAIT_TIMEOUT_MS / 60_000);
+        process.stderr.write(`[*] ChatGPT login expired — please log in in the browser window, or run: node chatgpt.js --login (timeout ${minutes}m)\n`);
+      }
     }
     throw new Error(`Daemon did not start. Check log: ${DAEMON_LOG}`);
   } finally {

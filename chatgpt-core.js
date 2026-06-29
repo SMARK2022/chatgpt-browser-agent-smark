@@ -50,7 +50,7 @@ const DAEMON_VERSION   = 23;
 const RESPONSE_TIMEOUT = positiveIntEnv('CHATGPT_RESPONSE_TIMEOUT_MS', 540_000); // 大文件分析会很慢，默认给 9 分钟。
 const MAX_RETURN_CHARS = positiveIntEnv('CHATGPT_MAX_RETURN_CHARS', 6_000);
 const RESPONSE_PREVIEW_CHARS = positiveIntEnv('CHATGPT_RESPONSE_PREVIEW_CHARS', 4_000);
-const MAX_SESSION_PAGES = positiveIntEnv('CHATGPT_MAX_SESSION_PAGES', 8);
+const MAX_SESSION_PAGES = positiveIntEnv('CHATGPT_MAX_SESSION_PAGES', 12);
 const MAX_DAEMON_REQUEST_BYTES = positiveIntEnv('CHATGPT_DAEMON_MAX_REQUEST_BYTES', 25 * 1024 * 1024);
 const PENDING_TTL_MS = positiveIntEnv('CHATGPT_PENDING_TTL_MS', 12 * 60 * 60 * 1000);
 const COMPLETED_RETRY_TTL_MS = positiveIntEnv('CHATGPT_COMPLETED_RETRY_TTL_MS', 10 * 60 * 1000);
@@ -63,6 +63,9 @@ const MAX_UPLOAD_BYTES = positiveIntEnv('CHATGPT_MAX_UPLOAD_BYTES', 400 * 1024 *
 const MAX_TOTAL_UPLOAD_BYTES = positiveIntEnv('CHATGPT_MAX_TOTAL_UPLOAD_BYTES', 800 * 1024 * 1024);
 const MAX_VOICE_FILE_BYTES = positiveIntEnv('CHATGPT_VOICE_FILE_MAX_BYTES', 50 * 1024 * 1024);
 const MAX_FULL_PROMPT_CHARS = positiveIntEnv('CHATGPT_MAX_FULL_PROMPT_CHARS', 500_000);
+// 登录过期时 daemon 保持浏览器窗口打开，等待用户手动登录；超时后返回明确错误。
+// 默认 2 分钟：用户在场时足够完成邮箱/密码登录，不在场时不会让 MCP 调用长时间悬挂。
+const LOGIN_WAIT_TIMEOUT_MS = positiveIntEnv('CHATGPT_LOGIN_WAIT_TIMEOUT_MS', 120_000);
 const ASK_MODES = new Set(['auto', 'image']);
 // 图片比例来自实测的 ChatGPT image popover；保存语义枚举，DOM 本地化标签留给 adapter 翻译。
 const IMAGE_ASPECT_RATIOS = new Set(['auto', 'square', 'portrait', 'story', 'landscape', 'wide']);
@@ -1063,14 +1066,18 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
   }
 
   const closeIdlePageIfNeeded = async () => {
-    if (sessionPages.size < MAX_SESSION_PAGES) return true;
+    // 预留 3 个空位时就开始清理 idle 页面，避免到满负荷才回收导致新会话创建失败。
+    // pageCanBeClosed 只允许关闭"无活跃锁且非 pending"的页面，不会影响正在使用或待恢复的会话。
+    const proactiveThreshold = Math.max(1, MAX_SESSION_PAGES - 3);
+    if (sessionPages.size < proactiveThreshold) return true;
     for (const [id, page] of sessionPages) {
       if (!pageCanBeClosed(id)) continue;
       sessionPages.delete(id);
       await page.close().catch(() => {});
+      // 主动清理只关一个就够：不要在单次 pageFor 中批量关页面，避免阻塞新会话创建。
       return true;
     }
-    return false;
+    return sessionPages.size < MAX_SESSION_PAGES;
   };
 
   async function createSessionPage() {
@@ -1114,6 +1121,8 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
         if (raced && !raced.isClosed()) return raced;
         // 每个 #sessionID 固定绑定一个页面：恢复读取自己的 DOM，不会被其他会话导航覆盖。
         // 启动时已有的 bootstrapPage 只复用一次，随后所有新 session 都拥有独立 page。
+        // 新建页面前先主动清理 idle 页面，避免累积到上限才回收。
+        if (!sparePage || sparePage.isClosed()) await closeIdlePageIfNeeded();
         const next = sparePage && !sparePage.isClosed()
           ? sparePage
           : await createSessionPage();
@@ -1434,6 +1443,9 @@ async function startDaemonProcess() {
   // daemon 是唯一持有 Puppeteer browser 的进程；CLI/MCP 都只通过本地 HTTP 找它。
   const logStream = fs.createWriteStream(DAEMON_LOG, { flags: 'a' });
   const log = msg => logStream.write(`[${new Date().toISOString()}] ${msg}\n`);
+  // process.exit 不等待 async writeStream 刷盘；登录等待阶段的断连/超时错误必须先落盘再退出，
+  // 否则 client 的 daemonStartupErrorSince 读不到错误，只能等满 DAEMON_START_TIMEOUT。
+  const flushAndExit = code => { logStream.end(() => process.exit(code)); };
 
   log('Daemon starting...');
 
@@ -1447,9 +1459,45 @@ async function startDaemonProcess() {
     await bootstrapPage.goto(project?.url || CHATGPT_URL, { waitUntil: 'domcontentloaded', timeout: 45_000 });
 
     if (await CHATGPT_DOM.isLoggedOut(bootstrapPage)) {
-      log('Startup error: Not logged in. Run: node chatgpt.js --login');
-      await browser.close();
-      process.exit(1);
+      // 保持浏览器窗口打开让用户手动登录；Puppeteer 控制的浏览器可能被 Google OAuth 拒绝，
+      // 邮箱/密码登录通常可用。Google 账户用户可关闭此窗口后运行 node chatgpt.js --login。
+      log('Login required; waiting for manual login in browser window...');
+      let loginConfirmed = false;
+      const loginDeadline = Date.now() + LOGIN_WAIT_TIMEOUT_MS;
+      while (Date.now() < loginDeadline) {
+        await sleep(3_000);
+        // browser.on('disconnected') 尚未注册（在 startup try 块之后才挂载），
+        // 这里手动检测断连，避免用户关闭窗口后空转至超时。
+        if (!browser.isConnected()) {
+          log('Startup error: Browser closed during login wait. Run: node chatgpt.js --login');
+          return flushAndExit(1);
+        }
+        try {
+          // 被动检测：只读 URL 和 DOM，不调用 page.goto，避免打断用户正在填写的登录表单。
+          // ChatGPT 登录成功后会自然重定向到 chatgpt.com，isLoggedOut 会返回 false。
+          if (!await CHATGPT_DOM.isLoggedOut(bootstrapPage)) {
+            // 二次确认：OAuth 重定向中途可能短暂出现非登录页 URL，单次检测可能误判。
+            await sleep(2_000);
+            if (browser.isConnected() && !await CHATGPT_DOM.isLoggedOut(bootstrapPage)) {
+              loginConfirmed = true;
+              break;
+            }
+          }
+        } catch {
+          // 页面导航中 evaluate 失败是正常的（OAuth 重定向会销毁 execution context）；
+          // 只有 browser 真正断开才退出，其余异常继续等待下一轮检测。
+          if (!browser.isConnected()) {
+            log('Startup error: Browser closed during login wait. Run: node chatgpt.js --login');
+            return flushAndExit(1);
+          }
+        }
+      }
+      if (!loginConfirmed) {
+        log('Startup error: Login wait timed out after ' + LOGIN_WAIT_TIMEOUT_MS + 'ms. Log in to chatgpt.com in the browser window, or run: node chatgpt.js --login');
+        await browser.close();
+        return flushAndExit(1);
+      }
+      log('Login detected; continuing startup.');
     }
 
     project = project || await resolveProject(bootstrapPage, DEFAULT_PROJECT, log);
@@ -1465,7 +1513,8 @@ async function startDaemonProcess() {
   } catch (err) {
     log(`Startup error: ${err.message}`);
     if (browser) await browser.close().catch(() => {});
-    process.exit(1);
+    // 外层 catch 同样需要刷盘后退出，否则启动期异常的日志可能丢失。
+    return flushAndExit(1);
   }
 
   const runtime = createDaemonRuntime({ browser, bootstrapPage, project });

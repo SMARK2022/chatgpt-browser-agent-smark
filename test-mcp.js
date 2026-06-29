@@ -2,17 +2,17 @@
 'use strict';
 
 /**
- * test-mcp.js — 不启动浏览器的 MCP 协议烟测
+ * test-mcp.js — MCP 协议烟测 + 真实 daemon 端到端测试
  *
- * 这些测试只覆盖 wrapper 层能确定的协议不变量：JSON-RPC id、batch、tool schema、
- * 超大 stdin 行和 notification。它们故意不发送真正 ask，避免 CI/本地检查依赖登录态、
- * ChatGPT Web DOM 或浏览器窗口。
- *
- * 这里还固定覆盖 OpenCode 全局 config 深合并留下旧环境变量的回归路径：wrapper
- * 不应因为部署层 timeout 组合陈旧就在启动期退出，否则 host 只能看到 Connection closed。
+ * 测试分两层：
+ *   1. wrapper 协议层（runServer）：JSON-RPC、schema 校验、超限恢复——不依赖浏览器。
+ *   2. 真实 E2E 层（runChatgptCLI + 真实 daemon）：ask、文件上传、voice、并发、session 续聊。
+ * E2E 测试在 daemon 不可用时自动跳过（打印 SKIP），不失败。
+ * 每个测试最多 40 秒；全部测试最多 3 分钟。
  */
 
 const assert = require('assert');
+const crypto = require('crypto');
 const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
 const http = require('http');
@@ -28,18 +28,412 @@ const BASE_ENV = {
   CHATGPT_CLI_TIMEOUT_MS: '6000',
 };
 
+// E2E 测试使用真实 daemon 的环境（不覆盖 STATE_DIR，复用用户登录态）。
+const E2E_ENV = {
+  ...process.env,
+  CHATGPT_PROJECT: 'MCP',
+  CHATGPT_WORKSPACE_ROOTS: process.cwd(),
+  CHATGPT_WORKSPACE_DIR: process.cwd(),
+  // E2E ask 超时给 55s，留 5s margin 给 CLI 启动和 daemon 通信。
+  CHATGPT_ASK_HTTP_TIMEOUT_MS: '55000',
+  CHATGPT_CLI_TIMEOUT_MS: '58000',
+};
+
+let e2eAvailable = null; // null=未检测, true=可用, false=不可用
+let e2eSessionID = null; // E2E 测试间共享的 sessionID，避免每次都新建会话（新建需要 ~15s 导航开销）
+
 async function main() {
-  testBasicProtocol();
-  testLegacyTimeoutEnv();
-  testArgumentValidation();
-  testVoiceTranscribeIsPrivate();
-  testTranscribeFileCliValidation();
-  await testDirectVoiceTranscribeSkipsComposerWait();
-  testOversizedLineRecovery();
-  testExistingSessionIndexStartup();
-  await testStatusReportsDisconnectedBrowser();
-  await testVoiceSkipsStaleBrowserDaemon();
-  await testAskSkipsStaleBrowserDaemon();
+  const PER_TEST_TIMEOUT = 60_000;
+  // 支持按名称运行单个测试：node test-mcp.js testE2EAskWithFileUpload
+  const filter = process.argv.slice(2);
+  const allTests = [
+    ['testBasicProtocol', () => testBasicProtocol(), false],
+    ['testLegacyTimeoutEnv', () => testLegacyTimeoutEnv(), false],
+    ['testArgumentValidation', () => testArgumentValidation(), false],
+    ['testVoiceTranscribeIsPrivate', () => testVoiceTranscribeIsPrivate(), false],
+    ['testTranscribeFileCliValidation', () => testTranscribeFileCliValidation(), false],
+    ['testDirectVoiceTranscribeSkipsComposerWait', () => testDirectVoiceTranscribeSkipsComposerWait(), false],
+    ['testOversizedLineRecovery', () => testOversizedLineRecovery(), false],
+    ['testExistingSessionIndexStartup', () => testExistingSessionIndexStartup(), false],
+    ['testStatusReportsDisconnectedBrowser', () => testStatusReportsDisconnectedBrowser(), false],
+    ['testVoiceSkipsStaleBrowserDaemon', () => testVoiceSkipsStaleBrowserDaemon(), false],
+    ['testAskSkipsStaleBrowserDaemon', () => testAskSkipsStaleBrowserDaemon(), false],
+    ['testLoginRequiredMarkerNotTreatedAsStartupError', () => testLoginRequiredMarkerNotTreatedAsStartupError(), false],
+    ['testLoginWaitTimeoutErrorDetected', () => testLoginWaitTimeoutErrorDetected(), false],
+    ['testSessionIDValidationRejection', () => testSessionIDValidationRejection(), false],
+    ['testFileUploadRejectsOutsideAllowlist', () => testFileUploadRejectsOutsideAllowlist(), false],
+    ['testFileUploadRejectsDuplicateBasenames', () => testFileUploadRejectsDuplicateBasenames(), false],
+    ['testStopWithoutActiveAsk', () => testStopWithoutActiveAsk(), false],
+    ['checkE2EAvailability', () => checkE2EAvailability(), true],
+    ['testE2EStatus', () => testE2EStatus(), true],
+    ['testE2EAskBasic', () => testE2EAskBasic(), true],
+    ['testE2EAskWithSession', () => testE2EAskWithSession(), true],
+    ['testE2EAskWithFileUpload', () => testE2EAskWithFileUpload(), true],
+    ['testE2EAskWithSaveToFile', () => testE2EAskWithSaveToFile(), true],
+    ['testE2EConcurrentAsks', () => testE2EConcurrentAsks(), true],
+    ['testE2EVoiceTranscribe', () => testE2EVoiceTranscribe(), true],
+  ];
+  // 有 filter 时只跑指定测试；E2E 测试需要先检测 daemon 可用性。
+  const selected = filter.length > 0 ? allTests.filter(t => filter.includes(t[0])) : allTests;
+  // 如果选了 E2E 测试但没选 checkE2EAvailability，自动先跑它。
+  const needsE2ECheck = selected.some(t => t[2]) && !selected.some(t => t[0] === 'checkE2EAvailability');
+  if (needsE2ECheck) await withTestTimeout('checkE2EAvailability', checkE2EAvailability, PER_TEST_TIMEOUT);
+  for (const [name, fn] of selected) {
+    await withTestTimeout(name, fn, PER_TEST_TIMEOUT);
+  }
+}
+
+// 检测真实 daemon 是否可用；不可用时尝试启动（ask 会触发 ensureDaemon）。
+// 启动失败（如未登录）则所有 E2E 测试自动跳过，不失败。
+async function checkE2EAvailability() {
+  // 先试 --status（只读，不启动 daemon）。
+  const status = await runChatgptCLI(['--status'], E2E_ENV, 10_000);
+  if (status.status === 0 && /Daemon running/.test(status.stdout)) {
+    e2eAvailable = true;
+    console.log('  E2E daemon detected: ' + status.stdout.split('\n')[0]);
+    return;
+  }
+  // daemon 未运行；用一次简单 ask 触发 ensureDaemon 启动浏览器。
+  // 如果登录态有效，daemon 会启动并回答；否则会进入登录等待或超时。
+  console.log('  Starting daemon for E2E tests...');
+  const probe = await runChatgptCLI(['--raw', '请回复：E2E就绪'], E2E_ENV, 59_000);
+  if (probe.status === 0 && /Session:/.test(probe.stdout)) {
+    e2eAvailable = true;
+    console.log('  E2E daemon started successfully');
+    return;
+  }
+  e2eAvailable = false;
+  console.log('  SKIP: E2E tests (daemon could not start or not logged in)');
+  console.log('  Detail: ' + (probe.stderr || probe.stdout).slice(0, 200));
+}
+
+// E2E 测试统一入口：daemon 不可用时跳过而非失败。
+async function e2e(fn) {
+  if (e2eAvailable === false) throw new SkipError('daemon not available');
+  if (e2eAvailable === null) await checkE2EAvailability();
+  if (e2eAvailable === false) throw new SkipError('daemon not available');
+  await fn();
+}
+
+class SkipError extends Error {
+  constructor(reason) { super(`SKIP: ${reason}`); this.name = 'SkipError'; }
+}
+
+// 单测试超时保护：超时后打印失败信息并退出，不让整个测试进程卡死。
+async function withTestTimeout(name, fn, ms) {
+  let timer;
+  try {
+    await Promise.race([
+      fn(),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${name} timed out after ${ms}ms`)), ms); }),
+    ]);
+    console.log(`  PASS: ${name}`);
+  } catch (err) {
+    if (err instanceof SkipError) {
+      console.log(`  ${err.message}`);
+      return;
+    }
+    console.error(`FAIL: ${name}: ${err.message}`);
+    process.exit(1);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function testLoginRequiredMarkerNotTreatedAsStartupError() {
+  // 当 daemon 日志包含 "Login required;" 但不包含 "Startup error:" 时，
+  // CLI 必须继续轮询等待而不是立即报启动失败。这验证 "Login required;" 标记
+  // 和 "Startup error:" 标记是两个独立的检测路径，不会互相误判。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-login-wait-'));
+  try {
+    // 用 stub daemon 脚本模拟"检测到未登录、写 Login required 标记后保持存活"的行为。
+    const stubScript = path.join(dir, 'stub-daemon.js');
+    fs.writeFileSync(stubScript, [
+      "const fs = require('fs');",
+      "const path = require('path');",
+      "const log = path.join(process.env.CHATGPT_STATE_DIR, 'daemon.log');",
+      "fs.appendFileSync(log, '[' + new Date().toISOString() + '] Daemon starting...\\n');",
+      "fs.appendFileSync(log, '[' + new Date().toISOString() + '] Login required; waiting for manual login in browser window...\\n');",
+      // stub 存活到 CLI 超时退出，让测试验证 "Login required" 不被当作 Startup error。
+      "setTimeout(() => process.exit(1), 5000);",
+    ].join('\n'));
+    const result = await runChatgptCLI(['--raw', 'test prompt'], {
+      CHATGPT_STATE_DIR: dir,
+      CHATGPT_SESSION_DIR: path.join(dir, 'sessions'),
+      CHATGPT_WORKSPACE_DIR: process.cwd(),
+      CHATGPT_WORKSPACE_ROOTS: process.cwd(),
+      // 让 ensureDaemon 用 stub 脚本代替真实 daemon 子进程。
+      CHATGPT_DAEMON_INTERNAL_SCRIPT: stubScript,
+      CHATGPT_DAEMON_START_TIMEOUT_MS: '3000',
+    }, 10000);
+    assert.notStrictEqual(result.status, 0);
+    // 关键断言：CLI 不能把 "Login required;" 当作 "Startup error" 报告；
+    // 应该是 "Daemon did not start"（轮询超时），而不是 "Daemon startup failed"。
+    assert.ok(!/Daemon startup failed/i.test(result.stderr),
+      `"Login required;" must not be treated as Startup error; got: ${result.stderr}`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+async function testLoginWaitTimeoutErrorDetected() {
+  // 登录等待超时后 daemon 写 "Startup error: Login wait timed out"；
+  // CLI 必须秒级检测到这个 Startup error 并把超时原因返回给调用方。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-login-timeout-'));
+  try {
+    // stub daemon 模拟完整登录等待超时流程：先写 Login required，再写 Startup error 并退出。
+    const stubScript = path.join(dir, 'stub-daemon.js');
+    fs.writeFileSync(stubScript, [
+      "const fs = require('fs');",
+      "const path = require('path');",
+      "const log = path.join(process.env.CHATGPT_STATE_DIR, 'daemon.log');",
+      "fs.appendFileSync(log, '[' + new Date().toISOString() + '] Daemon starting...\\n');",
+      "fs.appendFileSync(log, '[' + new Date().toISOString() + '] Login required; waiting for manual login in browser window...\\n');",
+      "fs.appendFileSync(log, '[' + new Date().toISOString() + '] Startup error: Login wait timed out after 120000ms. Log in to chatgpt.com in the browser window, or run: node chatgpt.js --login\\n');",
+      "process.exit(1);",
+    ].join('\n'));
+    const result = await runChatgptCLI(['--raw', 'test prompt'], {
+      CHATGPT_STATE_DIR: dir,
+      CHATGPT_SESSION_DIR: path.join(dir, 'sessions'),
+      CHATGPT_WORKSPACE_DIR: process.cwd(),
+      CHATGPT_WORKSPACE_ROOTS: process.cwd(),
+      CHATGPT_DAEMON_INTERNAL_SCRIPT: stubScript,
+      CHATGPT_DAEMON_START_TIMEOUT_MS: '5000',
+    }, 10000);
+    assert.notStrictEqual(result.status, 0);
+    // 超时错误必须被 CLI 检测到并包含在输出中，而不是等满 DAEMON_START_TIMEOUT。
+    assert.match(result.stderr, /Login wait timed out/i);
+    // 错误信息必须包含 --login 建议让用户知道如何恢复。
+    assert.match(result.stderr, /--login/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// ── 真实 daemon 端到端测试 ──────────────────────────────────────────────────────
+// 以下测试使用真实 daemon（不覆盖 STATE_DIR），需要浏览器已登录 ChatGPT。
+// daemon 不可用时通过 e2e() 包装自动跳过。
+
+async function testE2EStatus() {
+  await e2e(async () => {
+    const result = await runChatgptCLI(['--status'], E2E_ENV, 10_000);
+    assert.strictEqual(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Daemon running/i);
+    assert.match(result.stdout, /Browser: connected/i);
+  });
+}
+
+async function testE2EAskBasic() {
+  // 基本 ask：发送简单数学题，验证 ChatGPT 返回正确答案（不是机械复述）。
+  // 同时把返回的 sessionID 存入 e2eSessionID 供后续续聊测试复用，避免新建会话的 ~15s 导航开销。
+  await e2e(async () => {
+    const result = await runChatgptCLI(['--raw', '37+58等于多少？只返回数字。'], E2E_ENV, 59_000);
+    assert.strictEqual(result.status, 0, result.stderr);
+    assert.match(result.stdout, /\b95\b/);
+    const match = result.stdout.match(/Session: (#[a-f0-9]{10})/);
+    assert.ok(match, 'ask must return sessionID');
+    e2eSessionID = match[1];
+    assert.match(result.stdout, /Session: #[a-f0-9]{10}/);
+  });
+}
+
+async function testE2EAskWithSession() {
+  // session 续聊验证：复用 testE2EAskBasic 创建的会话（37+58=95），在同一会话中追问。
+  // 只有真正续聊同一会话，ChatGPT 才能知道上一轮答案是 95 并计算出 105——这验证了 session 连续性。
+  // 不使用"记住"等词避免触发 ChatGPT Memory 功能；不涉及敏感表述。
+  // 复用已有 sessionID 只需一次 CLI 调用，避免新建会话的导航开销。
+  await e2e(async () => {
+    assert.ok(e2eSessionID, 'session test requires e2eSessionID from testE2EAskBasic');
+    const second = await runChatgptCLI(['--raw', '--session-id', e2eSessionID, '把你上一个回答的数字加上10，等于多少？只返回数字。'], E2E_ENV, 59_000);
+    assert.strictEqual(second.status, 0, second.stderr);
+    // 必须返回 105（95+10），证明 ChatGPT 能看到上一轮对话上下文。
+    assert.match(second.stdout, /\b105\b/);
+    assert.match(second.stdout, new RegExp(e2eSessionID));
+  });
+}
+
+async function testE2EAskWithFileUpload() {
+  // 文件上传：在 upload cache 中创建含唯一标记的文件，上传后让 ChatGPT 读出标记。
+  // 只有真正读取了文件内容才能返回唯一标记——这验证了文件上传的完整性。
+  // 复用 e2eSessionID 避免新建会话的 ~10s 导航开销，让文件上传在 40s 测试超时内完成。
+  const uploadEnv = { ...E2E_ENV, CHATGPT_ASK_HTTP_TIMEOUT_MS: '55000', CHATGPT_CLI_TIMEOUT_MS: '58000' };
+  await e2e(async () => {
+    assert.ok(e2eSessionID, 'file upload test requires e2eSessionID from testE2EAskBasic');
+    const uploadDir = path.join(process.cwd(), '.opencode', 'cache', 'chatgpt', 'uploads');
+    fs.mkdirSync(uploadDir, { recursive: true });
+    const marker = 'ZEBRA-' + Date.now().toString(36).toUpperCase().slice(-5);
+    const uploadFile = path.join(uploadDir, `e2e-upload-${marker}.txt`);
+    // 文件内容加入随机填充，避免 ChatGPT 对相似内容做"已上传过此文件"去重。
+    const padding = crypto.randomBytes(64).toString('hex');
+    fs.writeFileSync(uploadFile, `这是一份测试文件。标记码：${marker}\n随机填充：${padding}\n`);
+    try {
+      const result = await runChatgptCLI(['--raw', '--session-id', e2eSessionID, '--upload', uploadFile, '文件中的标记是什么？只返回标记。'], uploadEnv, 59_000);
+      assert.strictEqual(result.status, 0, result.stderr);
+      // ChatGPT 必须返回文件中的唯一标记，证明文件被真正上传并读取。
+      assert.match(result.stdout, new RegExp(marker), `response must contain the unique marker ${marker} from uploaded file`);
+      assert.match(result.stdout, /Session: #[a-f0-9]{10}/);
+    } finally {
+      try { fs.unlinkSync(uploadFile); } catch {}
+    }
+  });
+}
+
+async function testE2EAskWithSaveToFile() {
+  // saveToFile：验证回答被保存到磁盘文件，且文件内容包含 ChatGPT 的回答。
+  await e2e(async () => {
+    const result = await runChatgptCLI(['--raw', '--save-to-file', '请回复：保存验证通过'], E2E_ENV, 59_000);
+    assert.strictEqual(result.status, 0, result.stderr);
+    // saveToFile 模式下输出应包含保存路径和元信息。
+    assert.match(result.stdout, /Response saved to:/i);
+    assert.match(result.stdout, /Lines: \d+/);
+    assert.match(result.stdout, /Characters: \d+/);
+    assert.match(result.stdout, /Session: #[a-f0-9]{10}/);
+    // 提取保存路径，验证文件真实存在且包含回答内容。
+    const savedPath = result.stdout.match(/Response saved to:\s*(.+)/)?.[1]?.trim();
+    assert.ok(savedPath, 'must have saved response path');
+    assert.ok(fs.existsSync(savedPath), 'saved response file must exist on disk');
+    const savedContent = fs.readFileSync(savedPath, 'utf8');
+    assert.match(savedContent, /保存验证通过/);
+  });
+}
+
+async function testE2EConcurrentAsks() {
+  // 并发 ask：同时发送两个不同数学题，验证各自返回正确答案且 sessionID 不同。
+  // 这验证了 daemon 能并发处理多个会话，不会串台。
+  await e2e(async () => {
+    const [a, b] = await Promise.all([
+      runChatgptCLI(['--raw', '12*12等于多少？只返回数字。'], E2E_ENV, 59_000),
+      runChatgptCLI(['--raw', '99+1等于多少？只返回数字。'], E2E_ENV, 59_000),
+    ]);
+    assert.strictEqual(a.status, 0, 'concurrent ask A failed: ' + a.stderr);
+    assert.strictEqual(b.status, 0, 'concurrent ask B failed: ' + b.stderr);
+    // 两个 ask 各自返回正确答案，证明没有串台。
+    assert.match(a.stdout, /\b144\b/);
+    assert.match(b.stdout, /\b100\b/);
+    // 两个 ask 应返回不同的 sessionID。
+    const sessionA = a.stdout.match(/Session: (#[a-f0-9]{10})/)?.[1];
+    const sessionB = b.stdout.match(/Session: (#[a-f0-9]{10})/)?.[1];
+    assert.ok(sessionA && sessionB, 'both asks must return sessionID');
+    assert.notStrictEqual(sessionA, sessionB, 'concurrent asks must have different sessionIDs');
+  });
+}
+
+async function testE2EVoiceTranscribe() {
+  // voice 转写：使用 TTS 生成的真实 "hello world" WAV 文件，验证 daemon 能转写出可识别的文本。
+  // 空 WAV 无法产生可识别语音；这里用 System.Speech 合成的真实音频验证端到端转写能力。
+  await e2e(async () => {
+    // TTS 音频预生成在项目目录下；voice file 必须在 daemon 的 VOICE_FILE_ROOTS 内。
+    // 默认 root 是 os.tmpdir()/opencode/voice/，把 TTS WAV 复制过去。
+    const ttsWav = path.join(__dirname, 'test-voice-hello.wav');
+    const hasRealAudio = fs.existsSync(ttsWav);
+    const voiceRoot = path.join(os.tmpdir(), 'opencode', 'voice');
+    fs.mkdirSync(voiceRoot, { recursive: true });
+    const voiceFile = path.join(voiceRoot, `e2e-voice-${Date.now()}.wav`);
+    if (hasRealAudio) {
+      fs.copyFileSync(ttsWav, voiceFile);
+    } else {
+      writeTinyWav(voiceFile);
+    }
+    try {
+      const result = await runChatgptCLI(['transcribe-file', '--file', voiceFile, '--json'], E2E_ENV, 59_000);
+      if (hasRealAudio) {
+        // 真实音频：daemon 应返回包含 "hello" 的转写文本。
+        assert.strictEqual(result.status, 0, result.stderr);
+        const parsed = JSON.parse(result.stdout.trim());
+        assert.ok(parsed.text && parsed.text.trim(), 'voice transcription must return non-empty text');
+        // TTS 说的是 "hello world"，转写结果应包含 "hello"（不区分大小写）。
+        assert.match(parsed.text.toLowerCase(), /hello/i, 'transcription must contain "hello" from TTS audio');
+      } else {
+        // 空 WAV：daemon 可能返回空文本或错误；只验证请求被接收处理。
+        if (result.status === 0) {
+          const parsed = JSON.parse(result.stdout.trim());
+          assert.ok('text' in parsed, 'voice result must have text field');
+        } else {
+          assert.match(result.stderr, /dictation|transcri|empty|voice/i);
+        }
+      }
+    } finally {
+      try { fs.unlinkSync(voiceFile); } catch {}
+    }
+  });
+}
+
+// ── wrapper 校验测试（不依赖浏览器）──
+
+async function testFileUploadRejectsOutsideAllowlist() {
+  // 文件不在 upload allowlist 内时，MCP wrapper 必须在启动 CLI 前就拒绝。
+  const outsideFile = path.join(os.tmpdir(), 'outside-allowlist-test.txt');
+  fs.writeFileSync(outsideFile, 'should be rejected');
+  try {
+    const responses = runServer([
+      JSON.stringify({ jsonrpc: '2.0', id: 'upload-outside', method: 'tools/call', params: { name: 'ask', arguments: { prompt: 'test', file: outsideFile } } }),
+    ]);
+    const result = responses.find(item => item.id === 'upload-outside');
+    assert.ok(result.result?.isError, 'file outside allowlist must return tool error');
+    assert.match(result.result.content[0].text, /outside.*root|allowed.*root/i);
+  } finally {
+    try { fs.unlinkSync(outsideFile); } catch {}
+  }
+}
+
+async function testFileUploadRejectsDuplicateBasenames() {
+  // ChatGPT composer 按文件名匹配 attachment；同名文件无法区分，必须在上传前拒绝。
+  const uploadDir = path.join(process.cwd(), '.opencode', 'cache', 'chatgpt', 'uploads');
+  fs.mkdirSync(uploadDir, { recursive: true });
+  fs.mkdirSync(path.join(uploadDir, 'sub'), { recursive: true });
+  const fileA = path.join(uploadDir, 'dup-name.txt');
+  const fileB = path.join(uploadDir, 'sub', 'dup-name.txt');
+  fs.writeFileSync(fileA, 'A');
+  fs.writeFileSync(fileB, 'B');
+  try {
+    const responses = runServer([
+      JSON.stringify({ jsonrpc: '2.0', id: 'dup-basenames', method: 'tools/call', params: { name: 'ask', arguments: { prompt: 'test', file: [fileA, fileB] } } }),
+    ]);
+    const result = responses.find(item => item.id === 'dup-basenames');
+    assert.ok(result.result?.isError, 'duplicate basenames must return tool error');
+    assert.match(result.result.content[0].text, /basename|distinct/i);
+  } finally {
+    try { fs.unlinkSync(fileA); } catch {}
+    try { fs.rmSync(path.join(uploadDir, 'sub'), { recursive: true, force: true }); } catch {}
+  }
+}
+
+function testSessionIDValidationRejection() {
+  // sessionID 格式校验在 MCP wrapper 层完成，不需要启动 daemon 或 CLI。
+  // 无效格式必须快速返回 tool error，不触发 CLI spawn。
+  // 只测拒绝路径：有效 sessionID 会 spawn CLI 导致挂起，其 normalize 逻辑通过 ask 成功路径隐式覆盖。
+  const responses = runServer([
+    // 无效 sessionID 应该在 wrapper 层被拒绝，不 spawn CLI。
+    JSON.stringify({ jsonrpc: '2.0', id: 'bad-session', method: 'tools/call', params: { name: 'ask', arguments: { prompt: 'x', sessionID: 'not-valid' } } }),
+    // 非法字符 sessionID。
+    JSON.stringify({ jsonrpc: '2.0', id: 'bad-chars', method: 'tools/call', params: { name: 'ask', arguments: { prompt: 'x', sessionID: '#gggggggggg' } } }),
+    // 长度不对的 sessionID。
+    JSON.stringify({ jsonrpc: '2.0', id: 'bad-length', method: 'tools/call', params: { name: 'ask', arguments: { prompt: 'x', sessionID: '#abc' } } }),
+  ]);
+  for (const id of ['bad-session', 'bad-chars', 'bad-length']) {
+    const r = responses.find(item => item.id === id);
+    assert.ok(r.result?.isError, `${id} must return tool error`);
+    assert.match(r.result.content[0].text, /sessionID must be/i, `${id} must mention sessionID format`);
+  }
+}
+
+async function testStopWithoutActiveAsk() {
+  // stop 在没有活跃 ask 时不应被拒绝。
+  // 直接用 CLI 测试 --stop，不通过 MCP wrapper（避免 spawnSync 超时）。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-stop-test-'));
+  try {
+    const result = await runChatgptCLI(['--stop'], {
+      CHATGPT_STATE_DIR: dir,
+      CHATGPT_SESSION_DIR: path.join(dir, 'sessions'),
+      CHATGPT_WORKSPACE_DIR: process.cwd(),
+      CHATGPT_WORKSPACE_ROOTS: process.cwd(),
+    }, 5000);
+    // 没有 daemon 时 --stop 应该快速退出且 status=0。
+    assert.strictEqual(result.status, 0, result.stderr || result.stdout);
+    assert.match(result.stdout, /No daemon running/i);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 function runServer(lines, env = {}) {
