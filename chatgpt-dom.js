@@ -160,13 +160,10 @@ function createChatGPTDom({ responseTimeout }) {
     },
 
     async transcribeAudioFile(page, file, voiceUrl, log) {
-      await page.bringToFront().catch(() => {});
       // Node 侧只读取一次文件；direct upload 和 fallback fake mic 共用同一份 base64，避免两次磁盘读取产生 TOCTOU 窗口。
       const audioBase64 = fs.readFileSync(file).toString('base64');
-      // 语音 direct upload 只需要 ChatGPT 同源登录态；固定 Project URL 来自 daemon 启动期解析，避免再次打开普通首页。
-      // direct path 不等 composer，也不安装 fake mic；只有私有转写接口失败时才进入慢速 UI fallback。
-      // direct path 仍在 ChatGPT 页面上下文内执行，复用用户登录态，不新增本地 HTTP/MCP 暴露面。
-      await page.goto(voiceUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+      // direct path 零页面操作：不 bringToFront、不 goto、不依赖任何 DOM 状态。
+      // 它只在页面 JS 上下文中做 fetch 调用，对正在使用该页面的 ask 会话无副作用。
       try {
         // direct upload 是性能优化路径：成功时不触碰听写按钮，也不污染 composer 文本。
         const direct = await transcribeAudioFileDirect(page, audioBase64, file);
@@ -177,6 +174,12 @@ function createChatGPTDom({ responseTimeout }) {
         // ChatGPT Web 的私有 endpoint/header 可能随前端版本调整；fallback 继续用已验证的听写 UI，避免一次网页变更让语音输入彻底不可用。
         // fallback 日志只记录错误信息，不记录 token、请求体或音频内容，避免把登录态材料写进 daemon.log。
         log(`Direct voice transcription failed, falling back to dictation UI: ${err.message}`);
+      }
+      // fallback 需要 composer 和听写按钮；此时才做 bringToFront + goto 等页面操作。
+      // fallback 需要项目页的 composer；direct 复用的页面可能不在项目页上。
+      await page.bringToFront().catch(() => {});
+      if (!/^https:\/\/chatgpt\.com\/g\//i.test(page.url())) {
+        await page.goto(voiceUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
       }
       // fallback 才依赖 React composer 和听写按钮；把等待放在这里，避免 direct 成功路径浪费固定 3 秒。
       await sleep(3_000);
@@ -1123,8 +1126,11 @@ function createChatGPTDom({ responseTimeout }) {
       }
 
       const stableMs = responseStableMs(responseLen, options.slow);
-      // copy button 出现且 stop/placeholder 消失时通常已完成；仍留短稳定窗口防最后一帧 DOM 更新。
-      const doneStableMs = responseLen > 0 && state.copyButton && !state.generating && !state.placeholder ? Math.min(stableMs, 2_000) : stableMs;
+      // stop button 消失是必要条件；消息底部操作按钮（copy/regenerate 等）渲染到 DOM 才是安全完成的充分条件。
+      // stop button 消失但操作按钮未出现时，DOM 可能仍在更新，不能提前返回。
+      // 操作按钮出现时只需 750ms 稳定窗口（一个轮询周期）防最后一帧竞态。
+      const fullyRendered = responseLen > 0 && !state.generating && !state.placeholder && state.actionButtons;
+      const doneStableMs = fullyRendered ? Math.min(stableMs, 750) : stableMs;
       if (!state.generating && !state.placeholder && (hasNewText || hasNewNativeImage) && Date.now() - lastChangedAt >= doneStableMs) {
         return { status: 'completed', reason: 'stable' };
       }
@@ -1151,8 +1157,12 @@ function createChatGPTDom({ responseTimeout }) {
       const lastText = msgs.length > 0 ? (msgs[msgs.length - 1].innerText || '').trim() : '';
       const lastAssistant = msgs.length > 0 ? msgs[msgs.length - 1] : null;
       const emptyAssistantTurn = emptyUnroleAssistantTurn();
-      const assistantLabels = [...(lastAssistant?.querySelectorAll('button') || [])]
-        .map(button => `${button.getAttribute('aria-label') || ''} ${button.textContent || ''}`.trim())
+      // 操作按钮（copy/regenerate 等）在 conversation-turn 容器底部，不在 assistant 消息元素内部。
+      // 只搜索 assistant 元素会漏掉这些按钮；必须搜索整个 turn 容器。
+      const lastTurn = lastAssistant?.closest('[data-testid^="conversation-turn-"]')
+        || [...document.querySelectorAll('[data-testid^="conversation-turn-"]')].pop();
+      const turnButtonLabels = [...(lastTurn?.querySelectorAll('button') || [])]
+        .map(button => `${button.getAttribute('aria-label') || ''} ${button.getAttribute('data-testid') || ''} ${button.textContent || ''}`.trim())
         .filter(Boolean);
       const stopButton = !!document.querySelector('button[data-testid="stop-button"], button[aria-label*="Stop"], button[aria-label*="停止"]');
       // 图片 URL 快照既用于完成判定，也用于下载阶段过滤旧图；复用同一 session 时不能把历史图片当本轮产物。
@@ -1164,7 +1174,10 @@ function createChatGPTDom({ responseTimeout }) {
         nativeImageCount: nativeImageURLs.length,
         nativeImageURLs,
         lastText,
-        copyButton: assistantLabels.some(label => /copy|复制/i.test(label)),
+        copyButton: turnButtonLabels.some(label => /copy|复制/i.test(label)),
+        // actionButtons 是比 copyButton 更宽的完成信号：copy/regenerate/share/like 等任意操作按钮出现都说明 DOM 已完全渲染。
+        // stop button 消失只表示生成停止，但 DOM 可能还在更新；操作按钮出现才是安全返回的条件。
+        actionButtons: turnButtonLabels.some(label => /copy|复制|regenerate|重新生成|share|分享|read aloud|朗读|like|点赞|dislike|踩/i.test(label)),
         generating: stopButton,
         placeholder: /^(thinking|thinking\.\.\.|思考中|正在思考)$/i.test(lastText.replace(/\s+/g, ' ').trim()),
         emptyAssistantTurn,
@@ -1209,8 +1222,9 @@ function createChatGPTDom({ responseTimeout }) {
 
   function responseStableMs(length, slow) {
     // 大文件和长 prompt 的回答通常会经历更长工具调用，稳定窗口相应拉长以减少早停。
-    if (slow) return length < 1_000 ? 15_000 : length < 4_000 ? 18_000 : 22_000;
-    return length < 1_000 ? 6_000 : length < 4_000 ? 8_000 : 12_000;
+    if (slow) return length < 1_000 ? 8_000 : length < 4_000 ? 12_000 : 18_000;
+    // 短回答（如数学题）几秒就渲染完；6s 稳定窗口让用户多等好几秒。
+    return length < 1_000 ? 3_000 : length < 4_000 ? 5_000 : 10_000;
   }
 
   /**

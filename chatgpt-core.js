@@ -139,6 +139,9 @@ function browserLaunchArgs() {
     '--disable-blink-features=AutomationControlled',
     '--disable-extensions',
     '--disable-extensions-except=',
+    // 阻止 Edge 弹出"恢复上次会话"对话框；多余标签页在启动后由 closeStalePages 统一清理。
+    '--disable-session-crashed-bubble',
+    '--restore-last-session=false',
     BROWSER_PROFILE_DIRECTORY ? `--profile-directory=${BROWSER_PROFILE_DIRECTORY}` : null,
     Number.isFinite(BROWSER_DEBUG_PORT) && BROWSER_DEBUG_PORT > 0 ? `--remote-debugging-port=${BROWSER_DEBUG_PORT}` : null,
   ].filter(Boolean);
@@ -1051,6 +1054,9 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
   let pageCreateQueue = Promise.resolve();
   let voiceLock = Promise.resolve();
   let sparePage = bootstrapPage;
+  // voice 转写页持久化复用：direct path 只需 chatgpt.com 同源 cookie，不需要每次新建 tab + 导航项目页。
+  // 持久化后首次转写 ~5s（含 goto），后续转写只需 ~2s（纯 API 调用）。
+  let persistentVoicePage = null;
 
   // pending 会话仍可能承载远端生成 DOM；registry 防重发，tab 保留则服务后续 artifact/text recovery。
   const pageCanBeClosed = id => !sessionLocks.has(id) && !isPendingFresh(readSessionEntry(id, project)?.pending);
@@ -1134,11 +1140,20 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
       }
     },
     async voicePage() {
-      // 语音听写页是 TUI 私有工作页，不能放入 sessionPages；否则普通 ask 的 page cap、pending
-      // recovery 和 #sessionID LRU 都会把一次转写误认为一条 ChatGPT conversation。每次新建页面也避免
-      // evaluateOnNewDocument 中携带的 base64 音频在长期复用页里累积。
+      // direct path 只需 chatgpt.com 同源 cookie 做 fetch；不需要专用页面、项目页或 composer。
+      // 优先复用 daemon 已打开的任意 chatgpt.com 页面，零创建零导航零切换。
       assertBrowserConnected();
-      return browser.newPage();
+      const candidates = [
+        persistentVoicePage,
+        sparePage,
+        ...sessionPages.values(),
+      ].filter(page => page && !page.isClosed() && /^https:\/\/chatgpt\.com/i.test(page.url()));
+      if (candidates.length > 0) return candidates[0];
+      // 没有已在 chatgpt.com 上的页面时才新建，并导航到 chatgpt.com 首页（非项目页，加载更快）。
+      // 不导航到 chatgpt.com 的话 direct path 的 fetch('/api/auth/session') 会因 about:blank 相对 URL 解析失败。
+      persistentVoicePage = await browser.newPage();
+      await persistentVoicePage.goto(CHATGPT_URL, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+      return persistentVoicePage;
     },
     withSession(sessionID, task) {
       // 同一会话串行；不同会话可以并发。这个 seam 是 daemon 并发语义的唯一入口。
@@ -1172,6 +1187,11 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
       // 后台 tab 偶尔不刷新 DOM，DOM 层会按低频节奏 bringToFront，真正超时仍由 pending/recovery 兜底。
       return CHATGPT_DOM.waitForResponse(page, beforeState, { ...waitOptions, foregroundPulseMs: 4_000 }, log);
     },
+    // 返回 daemon 当前管理的所有页面引用（bootstrapPage + sessionPages + voicePage），
+    // 供 stale page cleanup 判断哪些页面不该被关闭。
+    managedPages() {
+      return [...sessionPages.values(), persistentVoicePage].filter(p => p && !p.isClosed());
+    },
   };
 }
 
@@ -1179,14 +1199,11 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
 
 async function runVoiceTranscribe(runtime, input, log) {
   const page = await runtime.voicePage();
-  try {
-    log(`voice: transcribing ${path.basename(input.file)} bytes=${fs.statSync(input.file).size}`);
-    // voice direct upload 只需要同源登录态；复用启动期固定 Project URL，避免临时页再绕普通首页。
-    const text = await CHATGPT_DOM.transcribeAudioFile(page, input.file, runtime.project.url, log);
-    return { ok: true, text };
-  } finally {
-    await page.close().catch(() => {});
-  }
+  // 不关闭 voice page：持久化复用省去每次 newPage + goto 的 ~3s 开销。
+  // direct path 只做 fetch 调用，不会污染页面状态；fallback 路径自己清空 composer。
+  log(`voice: transcribing ${path.basename(input.file)} bytes=${fs.statSync(input.file).size}`);
+  const text = await CHATGPT_DOM.transcribeAudioFile(page, input.file, runtime.project.url, log);
+  return { ok: true, text };
 }
 
 // ─── Ask Flow ────────────────────────────────────────────────────────────────
@@ -1452,7 +1469,14 @@ async function startDaemonProcess() {
   let browser, bootstrapPage, project;
   try {
     browser = await launchBrowser(log);
-    bootstrapPage = await browser.newPage();
+    // Edge 用 user-data-dir 启动时会恢复上次会话的标签页；Puppeteer 也会创建初始 about:blank。
+    // 这些无关页面拖慢启动、占用内存、可能干扰 DOM 检测。启动后立即清理，只保留一个页面做 bootstrap。
+    const initialPages = await browser.pages();
+    // 复用第一个页面作为 bootstrapPage（避免多创建一个 tab），关闭其余所有页面。
+    bootstrapPage = initialPages[0] || await browser.newPage();
+    for (const page of initialPages) {
+      if (page !== bootstrapPage) await page.close().catch(() => {});
+    }
     // 缓存命中时直接打开固定 Project，避免每次冷启动都先刷新首页再跳项目页。
     // 缓存缺失才走首页发现；登录态仍在首次导航后统一确认，避免未登录时误报 Project 不存在。
     project = resolveCachedProject(DEFAULT_PROJECT);
@@ -1523,6 +1547,23 @@ async function startDaemonProcess() {
   let server;
   let shuttingDown = false;
 
+  // 定期清理不属于任何 session 的游离页面（Edge 恢复的旧标签、用户手动打开的标签等）。
+  // bootstrapPage 和 sessionPages 中的页面是 daemon 管理的，不清理。
+  const STALE_PAGE_CLEANUP_INTERVAL_MS = 60_000;
+  const stalePageTimer = setInterval(async () => {
+    if (shuttingDown) return;
+    try {
+      const managedPages = new Set([bootstrapPage, ...runtime.managedPages()].filter(Boolean));
+      const allPages = await browser.pages();
+      for (const page of allPages) {
+        if (!managedPages.has(page) && !page.isClosed()) {
+          await page.close().catch(() => {});
+          log('Closed stale page not tracked by daemon');
+        }
+      }
+    } catch {}
+  }, STALE_PAGE_CLEANUP_INTERVAL_MS);
+
   const shutdownOnce = async (message, options = {}) => {
     if (shuttingDown) return;
     shuttingDown = true;
@@ -1533,6 +1574,7 @@ async function startDaemonProcess() {
       try { if (fs.existsSync(file)) fs.unlinkSync(file); } catch {}
     }
     if (server) server.close();
+    clearInterval(stalePageTimer);
     // browser disconnected 回调里不再 close browser：连接已断开，重复 close 只会制造无意义的协议错误。
     if (options.closeBrowser !== false) await browser.close().catch(() => {});
     process.exit(options.exitCode ?? 0);
