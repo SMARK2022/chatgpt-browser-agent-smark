@@ -62,6 +62,9 @@ const MAX_UPLOAD_FILES = positiveIntEnv('CHATGPT_MAX_UPLOAD_FILES', 12);
 const MAX_UPLOAD_BYTES = positiveIntEnv('CHATGPT_MAX_UPLOAD_BYTES', 400 * 1024 * 1024);
 const MAX_TOTAL_UPLOAD_BYTES = positiveIntEnv('CHATGPT_MAX_TOTAL_UPLOAD_BYTES', 800 * 1024 * 1024);
 const MAX_VOICE_FILE_BYTES = positiveIntEnv('CHATGPT_VOICE_FILE_MAX_BYTES', 50 * 1024 * 1024);
+// voice 转写总超时：覆盖 session 获取 + 音频上传 + 转写返回的完整链路。
+// 超时后 voiceLock 被释放，防止 fetch 挂起导致所有后续 voice 调用永久阻塞。
+const VOICE_TRANSCRIBE_TIMEOUT_MS = positiveIntEnv('CHATGPT_VOICE_TRANSCRIBE_TIMEOUT_MS', 120_000);
 const MAX_FULL_PROMPT_CHARS = positiveIntEnv('CHATGPT_MAX_FULL_PROMPT_CHARS', 500_000);
 // 登录过期时 daemon 保持浏览器窗口打开，等待用户手动登录；超时后返回明确错误。
 // 默认 2 分钟：用户在场时足够完成邮箱/密码登录，不在场时不会让 MCP 调用长时间悬挂。
@@ -1148,9 +1151,25 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
         sparePage,
         ...sessionPages.values(),
       ].filter(page => page && !page.isClosed() && /^https:\/\/chatgpt\.com/i.test(page.url()));
-      if (candidates.length > 0) return candidates[0];
-      // 没有已在 chatgpt.com 上的页面时才新建，并导航到 chatgpt.com 首页（非项目页，加载更快）。
-      // 不导航到 chatgpt.com 的话 direct path 的 fetch('/api/auth/session') 会因 about:blank 相对 URL 解析失败。
+      // 健康检查：页面复用数小时后可能因 Service Worker 卡住、事件循环冻结等原因退化。
+      // 3s 内不响应则视为退化，关闭旧页面（仅 persistentVoicePage）并创建新页面。
+      // sessionPages 中的页面不关闭（ask 可能正在使用）；sparePage 设为 null 让 pageFor 创建替代。
+      for (const candidate of candidates) {
+        try {
+          await withTimeout(candidate.evaluate(() => true), 3_000, 'voice page health check');
+          return candidate;
+        } catch {
+          if (candidate === persistentVoicePage) {
+            persistentVoicePage = null;
+            // close 也加超时：退化页面的 CDP 调用可能同样挂起
+            await withTimeout(candidate.close(), 5_000, 'close degraded voice page').catch(() => {});
+          } else if (candidate === sparePage) {
+            sparePage = null;
+          }
+          // sessionPages 中的退化页面跳过，不关闭（ask 可能正在使用）
+        }
+      }
+      // 没有已在 chatgpt.com 上的可用页面时才新建，并导航到 chatgpt.com 首页（非项目页，加载更快）。
       persistentVoicePage = await browser.newPage();
       await persistentVoicePage.goto(CHATGPT_URL, { waitUntil: 'domcontentloaded', timeout: 30_000 });
       return persistentVoicePage;
@@ -1202,7 +1221,14 @@ async function runVoiceTranscribe(runtime, input, log) {
   // 不关闭 voice page：持久化复用省去每次 newPage + goto 的 ~3s 开销。
   // direct path 只做 fetch 调用，不会污染页面状态；fallback 路径自己清空 composer。
   log(`voice: transcribing ${path.basename(input.file)} bytes=${fs.statSync(input.file).size}`);
-  const text = await CHATGPT_DOM.transcribeAudioFile(page, input.file, runtime.project.url, log);
+  // 超时保护：fetch 挂起时 page.evaluate 永不返回，voiceLock 永久卡死。
+  // withTimeout 在 VOICE_TRANSCRIBE_TIMEOUT_MS 后 reject，voiceLock 被释放，后续 voice 调用可继续。
+  // 退化页面在下次 voicePage() 调用时由健康检查关闭并重建。
+  const text = await withTimeout(
+    CHATGPT_DOM.transcribeAudioFile(page, input.file, runtime.project.url, log),
+    VOICE_TRANSCRIBE_TIMEOUT_MS,
+    `Voice transcription timed out after ${VOICE_TRANSCRIBE_TIMEOUT_MS}ms`
+  );
   return { ok: true, text };
 }
 

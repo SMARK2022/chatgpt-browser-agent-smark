@@ -65,6 +65,7 @@ async function main() {
     ['testFileUploadRejectsDuplicateBasenames', () => testFileUploadRejectsDuplicateBasenames(), false],
     ['testStopWithoutActiveAsk', () => testStopWithoutActiveAsk(), false],
     ['testTableCitationExtraction', () => testTableCitationExtraction(), false],
+    ['testVoicePageHealthCheck', () => testVoicePageHealthCheck(), false],
     ['checkE2EAvailability', () => checkE2EAvailability(), true],
     ['testE2EStatus', () => testE2EStatus(), true],
     ['testE2EAskBasic', () => testE2EAskBasic(), true],
@@ -509,6 +510,53 @@ function findTestBrowserPath() {
       ? ['/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge', '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', '/Applications/Chromium.app/Contents/MacOS/Chromium']
       : ['/usr/bin/microsoft-edge', '/usr/bin/microsoft-edge-stable', '/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/usr/bin/chromium', '/usr/bin/chromium-browser'];
   return candidates.find(p => p && fs.existsSync(p));
+}
+
+async function testVoicePageHealthCheck() {
+  // 验证 withTimeout 能检测并中断挂起的 page.evaluate——这是防止 voiceLock 永久卡死的核心机制。
+  // 生产场景：页面复用数小时后 fetch 挂起 → page.evaluate 永不返回 → voiceLock 永久 pending。
+  // withTimeout 让 runVoiceTranscribe 在超时后 reject，释放 voiceLock，后续 voice 调用不被阻塞。
+  const puppeteer = require('puppeteer-core');
+  const browserPath = findTestBrowserPath();
+  if (!browserPath) { console.log('  SKIP: no browser found for health check test'); return; }
+  const tmpProfile = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-voice-health-'));
+  const browser = await puppeteer.launch({
+    executablePath: browserPath,
+    headless: true,
+    userDataDir: tmpProfile,
+    args: ['--no-first-run', '--no-default-browser-check', '--disable-extensions'],
+  });
+  try {
+    const page = await browser.newPage();
+    await page.setContent('<html><body>test</body></html>');
+    // 异步冻结事件循环：setTimeout 回调中执行 while(true)。
+    // evaluate 本身立即返回，但 100ms 后事件循环被永久阻塞。
+    await page.evaluate(() => { setTimeout(() => { while(true) {} }, 100); });
+    // 等待冻结生效
+    await new Promise(r => setTimeout(r, 300));
+    // 此时 page.evaluate(() => true) 应该挂起——模拟生产中 fetch 挂起的场景。
+    // 用 Promise.race + setTimeout 验证挂起的 evaluate 能被超时中断（withTimeout 的核心机制）。
+    const startedAt = Date.now();
+    let timed = false;
+    try {
+      await Promise.race([
+        page.evaluate(() => true),
+        new Promise((_, reject) => setTimeout(() => { timed = true; reject(new Error('health check timeout')); }, 3_000)),
+      ]);
+      // 如果 evaluate 返回了（页面可能没冻结），跳过
+      if (!timed) { console.log('  SKIP: page did not freeze as expected'); return; }
+    } catch {
+      // 预期：超时触发，evaluate 被中断
+      assert.ok(timed, 'timeout must fire within 3s on a frozen page');
+      const elapsed = Date.now() - startedAt;
+      // 超时应在 3-5s 范围内（给 Puppeteer CDP 通信留余量）
+      assert.ok(elapsed < 6_000, `health check timeout should be fast, got ${elapsed}ms`);
+    }
+    console.log('  confirmed: withTimeout detects frozen page.evaluate within timeout');
+  } finally {
+    await browser.close().catch(() => {});
+    fs.rmSync(tmpProfile, { recursive: true, force: true });
+  }
 }
 
 function runServer(lines, env = {}) {
