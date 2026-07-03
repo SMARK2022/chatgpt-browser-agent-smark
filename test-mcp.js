@@ -64,6 +64,7 @@ async function main() {
     ['testFileUploadRejectsOutsideAllowlist', () => testFileUploadRejectsOutsideAllowlist(), false],
     ['testFileUploadRejectsDuplicateBasenames', () => testFileUploadRejectsDuplicateBasenames(), false],
     ['testStopWithoutActiveAsk', () => testStopWithoutActiveAsk(), false],
+    ['testTableCitationExtraction', () => testTableCitationExtraction(), false],
     ['checkE2EAvailability', () => checkE2EAvailability(), true],
     ['testE2EStatus', () => testE2EStatus(), true],
     ['testE2EAskBasic', () => testE2EAskBasic(), true],
@@ -434,6 +435,80 @@ async function testStopWithoutActiveAsk() {
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+}
+
+async function testTableCitationExtraction() {
+  // 验证表格单元格内 citation pill 被正确转成 [Ref n] 并追加 References 段。
+  // 用真实浏览器 + DOM fixture 直接测试 extractAssistant 的提取逻辑，
+  // 不依赖 ChatGPT 回答格式，比 E2E 测试更确定。
+  const puppeteer = require('puppeteer-core');
+  const { createChatGPTDom } = require('./chatgpt-dom');
+  // 惰性 require puppeteer-core：避免无浏览器环境加载不必要的重模块。
+  const browserPath = findTestBrowserPath();
+  if (!browserPath) { console.log('  SKIP: no browser found for DOM extraction test'); return; }
+  const tmpProfile = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-dom-test-'));
+  const browser = await puppeteer.launch({
+    executablePath: browserPath,
+    headless: true,
+    userDataDir: tmpProfile,
+    args: ['--no-first-run', '--no-default-browser-check', '--disable-extensions'],
+  });
+  try {
+    const page = await browser.newPage();
+    // 构造含 citation pill 的表格 HTML，模拟 ChatGPT 带 web search 引用的表格回答。
+    await page.setContent(`
+      <div data-message-author-role="assistant">
+        <div class="markdown">
+          <table>
+            <tr><th>CVE</th><th>来源</th></tr>
+            <tr>
+              <td>CVE-2025-34067</td>
+              <td>NVD <span data-testid="webpage-citation-pill"><a href="https://nvd.nist.gov/vuln/detail/CVE-2025-34067">国家漏洞数据库</a></span></td>
+            </tr>
+            <tr>
+              <td>CVE-2024-58274</td>
+              <td>Check Point <span data-testid="webpage-citation-pill"><a href="https://checkpoint.com/advisories">Check Point Software</a></span></td>
+            </tr>
+          </table>
+        </div>
+      </div>
+    `);
+    const dom = createChatGPTDom({ responseTimeout: 5_000 });
+    const result = await dom.extractAssistant(page);
+    assert.ok(result, 'extractAssistant must return non-null for valid DOM');
+    // 表格内 citation pill 必须被转成 [Ref n]，而不是纯文本"国家漏洞数据库"
+    assert.match(result, /\[Ref 1\]/, 'citation pill in first table cell must be [Ref 1]');
+    assert.match(result, /\[Ref 2\]/, 'citation pill in second table cell must be [Ref 2]');
+    // pill 原始文本不应出现在表格行中（innerText 的旧行为会泄漏到单元格）
+    assert.doesNotMatch(result, /\|.*国家漏洞数据库/, 'raw pill text must not leak into table row');
+    // 必须追加 References 段
+    assert.match(result, /References:/, 'References section must be appended');
+    // References 段中 [Ref n] 必须映射到正确的来源 URL
+    assert.match(result, /\[Ref 1\].*nvd\.nist\.gov/, 'Ref 1 must map to NVD URL');
+    assert.match(result, /\[Ref 2\].*checkpoint\.com/, 'Ref 2 must map to Check Point URL');
+    // 表格 markdown 结构必须保留
+    assert.match(result, /\| CVE/, 'table header must be preserved');
+    assert.match(result, /\| ---/, 'table separator must be preserved');
+  } finally {
+    await browser.close().catch(() => {});
+    fs.rmSync(tmpProfile, { recursive: true, force: true });
+  }
+}
+
+// 发现可用于 DOM 提取测试的浏览器路径（简化版，不含 daemon 的全部候选路径）。
+function findTestBrowserPath() {
+  if (process.env.CHATGPT_BROWSER_PATH && fs.existsSync(process.env.CHATGPT_BROWSER_PATH)) return process.env.CHATGPT_BROWSER_PATH;
+  const candidates = process.platform === 'win32'
+    ? [
+        path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+        path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+        path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+        path.join(process.env.LOCALAPPDATA || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      ]
+    : process.platform === 'darwin'
+      ? ['/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge', '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', '/Applications/Chromium.app/Contents/MacOS/Chromium']
+      : ['/usr/bin/microsoft-edge', '/usr/bin/microsoft-edge-stable', '/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/usr/bin/chromium', '/usr/bin/chromium-browser'];
+  return candidates.find(p => p && fs.existsSync(p));
 }
 
 function runServer(lines, env = {}) {

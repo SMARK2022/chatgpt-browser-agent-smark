@@ -1323,7 +1323,10 @@ function createChatGPTDom({ responseTimeout }) {
         return nested.length ? `${head}${nested.join('\n')}\n` : head;
       }
       function tableBlock(el) {
-        const rows = [...el.querySelectorAll('tr')].map(row => [...row.children].map(cell => tableCell(cell.innerText || '')));
+        // 用 inlineChildren 替代 cell.innerText：让 citation pill、链接、粗体等行内语义
+        // 在表格单元格中被正确转换，而不是被 innerText 拍平成纯文本。
+        // tableCell 仍负责 pipe 转义和换行转 <br>，对 inlineChildren 的字符串输出安全。
+        const rows = [...el.querySelectorAll('tr')].map(row => [...row.children].map(cell => tableCell(inlineChildren(cell))));
         if (rows.length === 0) return '';
         return `${[rows[0], rows[0].map(() => '---'), ...rows.slice(1)].map(row => `| ${row.join(' | ')} |`).join('\n')}\n\n`;
       }
