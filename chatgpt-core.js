@@ -63,8 +63,11 @@ const MAX_UPLOAD_BYTES = positiveIntEnv('CHATGPT_MAX_UPLOAD_BYTES', 400 * 1024 *
 const MAX_TOTAL_UPLOAD_BYTES = positiveIntEnv('CHATGPT_MAX_TOTAL_UPLOAD_BYTES', 800 * 1024 * 1024);
 const MAX_VOICE_FILE_BYTES = positiveIntEnv('CHATGPT_VOICE_FILE_MAX_BYTES', 50 * 1024 * 1024);
 // voice 转写总超时：覆盖 session 获取 + 音频上传 + 转写返回的完整链路。
-// 超时后 voiceLock 被释放，防止 fetch 挂起导致所有后续 voice 调用永久阻塞。
-const VOICE_TRANSCRIBE_TIMEOUT_MS = positiveIntEnv('CHATGPT_VOICE_TRANSCRIBE_TIMEOUT_MS', 120_000);
+// 实际转写 2-8s；60s 足够覆盖慢网络和大文件，超时后 voiceLock 被释放。
+const VOICE_TRANSCRIBE_TIMEOUT_MS = positiveIntEnv('CHATGPT_VOICE_TRANSCRIBE_TIMEOUT_MS', 60_000);
+// voice 页面最大年龄：超过后主动重建，防止 Service Worker 状态退化、cookie 过期等问题累积。
+// 10 分钟：voice 通常在短时内多次使用，10 分钟内不会触发重建；长时间空闲后首次使用时重建。
+const VOICE_PAGE_MAX_AGE_MS = positiveIntEnv('CHATGPT_VOICE_PAGE_MAX_AGE_MS', 600_000);
 const MAX_FULL_PROMPT_CHARS = positiveIntEnv('CHATGPT_MAX_FULL_PROMPT_CHARS', 500_000);
 // 登录过期时 daemon 保持浏览器窗口打开，等待用户手动登录；超时后返回明确错误。
 // 默认 2 分钟：用户在场时足够完成邮箱/密码登录，不在场时不会让 MCP 调用长时间悬挂。
@@ -1060,6 +1063,12 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
   // voice 转写页持久化复用：direct path 只需 chatgpt.com 同源 cookie，不需要每次新建 tab + 导航项目页。
   // 持久化后首次转写 ~5s（含 goto），后续转写只需 ~2s（纯 API 调用）。
   let persistentVoicePage = null;
+  // 页面创建时间：超过 VOICE_PAGE_MAX_AGE_MS 后主动重建，不等健康检查失败。
+  // 主动重建比被动检测更快（跳过 5s 健康检查 + 3s 关闭 = 省 8s），且防止退化累积。
+  let voicePageCreatedAt = 0;
+  // 标记转写失败过的页面，TTL 5 分钟后允许重新测试（证据：页面自愈约 3 分钟）。
+  // 避免坏页面被反复复用导致连续超时；TTL 到期后 fetch 探测会重新验证页面健康度。
+  const badVoicePages = new Map();
 
   // pending 会话仍可能承载远端生成 DOM；registry 防重发，tab 保留则服务后续 artifact/text recovery。
   const pageCanBeClosed = id => !sessionLocks.has(id) && !isPendingFresh(readSessionEntry(id, project)?.pending);
@@ -1146,32 +1155,58 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
       // direct path 只需 chatgpt.com 同源 cookie 做 fetch；不需要专用页面、项目页或 composer。
       // 优先复用 daemon 已打开的任意 chatgpt.com 页面，零创建零导航零切换。
       assertBrowserConnected();
+      // 主动重建：页面超过年龄限制直接关闭重建，不等健康检查失败。
+      // 比被动检测快（省 5s 健康检查 + 3s 关闭 = 8s），且防止退化累积导致转写挂起。
+      if (persistentVoicePage && voicePageCreatedAt && Date.now() - voicePageCreatedAt > VOICE_PAGE_MAX_AGE_MS) {
+        await withTimeout(persistentVoicePage.close(), 3_000, 'close aged voice page').catch(() => {});
+        persistentVoicePage = null;
+        voicePageCreatedAt = 0;
+      }
+      // 清理过期的坏页面标记：页面自愈约 3 分钟，TTL 5 分钟后允许重新测试
+      const now = Date.now();
+      for (const [page, expiresAt] of badVoicePages) {
+        if (now >= expiresAt || page.isClosed()) badVoicePages.delete(page);
+      }
+      // M2: 限制候选数量防止最坏情况超时；session pages 不检查（ask 可能在用，且 persistentVoicePage 通常可用）
       const candidates = [
         persistentVoicePage,
         sparePage,
-        ...sessionPages.values(),
-      ].filter(page => page && !page.isClosed() && /^https:\/\/chatgpt\.com/i.test(page.url()));
-      // 健康检查：页面复用数小时后可能因 Service Worker 卡住、事件循环冻结等原因退化。
-      // 3s 内不响应则视为退化，关闭旧页面（仅 persistentVoicePage）并创建新页面。
-      // sessionPages 中的页面不关闭（ask 可能正在使用）；sparePage 设为 null 让 pageFor 创建替代。
+      ].filter(page => page && !page.isClosed() && !badVoicePages.has(page) && /^https:\/\/chatgpt\.com/i.test(page.url()));
+      // 健康检查：用 fetch 探测替代 evaluate(() => true)。
+      // evaluate(() => true) 只验证 JS 上下文存活，无法检测 fetch 被 Service Worker 挂起的退化。
+      // fetch 探测直接测试 voice 转写使用的同源网络路径；页面侧 AbortController(4s)
+      // 确保即使 SW 卡住也不会在页面侧遗留悬挂请求（M1）。
+      // /api/auth/session 在健康页面上 <1s 响应；5s 超时足够覆盖慢网络。
       for (const candidate of candidates) {
         try {
-          await withTimeout(candidate.evaluate(() => true), 3_000, 'voice page health check');
+          await withTimeout(
+            candidate.evaluate(() => {
+              const controller = new AbortController();
+              const timer = setTimeout(() => controller.abort(), 4_000);
+              return fetch('/api/auth/session', { credentials: 'include', signal: controller.signal })
+                .then(r => r.status)
+                .finally(() => clearTimeout(timer));
+            }),
+            5_000,
+            'voice page health check'
+          );
           return candidate;
         } catch {
+          // 健康检查失败：标记为坏页面（5 分钟 TTL），关闭 persistentVoicePage
+          badVoicePages.set(candidate, Date.now() + 300_000);
           if (candidate === persistentVoicePage) {
             persistentVoicePage = null;
-            // close 也加超时：退化页面的 CDP 调用可能同样挂起
-            await withTimeout(candidate.close(), 5_000, 'close degraded voice page').catch(() => {});
+            await withTimeout(candidate.close(), 3_000, 'close degraded voice page').catch(() => {});
           } else if (candidate === sparePage) {
+            // sparePage 不关闭：pageFor() 发现 sparePage=null 会创建新页面；stale cleanup 处理孤儿
             sparePage = null;
           }
-          // sessionPages 中的退化页面跳过，不关闭（ask 可能正在使用）
         }
       }
       // 没有已在 chatgpt.com 上的可用页面时才新建，并导航到 chatgpt.com 首页（非项目页，加载更快）。
       persistentVoicePage = await browser.newPage();
-      await persistentVoicePage.goto(CHATGPT_URL, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+      await persistentVoicePage.goto(CHATGPT_URL, { waitUntil: 'domcontentloaded', timeout: 15_000 });
+      voicePageCreatedAt = Date.now();
       return persistentVoicePage;
     },
     withSession(sessionID, task) {
@@ -1211,6 +1246,19 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
     managedPages() {
       return [...sessionPages.values(), persistentVoicePage].filter(p => p && !p.isClosed());
     },
+    // 转写失败时标记页面为坏（5 分钟 TTL），关闭 persistentVoicePage。
+    // 健康检查无法检测所有退化模式（如健康检查通过后转写期间才发生的退化），
+    // 此方法作为兜底：失败后不再复用该页面，下次 voicePage() 会创建新页面。
+    invalidateVoicePage(page) {
+      badVoicePages.set(page, Date.now() + 300_000);
+      if (page === persistentVoicePage) {
+        persistentVoicePage = null;
+        withTimeout(page.close(), 3_000, 'close failed voice page').catch(() => {});
+      } else if (page === sparePage) {
+        sparePage = null;
+      }
+      // sessionPages 不再作为 voice 候选（fetch 健康检查可能干扰 ask），无需处理
+    },
   };
 }
 
@@ -1218,18 +1266,23 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
 
 async function runVoiceTranscribe(runtime, input, log) {
   const page = await runtime.voicePage();
-  // 不关闭 voice page：持久化复用省去每次 newPage + goto 的 ~3s 开销。
-  // direct path 只做 fetch 调用，不会污染页面状态；fallback 路径自己清空 composer。
   log(`voice: transcribing ${path.basename(input.file)} bytes=${fs.statSync(input.file).size}`);
-  // 超时保护：fetch 挂起时 page.evaluate 永不返回，voiceLock 永久卡死。
-  // withTimeout 在 VOICE_TRANSCRIBE_TIMEOUT_MS 后 reject，voiceLock 被释放，后续 voice 调用可继续。
-  // 退化页面在下次 voicePage() 调用时由健康检查关闭并重建。
-  const text = await withTimeout(
-    CHATGPT_DOM.transcribeAudioFile(page, input.file, runtime.project.url, log),
-    VOICE_TRANSCRIBE_TIMEOUT_MS,
-    `Voice transcription timed out after ${VOICE_TRANSCRIBE_TIMEOUT_MS}ms`
-  );
-  return { ok: true, text };
+  const transcribePromise = CHATGPT_DOM.transcribeAudioFile(page, input.file, runtime.project.url, log);
+  try {
+    // 超时保护：fetch 挂起时 page.evaluate 永不返回，voiceLock 永久卡死。
+    // withTimeout 在 VOICE_TRANSCRIBE_TIMEOUT_MS 后 reject，voiceLock 被释放，后续 voice 调用可继续。
+    const text = await withTimeout(transcribePromise, VOICE_TRANSCRIBE_TIMEOUT_MS,
+      `Voice transcription timed out after ${VOICE_TRANSCRIBE_TIMEOUT_MS}ms`);
+    return { ok: true, text };
+  } catch (err) {
+    // 仅在 timeout/abort（页面退化）时关闭页面，不在普通 HTTP 错误时关闭健康页面。
+    // transcribePromise.catch 防止 page.close() 导致的 pending evaluate 产生 unhandled rejection。
+    if (/timed out|timeout|abort/i.test(err.message)) {
+      transcribePromise.catch(() => {});
+      runtime.invalidateVoicePage(page);
+    }
+    throw err;
+  }
 }
 
 // ─── Ask Flow ────────────────────────────────────────────────────────────────

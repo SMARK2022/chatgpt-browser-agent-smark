@@ -171,12 +171,14 @@ function createChatGPTDom({ responseTimeout }) {
         // direct 成功时直接返回文本，让 TUI 插入光标位置；不需要模拟 ChatGPT composer 的听写结果。
         return direct.text;
       } catch (err) {
-        // AbortError 或 timeout 表示页面可能退化（fetch 被 Service Worker 挂起或事件循环冻结）。
-        // 不在同一退化页面上尝试 fallback（听写 UI 也会同样挂起）；直接抛错让外层 withTimeout 捕获，
-        // 下次 voicePage() 健康检查会关闭此页面并创建新页面。
+        // AbortError/timeout/target closed 表示页面可能退化或已被 invalidateVoicePage 关闭。
+        // 不在同一退化/已关闭页面上尝试 fallback（听写 UI 也会同样挂起或立即报错）；
+        // 直接抛错让外层 withTimeout 捕获，下次 voicePage() 会创建新页面。
         // 注意：AbortController.abort() 在页面侧抛 DOMException，但跨 CDP 边界后 .name 会丢失，
         // err.message 中包含 "abort" 字样，因此用 /abort/i 而非 err.name === 'AbortError'。
-        if (/timed out|timeout|abort/i.test(err.message)) throw err;
+        // "target closed"/"protocol error" 表示页面已被外部关闭（stale cleanup、浏览器断开等），
+        // fallback 同样会立即失败，不应在此页面上尝试。
+        if (/timed out|timeout|abort|target closed|protocol error/i.test(err.message)) throw err;
         // ChatGPT Web 的私有 endpoint/header 可能随前端版本调整；fallback 继续用已验证的听写 UI，避免一次网页变更让语音输入彻底不可用。
         // fallback 日志只记录错误信息，不记录 token、请求体或音频内容，避免把登录态材料写进 daemon.log。
         log(`Direct voice transcription failed, falling back to dictation UI: ${err.message}`);
@@ -512,9 +514,9 @@ function createChatGPTDom({ responseTimeout }) {
 
   async function transcribeAudioFileDirect(page, audioBase64, file) {
     // fetchTimeoutMs 传给页面侧 AbortController；按文件大小缩放避免大文件误杀。
-    // 最低 30s 保证小文件有足够重试窗口，每 100KB base64 额外给 1s 上传时间。
-    // 上限 90s：必须低于外层 VOICE_TRANSCRIBE_TIMEOUT_MS(120s)，留 30s 给 session fetch + 开销。
-    const fetchTimeoutMs = Math.min(90_000, Math.max(30_000, audioBase64.length * 0.01));
+    // 最低 15s：实际转写 2-8s，15s 足够覆盖慢网络。每 100KB base64 额外给 0.5s 上传时间。
+    // 上限 45s：必须低于外层 VOICE_TRANSCRIBE_TIMEOUT_MS(60s)，留余量给 session fetch + 开销。
+    const fetchTimeoutMs = Math.min(45_000, Math.max(15_000, audioBase64.length * 0.005));
     return page.evaluate(async (config) => {
       const startedAt = performance.now();
       // 页面侧 fetch 超时：页面复用数小时后 Service Worker 或后端可能挂起 fetch。
@@ -525,7 +527,7 @@ function createChatGPTDom({ responseTimeout }) {
         const timer = setTimeout(() => controller.abort(), ms);
         return fetch(url, { ...options, signal: controller.signal }).finally(() => clearTimeout(timer));
       };
-      const sessionResponse = await fetchWithTimeout('/api/auth/session', { credentials: 'include' }, 30_000);
+      const sessionResponse = await fetchWithTimeout('/api/auth/session', { credentials: 'include' }, 10_000);
       // session JSON 结构由 ChatGPT Web 控制；解析失败按无 token 处理，让外层走 fallback 而不是崩掉 daemon。
       const session = await sessionResponse.json().catch(() => null);
       const accessToken = session?.accessToken || session?.access_token || '';
