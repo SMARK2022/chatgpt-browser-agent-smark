@@ -26,6 +26,8 @@ const BASE_ENV = {
   CHATGPT_WORKSPACE_DIR: process.cwd(),
   CHATGPT_ASK_HTTP_TIMEOUT_MS: '5000',
   CHATGPT_CLI_TIMEOUT_MS: '6000',
+  // 测试不连接真实浏览器；显式禁用 CDP 端口，避免默认值 9222 导致 CLI 连接到用户正在运行的 Edge。
+  CHATGPT_BROWSER_DEBUG_PORT: '0',
 };
 
 // E2E 测试使用真实 daemon 的环境（不覆盖 STATE_DIR，复用用户登录态）。
@@ -52,6 +54,8 @@ async function main() {
     ['testArgumentValidation', () => testArgumentValidation(), false],
     ['testVoiceTranscribeIsPrivate', () => testVoiceTranscribeIsPrivate(), false],
     ['testTranscribeFileCliValidation', () => testTranscribeFileCliValidation(), false],
+    // macOS /var→/private/var 符号链接导致 pathInside 误判，验证 realpath 修复正确性。
+    ['testVoiceFileSymlinkedDirAccepted', () => testVoiceFileSymlinkedDirAccepted(), false],
     ['testDirectVoiceTranscribeSkipsComposerWait', () => testDirectVoiceTranscribeSkipsComposerWait(), false],
     ['testOversizedLineRecovery', () => testOversizedLineRecovery(), false],
     ['testExistingSessionIndexStartup', () => testExistingSessionIndexStartup(), false],
@@ -671,6 +675,48 @@ function testTranscribeFileCliValidation() {
   });
   assert.notStrictEqual(missingFile.status, 0);
   assert.match(missingFile.stderr, /Voice file does not exist/);
+}
+
+function testVoiceFileSymlinkedDirAccepted() {
+  // macOS 上 /var 是 /private/var 的符号链接；os.tmpdir() 返回 /var/...，
+  // 但 fs.realpathSync.native 返回 /private/var/...。
+  // voiceFileRoots 用 path.resolve（不做 realpath），validateVoiceInput 用 realpathSync.native。
+  // 如果 root 不做 realpath，pathInside 比较会失败，误报 "outside allowed roots"。
+  //
+  // 这个测试不能通过 fake daemon 端到端验证，因为 "outside allowed roots" 检查
+  // 在真实 daemon 的 validateVoiceInput 里，fake daemon 不运行该逻辑。
+  // 这里直接复现 pathInside + realpath 比较模式，验证修复逻辑的正确性：
+  // 由于 validateVoiceInput 运行在真实 daemon 进程内（需要浏览器），fake daemon 不执行该逻辑，
+  // 因此本测试是逻辑模式验证而非端到端回归守卫——它确保 realpath 比较模式正确处理符号链接，
+  // 但不直接调用 validateVoiceInput 本身。
+  const realDir = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-real-'));
+  // 用 symlink 模拟 macOS /var → /private/var 场景
+  const linkDir = path.join(path.dirname(realDir), 'chatgpt-symlink-' + path.basename(realDir));
+  try {
+    fs.symlinkSync(realDir, linkDir);
+    const voiceFile = path.join(linkDir, 'voice.wav');
+    writeTinyWav(voiceFile);
+
+    // 模拟 voiceFileRoots 的计算：path.resolve 不做 realpath
+    const root = path.resolve(linkDir);
+    // 模拟 validateVoiceInput 的文件 realpath
+    const realFile = fs.realpathSync.native(voiceFile);
+
+    // 修复前（bug）：root 不做 realpath，pathInside 比较失败
+    const buggyRelative = path.relative(path.resolve(root), path.resolve(realFile));
+    const buggyInside = !buggyRelative || (!buggyRelative.startsWith('..') && !path.isAbsolute(buggyRelative));
+    assert.ok(!buggyInside, 'without realpath on root, symlinked dir should fail pathInside (reproducing bug)');
+
+    // 修复后：root 也做 realpath，pathInside 比较通过
+    let realRoot = root;
+    try { realRoot = fs.realpathSync.native(root); } catch {}
+    const fixedRelative = path.relative(path.resolve(realRoot), path.resolve(realFile));
+    const fixedInside = !fixedRelative || (!fixedRelative.startsWith('..') && !path.isAbsolute(fixedRelative));
+    assert.ok(fixedInside, 'with realpath on root, symlinked dir should pass pathInside (fix verified)');
+  } finally {
+    fs.rmSync(realDir, { recursive: true, force: true });
+    try { fs.unlinkSync(linkDir); } catch {}
+  }
 }
 
 async function testDirectVoiceTranscribeSkipsComposerWait() {

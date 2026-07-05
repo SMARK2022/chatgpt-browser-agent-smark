@@ -20,7 +20,7 @@ const http                = require('http');
 const net                 = require('net');
 const os                  = require('os');
 const crypto              = require('crypto');
-const { execFileSync }    = require('child_process');
+const { execFileSync, spawn } = require('child_process');
 const { createChatGPTDom } = require('./chatgpt-dom');
 
 // ─── Constants and Directories ────────────────────────────────────────────────
@@ -36,7 +36,7 @@ const PROFILE_DIR      = path.join(STATE_DIR, 'profile');
 const BROWSER_USER_DATA_DIR = path.resolve(process.env.CHATGPT_BROWSER_USER_DATA_DIR || PROFILE_DIR);
 const BROWSER_PROFILE_DIRECTORY = process.env.CHATGPT_BROWSER_PROFILE_DIRECTORY || '';
 const BROWSER_WS_ENDPOINT = process.env.CHATGPT_BROWSER_WS_ENDPOINT || '';
-const BROWSER_DEBUG_PORT = Number.parseInt(process.env.CHATGPT_BROWSER_DEBUG_PORT || '', 10);
+const BROWSER_DEBUG_PORT = Number.parseInt(process.env.CHATGPT_BROWSER_DEBUG_PORT || '9222', 10);
 const BROWSER_CDP_URL_ENV = process.env.CHATGPT_BROWSER_CDP_URL || '';
 const BROWSER_CDP_URL = BROWSER_CDP_URL_ENV || (Number.isFinite(BROWSER_DEBUG_PORT) && BROWSER_DEBUG_PORT > 0 ? `http://127.0.0.1:${BROWSER_DEBUG_PORT}` : '');
 const BROWSER_CONNECT_TIMEOUT_MS = positiveIntEnv('CHATGPT_BROWSER_CONNECT_TIMEOUT_MS', 3_000);
@@ -121,6 +121,38 @@ async function launchBrowser(log = () => {}) {
     } catch (err) {
       if (BROWSER_WS_ENDPOINT || BROWSER_CDP_URL_ENV || !Number.isFinite(BROWSER_DEBUG_PORT) || BROWSER_DEBUG_PORT <= 0) throw err;
       log(`Existing debug browser is not reachable; launching Edge with --remote-debugging-port=${BROWSER_DEBUG_PORT}`);
+      // 用 spawn 启动 Edge（而非 puppeteer.launch），避免 chatgpt.com 检测到 Puppeteer 自动化标志
+      // 后拒绝保持登录态。spawn 启动的 Edge 和用户手动启动的一样，不带 navigator.webdriver。
+      const child = spawn(CHROME_PATH, [
+        `--user-data-dir=${BROWSER_USER_DATA_DIR}`,
+        // --profile-directory 必须和 --login / puppeteer.launch 保持一致，否则登录进 Profile A，
+        // daemon spawn 却用 Default，cookie 不互通导致登录态丢失。
+        BROWSER_PROFILE_DIRECTORY ? `--profile-directory=${BROWSER_PROFILE_DIRECTORY}` : null,
+        `--remote-debugging-port=${BROWSER_DEBUG_PORT}`,
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--disable-extensions',
+        'https://chatgpt.com',
+      ].filter(Boolean), { detached: true, stdio: 'ignore' });
+      // spawn 的 error 事件不会通过 Promise 传播；监听后写日志，避免 ENOENT 时进程被 uncaughtException 杀掉。
+      child.on('error', err => log(`Edge spawn failed: ${err.message}`));
+      child.unref();
+      // 轮询等待 CDP 端口可用，再通过 puppeteer.connect 连接（而非 puppeteer.launch 直接控制）。
+      const cdpDeadline = Date.now() + 30_000;
+      let cdpReady = false;
+      while (Date.now() < cdpDeadline) {
+        try { await ensureDevtoolsEndpointReachable(BROWSER_CDP_URL); cdpReady = true; break; }
+        catch { await new Promise(r => setTimeout(r, 1_000)); }
+      }
+      // CDP 端口始终不可达说明 Edge 启动失败（路径错误、profile 损坏等）；直接抛错，避免后续 8s 空等。
+      if (!cdpReady) throw new Error(`Edge did not open DevTools port ${BROWSER_DEBUG_PORT} within 30s. Check browser path: ${CHROME_PATH}`);
+      // 额外等待 Edge 完成 profile/cookie 加载；CDP 端口可用只代表进程启动，cookie 数据库可能尚未载入内存。
+      await new Promise(r => setTimeout(r, 8_000));
+      return await withTimeout(puppeteer.connect({
+        browserURL: BROWSER_CDP_URL,
+        defaultViewport: null,
+        protocolTimeout: RESPONSE_TIMEOUT,
+      }), BROWSER_CONNECT_TIMEOUT_MS, `Timed out connecting to browser DevTools endpoint: ${BROWSER_CDP_URL}`);
     }
   }
   if (usesExternalBrowserProfile() && browserProfileLooksLocked()) {
@@ -728,7 +760,13 @@ function validateVoiceInput(input) {
   let real;
   try { real = fs.realpathSync.native(abs); }
   catch { throw new Error(`Voice file does not exist: ${input.file}`); }
-  if (!VOICE_FILE_ROOTS.some(root => pathInside(root, real))) throw new Error(`Voice file is outside allowed roots: ${input.file}`);
+  if (!VOICE_FILE_ROOTS.some(root => {
+    // macOS 上 os.tmpdir() 返回 /var/...，但 realpathSync 返回 /private/var/...；
+    // root 不做 realpath 会导致 pathInside 比较失败，误报 "outside allowed roots"。
+    let realRoot = root;
+    try { realRoot = fs.realpathSync.native(root); } catch {}
+    return pathInside(realRoot, real);
+  })) throw new Error(`Voice file is outside allowed roots: ${input.file}`);
   const stat = fs.statSync(real);
   if (!stat.isFile()) throw new Error(`Voice path is not a regular file: ${input.file}`);
   if (stat.size > MAX_VOICE_FILE_BYTES) throw new Error(`Voice file is too large: ${real}; limit is ${MAX_VOICE_FILE_BYTES} bytes`);
@@ -1551,15 +1589,22 @@ async function startDaemonProcess() {
     // Edge 用 user-data-dir 启动时会恢复上次会话的标签页；Puppeteer 也会创建初始 about:blank。
     // 这些无关页面拖慢启动、占用内存、可能干扰 DOM 检测。启动后立即清理，只保留一个页面做 bootstrap。
     const initialPages = await browser.pages();
-    // 复用第一个页面作为 bootstrapPage（避免多创建一个 tab），关闭其余所有页面。
-    bootstrapPage = initialPages[0] || await browser.newPage();
+    // 优先复用已有 chatgpt.com 页面（spawn 时打开），避免 newPage 在 cookie 加载前
+    // 导航到 project URL 被重定向到 /auth/login，导致 chatgpt.com 清除 persistent session-token cookie。
+    bootstrapPage = initialPages.find(p => /chatgpt\.com/.test(p.url())) || initialPages[0] || await browser.newPage();
     for (const page of initialPages) {
       if (page !== bootstrapPage) await page.close().catch(() => {});
     }
-    // 缓存命中时直接打开固定 Project，避免每次冷启动都先刷新首页再跳项目页。
-    // 缓存缺失才走首页发现；登录态仍在首次导航后统一确认，避免未登录时误报 Project 不存在。
-    project = resolveCachedProject(DEFAULT_PROJECT);
-    await bootstrapPage.goto(project?.url || CHATGPT_URL, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+    // 只导航到 chatgpt.com 首页（不导航到 project URL），避免未登录时触发 /auth/login 清除 cookie。
+    if (!/chatgpt\.com/.test(bootstrapPage.url())) {
+      await bootstrapPage.goto(CHATGPT_URL, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+    }
+    // chatgpt.com 用 JS 渲染登录态；domcontentloaded 时 #prompt-textarea 可能还没出现，
+    // 导致 isLoggedOut 在页面完全渲染前误判为未登录。等待 composer 或登录按钮出现后再检查。
+    await Promise.race([
+      bootstrapPage.waitForSelector('#prompt-textarea', { timeout: 15_000 }).catch(() => {}),
+      bootstrapPage.waitForFunction(() => [...document.querySelectorAll('button, a')].some(el => /\b(log in|sign in)\b|登录|登入/i.test((el.textContent || '').trim())), { timeout: 15_000 }).catch(() => {}),
+    ]);
 
     if (await CHATGPT_DOM.isLoggedOut(bootstrapPage)) {
       // 保持浏览器窗口打开让用户手动登录；Puppeteer 控制的浏览器可能被 Google OAuth 拒绝，
@@ -1597,12 +1642,16 @@ async function startDaemonProcess() {
       }
       if (!loginConfirmed) {
         log('Startup error: Login wait timed out after ' + LOGIN_WAIT_TIMEOUT_MS + 'ms. Log in to chatgpt.com in the browser window, or run: node chatgpt.js --login');
-        await browser.close();
+        // CDP 连接模式下 disconnect 而非 close，避免杀掉用户已登录的浏览器窗口。
+        if (BROWSER_WS_ENDPOINT || BROWSER_CDP_URL) browser.disconnect();
+        else await browser.close();
         return flushAndExit(1);
       }
       log('Login detected; continuing startup.');
     }
 
+    // 已登录后才导航到 project URL，避免未登录时 /auth/login 重定向清除 persistent cookie。
+    project = resolveCachedProject(DEFAULT_PROJECT);
     project = project || await resolveProject(bootstrapPage, DEFAULT_PROJECT, log);
 
     if (!sameUrl(bootstrapPage.url(), project.url)) {
@@ -1615,7 +1664,11 @@ async function startDaemonProcess() {
     log('Browser ready and logged in.');
   } catch (err) {
     log(`Startup error: ${err.message}`);
-    if (browser) await browser.close().catch(() => {});
+    if (browser) {
+      // CDP 连接模式下 disconnect 而非 close，避免杀掉用户已登录的浏览器。
+      if (BROWSER_WS_ENDPOINT || BROWSER_CDP_URL) browser.disconnect();
+      else await browser.close().catch(() => {});
+    }
     // 外层 catch 同样需要刷盘后退出，否则启动期异常的日志可能丢失。
     return flushAndExit(1);
   }
@@ -1655,7 +1708,12 @@ async function startDaemonProcess() {
     if (server) server.close();
     clearInterval(stalePageTimer);
     // browser disconnected 回调里不再 close browser：连接已断开，重复 close 只会制造无意义的协议错误。
-    if (options.closeBrowser !== false) await browser.close().catch(() => {});
+    if (options.closeBrowser !== false) {
+      // CDP 连接模式下 disconnect 而非 close，避免 daemon 退出时杀掉用户已登录的浏览器，
+      // 导致 session cookie 丢失、下次启动需要重新登录。
+      if (BROWSER_WS_ENDPOINT || BROWSER_CDP_URL) browser.disconnect();
+      else await browser.close().catch(() => {});
+    }
     process.exit(options.exitCode ?? 0);
   };
 
