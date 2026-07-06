@@ -36,7 +36,10 @@ const PROFILE_DIR      = path.join(STATE_DIR, 'profile');
 const BROWSER_USER_DATA_DIR = path.resolve(process.env.CHATGPT_BROWSER_USER_DATA_DIR || PROFILE_DIR);
 const BROWSER_PROFILE_DIRECTORY = process.env.CHATGPT_BROWSER_PROFILE_DIRECTORY || '';
 const BROWSER_WS_ENDPOINT = process.env.CHATGPT_BROWSER_WS_ENDPOINT || '';
-const BROWSER_DEBUG_PORT = Number.parseInt(process.env.CHATGPT_BROWSER_DEBUG_PORT || '9222', 10);
+// 默认 0（禁用）：不走 spawn+connect 路径，直接用 puppeteer.launch 启动浏览器。
+// 默认 9222 会导致每次启动都尝试连接 9222 端口（通常失败）→ spawn Edge → 轮询 CDP 30s，
+// 在 profile 被锁或 Edge 无法打开 CDP 时完全挂起。需要 CDP 的用户可显式设置此环境变量。
+const BROWSER_DEBUG_PORT = Number.parseInt(process.env.CHATGPT_BROWSER_DEBUG_PORT || '0', 10);
 const BROWSER_CDP_URL_ENV = process.env.CHATGPT_BROWSER_CDP_URL || '';
 const BROWSER_CDP_URL = BROWSER_CDP_URL_ENV || (Number.isFinite(BROWSER_DEBUG_PORT) && BROWSER_DEBUG_PORT > 0 ? `http://127.0.0.1:${BROWSER_DEBUG_PORT}` : '');
 const BROWSER_CONNECT_TIMEOUT_MS = positiveIntEnv('CHATGPT_BROWSER_CONNECT_TIMEOUT_MS', 3_000);
@@ -160,14 +163,15 @@ async function launchBrowser(log = () => {}) {
   }
   // 没有 CDP 端口时只能复用同一个 user data dir 的登录态；若该 profile 正被普通 Edge 锁住，Chromium 会拒绝启动。
   // 这仍比插件私有空 profile 更符合用户预期：登录 cookie 来自指定 Edge profile，而不是重新登录。
-  return puppeteer.launch({
+  // 30s 超时防止 profile lock 或其他原因导致 puppeteer.launch 永久挂起（无超时时 daemon 会卡死直到被用户强杀）。
+  return withTimeout(puppeteer.launch({
     executablePath: CHROME_PATH,
     userDataDir: BROWSER_USER_DATA_DIR,
     headless: false,
     args: browserLaunchArgs(),
     defaultViewport: null,
     protocolTimeout: RESPONSE_TIMEOUT,
-  });
+  }), 30_000, 'Browser launch timed out');
 }
 
 function browserLaunchArgs() {

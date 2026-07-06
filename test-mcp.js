@@ -26,7 +26,7 @@ const BASE_ENV = {
   CHATGPT_WORKSPACE_DIR: process.cwd(),
   CHATGPT_ASK_HTTP_TIMEOUT_MS: '5000',
   CHATGPT_CLI_TIMEOUT_MS: '6000',
-  // 测试不连接真实浏览器；显式禁用 CDP 端口，避免默认值 9222 导致 CLI 连接到用户正在运行的 Edge。
+  // 测试不连接真实浏览器；显式禁用 CDP 端口，与生产默认值 0 保持一致。
   CHATGPT_BROWSER_DEBUG_PORT: '0',
 };
 

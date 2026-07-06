@@ -36,7 +36,9 @@ const STATE_DIR = path.resolve(process.env.CHATGPT_STATE_DIR || defaultStateDir(
 const PROFILE_DIR = path.join(STATE_DIR, 'profile');
 const BROWSER_USER_DATA_DIR = path.resolve(process.env.CHATGPT_BROWSER_USER_DATA_DIR || PROFILE_DIR);
 const BROWSER_PROFILE_DIRECTORY = process.env.CHATGPT_BROWSER_PROFILE_DIRECTORY || '';
-const BROWSER_DEBUG_PORT = Number.parseInt(process.env.CHATGPT_BROWSER_DEBUG_PORT || '9222', 10);
+// 默认 0（禁用）：不走 spawn+connect 路径，直接用 puppeteer.launch 启动浏览器。
+// 和 chatgpt-core.js 保持一致；默认 9222 会导致每次启动走脆弱的 spawn+poll+connect 路径。
+const BROWSER_DEBUG_PORT = Number.parseInt(process.env.CHATGPT_BROWSER_DEBUG_PORT || '0', 10);
 const BROWSER_CDP_URL = process.env.CHATGPT_BROWSER_CDP_URL || (Number.isFinite(BROWSER_DEBUG_PORT) && BROWSER_DEBUG_PORT > 0 ? `http://127.0.0.1:${BROWSER_DEBUG_PORT}` : '');
 const BROWSER_WS_ENDPOINT = process.env.CHATGPT_BROWSER_WS_ENDPOINT || '';
 const DAEMON_FILE = path.join(STATE_DIR, 'daemon.json');
@@ -426,9 +428,12 @@ async function acquireDaemonStartLock() {
 }
 
 function isStaleLock(file, maxAge) {
-  // 只看 mtime 会误删调试/重负载中的活锁；pid 仍存活时继续等待，避免双 daemon 启动。
-  if (Date.now() - fs.statSync(file).mtimeMs <= maxAge) return false;
+  // PID 优先：stuck daemon 被强杀后 lock 文件仍在，但 PID 已不存在。
+  // 此时 mtime 可能还很新（maxAge 内），不应阻塞 180s 等待。
   const pid = Number((fs.readFileSync(file, 'utf8').split(':')[0] || '').trim());
+  if (pid && !isProcessAlive(pid)) return true;
+  // PID 存活时再看 mtime：调试/重负载中的活锁不应被误删，只有超时后才视为 stale。
+  if (Date.now() - fs.statSync(file).mtimeMs <= maxAge) return false;
   return !pid || !isProcessAlive(pid);
 }
 
