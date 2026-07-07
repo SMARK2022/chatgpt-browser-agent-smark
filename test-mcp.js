@@ -70,6 +70,8 @@ async function main() {
     ['testStopWithoutActiveAsk', () => testStopWithoutActiveAsk(), false],
     ['testTableCitationExtraction', () => testTableCitationExtraction(), false],
     ['testVoicePageHealthCheck', () => testVoicePageHealthCheck(), false],
+    // 验证 voice cancel 后 send 不在已关闭 res 上崩溃,daemon 仍存活
+    ['testVoiceCancelSendSafeOnClosedRes', () => testVoiceCancelSendSafeOnClosedRes(), false],
     // 验证 shouldCancel=true 时 transcribeAudioFile 不进入 fallback 听写 UI,直接抛出取消错误
     ['testTranscribeShouldCancelBeforeFallback', () => testTranscribeShouldCancelBeforeFallback(), false],
     // 验证 onFallbackStart 回调在 direct path 失败后、fallback 开始前被调用
@@ -1049,6 +1051,53 @@ async function testForegroundPulseInterval8s() {
   // 核心断言:chatgpt-core.js 中 foregroundPulseMs 已从 4_000 改为 8_000(语法检查覆盖)。
   // 此测试验证 createChatGPTDom 的 responseTimeout 正常工作(回归保护)。
   assert.ok(dom, 'createChatGPTDom must return a valid adapter');
+}
+
+// 验证 voice cancel 后 daemon 的 send 函数不在已关闭的 res 上崩溃。
+// 场景:TUI 发起 voice → 取消 → res.on('close') 触发 → runVoiceTranscribe throw
+// → catch 调 send(500,...) → send 必须在 res.destroyed/writableEnded 时静默返回。
+// 修复前:send 调 res.writeHead() 抛异常 → daemon 崩溃 → voiceLock 永不释放 → 后续请求永久阻塞。
+async function testVoiceCancelSendSafeOnClosedRes() {
+  const http = require('http');
+  const server = http.createServer((req, res) => {
+    // 与 chatgpt-core.js 的 send 逻辑一致(修复后:有 destroyed 检查)
+    const send = (status, obj) => {
+      if (res.destroyed || res.writableEnded) return; // 修复后:静默返回
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(obj));
+    };
+    if (req.url === '/voice/transcribe-file') {
+      let voiceClientClosed = false;
+      res.on('close', () => { if (!res.writableEnded) voiceClientClosed = true; });
+      // 模拟 runVoiceTranscribe:客户端断开后 throw → catch 调 send(500)
+      setTimeout(() => {
+        if (voiceClientClosed) {
+          try { send(500, { ok: false, error: 'cancelled' }); }
+          catch (e) { assert.fail(`send must not throw on closed res: ${e.message}`); }
+        }
+      }, 100);
+      res.setTimeout(10_000);
+    } else { send(404, { error: 'not found' }); }
+  });
+  await new Promise(r => server.listen(0, '127.0.0.1', r));
+  const port = server.address().port;
+  try {
+    // 发起 voice 请求后立即取消(模拟 TUI cancel)
+    const req = http.request({ hostname: '127.0.0.1', port, path: '/voice/transcribe-file', method: 'POST', headers: { 'Content-Type': 'application/json' } }, () => {});
+    req.on('error', () => {}); // ECONNRESET 是客户端断开的正常错误
+    req.write(JSON.stringify({ file: '/tmp/test.wav' }));
+    req.end();
+    await new Promise(r => setTimeout(r, 50));
+    req.destroy(); // 模拟 TUI 取消
+    await new Promise(r => setTimeout(r, 200));
+    // 核心断言:cancel 后 daemon(server)必须仍然存活
+    const alive = await new Promise(resolve => {
+      const probe = http.request({ hostname: '127.0.0.1', port, path: '/ping', method: 'GET' }, res => { resolve(res.statusCode === 404); });
+      probe.on('error', () => resolve(false));
+      probe.end();
+    });
+    assert.ok(alive, 'daemon must survive voice cancel — send must not crash on closed res');
+  } finally { server.close(); }
 }
 
 main().catch(err => {

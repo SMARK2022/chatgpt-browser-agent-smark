@@ -1788,7 +1788,10 @@ async function startDaemonProcess() {
   });
 
   server = http.createServer(async (req, res) => {
+    // send 必须在 res 已关闭时静默返回:voice cancel 后客户端断开,catch 调 send(500)
+    // 会在已关闭的 res 上 writeHead 抛异常,导致 daemon 崩溃且 voiceLock 永不释放。
     const send = (status, obj) => {
+      if (res.destroyed || res.writableEnded) return;
       res.writeHead(status, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(obj));
     };
