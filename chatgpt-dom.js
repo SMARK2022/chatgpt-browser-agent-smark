@@ -69,8 +69,10 @@ function createChatGPTDom({ responseTimeout }) {
     },
 
     async focus(page) {
-      // 恢复读取前把目标页切到前台，降低后台 tab 延迟渲染导致的“文本已生成但 DOM 不完整”。
+      // 恢复读取前把目标页切到前台并滚动到最下方,降低后台 tab 延迟渲染导致的"文本已生成但 DOM 不完整"。
+      // ChatGPT 虚拟化视口外的消息;不滚动时最新 assistant 节点可能不在 DOM 中。
       await page.bringToFront().catch(() => {});
+      await scrollToEnd(page);
       await sleep(1_000);
     },
 
@@ -159,7 +161,7 @@ function createChatGPTDom({ responseTimeout }) {
       }
     },
 
-    async transcribeAudioFile(page, file, voiceUrl, log) {
+    async transcribeAudioFile(page, file, voiceUrl, log, shouldCancel = () => false, onFallbackStart = () => {}) {
       // Node 侧只读取一次文件；direct upload 和 fallback fake mic 共用同一份 base64，避免两次磁盘读取产生 TOCTOU 窗口。
       const audioBase64 = fs.readFileSync(file).toString('base64');
       // direct path 零页面操作：不 bringToFront、不 goto、不依赖任何 DOM 状态。
@@ -179,14 +181,18 @@ function createChatGPTDom({ responseTimeout }) {
         // "target closed"/"protocol error" 表示页面已被外部关闭（stale cleanup、浏览器断开等），
         // fallback 同样会立即失败，不应在此页面上尝试。
         if (/timed out|timeout|abort|target closed|protocol error/i.test(err.message)) throw err;
+        // 客户端已断开时不需要进入 ~90s 的 fallback 听写 UI。
+        if (shouldCancel()) throw new Error('Voice transcription cancelled before fallback');
         // ChatGPT Web 的私有 endpoint/header 可能随前端版本调整；fallback 继续用已验证的听写 UI，避免一次网页变更让语音输入彻底不可用。
         // fallback 日志只记录错误信息，不记录 token、请求体或音频内容，避免把登录态材料写进 daemon.log。
         log(`Direct voice transcription failed, falling back to dictation UI: ${err.message}`);
       }
-      // fallback 需要 composer 和听写按钮；此时才做 bringToFront + goto 等页面操作。
+      // fallback 需要 composer 和听写按钮;通知 caller 开始 fallback(让 ask foregroundPulse 跳过)。
+      onFallbackStart();
       // fallback 需要项目页的 composer；direct 复用的页面可能不在项目页上。
       await page.bringToFront().catch(() => {});
-      if (!/^https:\/\/chatgpt\.com\/g\//i.test(page.url())) {
+      // 听写 UI 在任何 chatgpt.com 聊天页都可用;不导航到项目页(避免创建多余对话和干扰 ask 会话)。
+      if (!/^https:\/\/chatgpt\.com/i.test(page.url())) {
         await page.goto(voiceUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
       }
       // fallback 才依赖 React composer 和听写按钮；把等待放在这里，避免 direct 成功路径浪费固定 3 秒。
@@ -1080,7 +1086,7 @@ function createChatGPTDom({ responseTimeout }) {
     // 等待拆成“开始”和“稳定”两段：先确认远端收下 prompt，再判断回答是否完成。
     before = before || await assistantState(page);
     log(`waitForResponse: beforeCount=${before.count}`);
-    options.foreground = foregroundPulse(page, options.foregroundPulseMs || 0);
+    options.foreground = foregroundPulse(page, options.foregroundPulseMs || 0, options.shouldSkipForeground);
     const startedAt = Date.now();
     // responseTimeout 是整次浏览器等待总预算；start/settle 共享同一个 deadline，避免外层 CLI 先超时。
     const deadline = startedAt + responseTimeout;
@@ -1158,14 +1164,17 @@ function createChatGPTDom({ responseTimeout }) {
     }
   }
 
-  function foregroundPulse(page, intervalMs) {
-    // ChatGPT Web 有些内容在后台 tab 不会完整 hydrate；等待期间低频轮流激活页面，避免只抽到引用/空 assistant。
-    // 频率不能太高，否则并发会话会互相抢前台；4s 级别足够触发渲染，又不会像 polling 一样打扰用户。
+  function foregroundPulse(page, intervalMs, shouldSkip) {
+    // ChatGPT Web 有些内容在后台 tab 不会完整 hydrate；等待期间低频轮流激活页面并滚动到最下方,避免只抽到引用/空 assistant。
+    // 频率不能太高，否则并发会话会互相抢前台；8s 级别足够触发渲染,又不会像 polling 一样打扰用户。
+    // shouldSkip:voice fallback 活跃时跳过 pulse,避免抢前台干扰听写 UI。
     let last = 0;
     return async () => {
       if (!intervalMs || Date.now() - last < intervalMs) return;
+      if (shouldSkip?.()) return;
       last = Date.now();
       await page.bringToFront().catch(() => {});
+      await scrollToEnd(page);
       await sleep(150);
     };
   }
@@ -1623,11 +1632,26 @@ function createChatGPTDom({ responseTimeout }) {
   }
 
   async function waitForDownloadedFile(downloadDir, before, beforeTemp, expectedName, shouldCancel) {
-    // 先找期望文件；只允许 Chrome 对同名文件追加 “(1)” 这类重命名，不接受任意变化文件。
+    // progress-aware 超时:120s 硬上限防止无限等待;30s 停滞(临时文件大小不变)检测卡死。
+    // 原设计(dom.js:32)不做固定超时,但 ask deadline 540s 内无进展的下载会永久阻塞 session lock。
+    const MAX_WAIT = 120_000;
+    const start = Date.now();
+    let lastProgressAt = start;
+    let lastTempSize = 0;
+    // 先找期望文件；只允许 Chrome 对同名文件追加 "(1)" 这类重命名，不接受任意变化文件。
     for (;;) {
       if (shouldCancel()) throw new Error('caller cancelled while waiting for generated file download');
+      const elapsed = Date.now() - start;
+      const stalled = Date.now() - lastProgressAt;
+      // 总超时 120s(硬上限,防止无限等待)或停滞 30s(临时文件大小不变,区分"下载中"和"卡住")
+      if (elapsed > MAX_WAIT || stalled > 30_000) throw new Error(`Artifact download ${elapsed > MAX_WAIT ? 'timed out' : 'stalled'}: ${expectedName}`);
       await sleep(500);
-      if (fs.readdirSync(downloadDir).some(name => (name.endsWith('.crdownload') || name.endsWith('.tmp')) && !beforeTemp.has(name))) continue;
+      // 检测临时文件增长(progress-aware):大小变化时重置停滞计时器。
+      const tempFiles = fs.readdirSync(downloadDir).filter(name => name.endsWith('.crdownload') || name.endsWith('.tmp'));
+      let currentTempSize = 0;
+      for (const name of tempFiles) { try { currentTempSize += fs.statSync(path.join(downloadDir, name)).size; } catch {} }
+      if (currentTempSize !== lastTempSize) { lastTempSize = currentTempSize; lastProgressAt = Date.now(); }
+      if (tempFiles.some(name => !beforeTemp.has(name))) continue;
       const current = snapshotDownloadDir(downloadDir);
       const expected = current.get(expectedName);
       if (expected && expected !== before.get(expectedName)) return path.join(downloadDir, expectedName);
@@ -1659,6 +1683,18 @@ function isChromeRenameOf(name, expectedName) {
 // ─── Node-side Filename Helpers ───────────────────────────────────────────────
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+// 滚动到对话最下方,确保最新 assistant 消息在视口内渲染。
+// ChatGPT 虚拟化视口外的消息;后台恢复前台后必须滚动,否则 assistantState 读到空/过期文本。
+// 同步 JS 操作(scrollTop/scrollIntoView),不依赖 rAF,后台也能执行。
+function scrollToEnd(page) {
+  return page.evaluate(() => {
+    const main = document.querySelector('main');
+    if (main) main.scrollTop = main.scrollHeight;
+    const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
+    if (msgs.length > 0) msgs[msgs.length - 1].scrollIntoView({ block: 'end' });
+  }).catch(() => {});
+}
 
 function ensurePrivateDir(dir) {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });

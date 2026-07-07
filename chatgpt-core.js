@@ -214,6 +214,21 @@ function withTimeout(promise, timeout, message) {
   ]).finally(() => clearTimeout(timer));
 }
 
+// voice 转写的客户端断开检测:轮询 shouldCancel,断开时 reject 让 Promise.race 中止转写。
+// 必须通过返回的 .stop() 在 finally 中清除定时器,否则成功路径会永久轮询泄漏。
+function cancelSignal(shouldCancel, pollMs) {
+  let timer;
+  const promise = new Promise((_, reject) => {
+    const check = () => {
+      if (shouldCancel()) reject(new Error('Voice transcription cancelled: client disconnected'));
+      else timer = setTimeout(check, pollMs);
+    };
+    timer = setTimeout(check, pollMs);
+  });
+  promise.stop = () => clearTimeout(timer);
+  return promise;
+}
+
 function tcpConnect(host, port) {
   // 连接成功就立即断开；真正的 DevTools 协议握手仍交给 Puppeteer，避免这里复制协议细节。
   return new Promise((resolve, reject) => {
@@ -566,7 +581,10 @@ function parseProjectRef(value, name) {
   if (!token) return;
   const id = token.match(/^(g-p-[a-z0-9]+)/i)?.[1];
   if (!id) return;
-  const url = `${CHATGPT_URL}/g/${token}/project`;
+  // ChatGPT 改版后 /project 是设置页,/c/new 会被 SPA 重定向到 /project;
+  // 用 chatgpt.com/ 主页(有干净聊天 composer,不重定向)作为新会话入口。
+  // 项目上下文通过登录态 cookie 隐式传递;如需显式项目,用户可配置 CHATGPT_PROJECT 指向特定对话 URL。
+  const url = CHATGPT_URL;
   const title = name || token.replace(id, '').replace(/^-/, '') || id;
   return { id, token, key: normalizeProjectKey(title || id), name: title, url };
 }
@@ -576,6 +594,10 @@ function projectIdFromUrl(url) {
 }
 
 function isChatSessionUrlForProject(url, project, options = {}) {
+  // /c/new 是项目内新建对话的 transient URL,ChatGPT 尚未将其改为 /c/{convId};
+  // 如果允许它通过,rememberCurrentSessionUrl 会在提交后立即记录 /c/new 而非真实会话 URL,
+  // 导致后续 restoreSessionPage 导航到 /c/new 创建新对话而非恢复已有对话。
+  if (/\/c\/new(?:[?#]|$)/.test(url)) return false;
   // 当前页面必须严格带 Project id；已登记条目可接受普通 /c/...，因为 projectID 已单独保存在 registry。
   if (!/\/c\//.test(url)) return false;
   const id = projectIdFromUrl(url);
@@ -903,7 +925,14 @@ function resolveCachedProject(requested) {
   const value = String(requested || DEFAULT_PROJECT).trim();
   const direct = parseProjectRef(value);
   if (direct) return direct;
-  return readProjectCache().projects[normalizeProjectKey(value)] || null;
+  const cached = readProjectCache().projects[normalizeProjectKey(value)];
+  if (cached) {
+    // 缓存中的 URL 可能是旧的 /project(ChatGPT 改版前的设置页);
+    // 用 parseProjectRef 修正为 /c/new,确保导航到聊天页而非设置页。
+    const fixed = parseProjectRef(cached.url, cached.name);
+    if (fixed) return fixed;
+  }
+  return cached || null;
 }
 
 async function resolveProject(page, requested, log) {
@@ -1098,6 +1127,9 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
   // 这里集中维护并发不变量，避免 HTTP handler、CLI、等待逻辑各自管理一套锁。
   const sessionPages = new Map();
   const sessionLocks = new Map();
+  // voice fallback 活跃时 ask 的 foregroundPulse 跳过,避免抢前台干扰听写 UI;
+  // 用对象持有避免闭包变量与 runtime 属性不匹配(flags 对象被两侧闭包共享)。
+  const flags = { voiceFallbackActive: false };
   let conversationCreateQueue = Promise.resolve();
   let pageCreateQueue = Promise.resolve();
   let voiceLock = Promise.resolve();
@@ -1281,7 +1313,8 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
     async waitForResponse(page, beforeState, waitOptions, log) {
       // 不同 sessionID 已经绑定不同 tab；并发不再主动 detach，避免两个 ask 同跑时其中一个只拿到 partial。
       // 后台 tab 偶尔不刷新 DOM，DOM 层会按低频节奏 bringToFront，真正超时仍由 pending/recovery 兜底。
-      return CHATGPT_DOM.waitForResponse(page, beforeState, { ...waitOptions, foregroundPulseMs: 4_000 }, log);
+      // foregroundPulse 8s:降低 macOS 前台干扰频率;!state.generating 在生成期防护,pulse 只影响 DOM 刷新频率。
+      return CHATGPT_DOM.waitForResponse(page, beforeState, { ...waitOptions, foregroundPulseMs: 8_000, shouldSkipForeground: () => flags.voiceFallbackActive }, log);
     },
     // 返回 daemon 当前管理的所有页面引用（bootstrapPage + sessionPages + voicePage），
     // 供 stale page cleanup 判断哪些页面不该被关闭。
@@ -1301,29 +1334,42 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
       }
       // sessionPages 不再作为 voice 候选（fetch 健康检查可能干扰 ask），无需处理
     },
+    // voice fallback 开始/结束标志:控制 ask 的 foregroundPulse 是否跳过。
+    // fallback 需要独占前台(听写 UI 依赖 rAF);direct path 不调用这些方法(不需要前台)。
+    beginVoiceFallback() { flags.voiceFallbackActive = true; },
+    endVoiceFallback() { flags.voiceFallbackActive = false; },
   };
 }
 
 // ─── Voice Flow ──────────────────────────────────────────────────────────────
 
-async function runVoiceTranscribe(runtime, input, log) {
+async function runVoiceTranscribe(runtime, input, log, shouldCancel = () => false) {
   const page = await runtime.voicePage();
   log(`voice: transcribing ${path.basename(input.file)} bytes=${fs.statSync(input.file).size}`);
-  const transcribePromise = CHATGPT_DOM.transcribeAudioFile(page, input.file, runtime.project.url, log);
+  // 传 CHATGPT_URL 而非 project.url:fallback 只需 chatgpt.com 同源页,不需要导航到项目页(避免干扰 ask)。
+  // onFallbackStart:direct path 失败进入 fallback 前通知 caller,让 ask 的 foregroundPulse 跳过。
+  const transcribePromise = CHATGPT_DOM.transcribeAudioFile(page, input.file, CHATGPT_URL, log, shouldCancel, () => runtime.beginVoiceFallback());
+  // cancelSignal 轮询客户端断开;与 withTimeout 竞速,先到者决定结果。
+  const cancel = cancelSignal(shouldCancel, 500);
   try {
-    // 超时保护：fetch 挂起时 page.evaluate 永不返回，voiceLock 永久卡死。
-    // withTimeout 在 VOICE_TRANSCRIBE_TIMEOUT_MS 后 reject，voiceLock 被释放，后续 voice 调用可继续。
-    const text = await withTimeout(transcribePromise, VOICE_TRANSCRIBE_TIMEOUT_MS,
-      `Voice transcription timed out after ${VOICE_TRANSCRIBE_TIMEOUT_MS}ms`);
+    const text = await Promise.race([
+      withTimeout(transcribePromise, VOICE_TRANSCRIBE_TIMEOUT_MS,
+        `Voice transcription timed out after ${VOICE_TRANSCRIBE_TIMEOUT_MS}ms`),
+      cancel,
+    ]);
     return { ok: true, text };
   } catch (err) {
-    // 仅在 timeout/abort（页面退化）时关闭页面，不在普通 HTTP 错误时关闭健康页面。
+    // timeout/abort/cancelled/target closed 都需要关闭坏页面,释放 voiceLock。
     // transcribePromise.catch 防止 page.close() 导致的 pending evaluate 产生 unhandled rejection。
-    if (/timed out|timeout|abort/i.test(err.message)) {
+    if (/Voice transcription cancelled|timed out|timeout|abort|target closed|protocol error/i.test(err.message)) {
       transcribePromise.catch(() => {});
       runtime.invalidateVoicePage(page);
     }
     throw err;
+  } finally {
+    // 无论成功/超时/取消,都清除 cancelSignal 定时器并恢复 ask 的 foregroundPulse。
+    cancel.stop();
+    runtime.endVoiceFallback();
   }
 }
 
@@ -1419,6 +1465,17 @@ async function runAsk(runtime, input, sessionID, log, shouldCancel = () => false
 async function restoreSessionPage(page, project, session, sessionID, log) {
   const targetUrl = session?.url || project.url;
   if (sameUrl(page.url(), targetUrl)) return;
+  // 新会话:当前页已在本项目(/g/{token}/c/)且无消息(干净对话)——复用,避免创建多余对话。
+  // 先 bringToFront+500ms 让虚拟化的消息 hydrate,避免后台 tab count=0 假阳性。
+  if (!session && page.url().includes(`/g/${project.token}/c/`)) {
+    await page.bringToFront().catch(() => {});
+    await sleep(500);
+    const reusable = await page.evaluate(() =>
+      !!document.querySelector('#prompt-textarea') &&
+      document.querySelectorAll('[data-message-author-role]').length === 0
+    ).catch(() => false);
+    if (reusable) { log(`Reusing current page for new session ${sessionID}`); return; }
+  }
   log(session ? `Restoring session ${sessionID}` : `Starting session ${sessionID} in ${project.name}`);
   // ChatGPT 页面会长期保持流式/预取连接；等待 networkidle 容易误判超时，composer 自己再等具体 selector。
   await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
@@ -1761,10 +1818,14 @@ async function startDaemonProcess() {
     }
 
     if (req.method === 'POST' && req.url === '/voice/transcribe-file') {
+      // 检测客户端断开:TUI cancel 后 daemon 仍持有 voiceLock 直到超时(60s);
+      // shouldCancel 让 cancelSignal 在 500ms 内检测断开,关闭页面释放 voiceLock。
+      let voiceClientClosed = false;
+      res.on('close', () => { if (!res.writableEnded) voiceClientClosed = true; });
       try {
         res.setTimeout(RESPONSE_TIMEOUT + 60_000);
         const parsed = validateVoiceInput(await readDaemonJsonBody(req, '/voice/transcribe-file', log));
-        const result = await runtime.withVoice(() => runVoiceTranscribe(runtime, parsed, log));
+        const result = await runtime.withVoice(() => runVoiceTranscribe(runtime, parsed, log, () => voiceClientClosed));
         send(200, result);
       } catch (err) {
         log(`Error: ${err.message}`);
