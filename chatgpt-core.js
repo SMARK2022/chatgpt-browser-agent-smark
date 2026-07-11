@@ -22,6 +22,19 @@ const os                  = require('os');
 const crypto              = require('crypto');
 const { execFileSync, spawn } = require('child_process');
 const { createChatGPTDom } = require('./chatgpt-dom');
+const projectPolicy       = require('./chatgpt-project');
+const {
+  normalizeProjectKey,
+  parse: parseProjectRef,
+  projectIdFromUrl,
+  isOfficialURL: isOfficialChatGPTURL,
+  conversation: conversationFromUrl,
+  acceptsHome: isProjectHomeUrlForProject,
+  acceptsConversation: isChatSessionUrlForProject,
+  sameConversation: isSameConversationUrl,
+  forSession: projectForSessionEntry,
+  select: selectDiscoveredProject,
+} = projectPolicy;
 
 // ─── Constants and Directories ────────────────────────────────────────────────
 
@@ -66,10 +79,9 @@ const MAX_UPLOAD_BYTES = positiveIntEnv('CHATGPT_MAX_UPLOAD_BYTES', 400 * 1024 *
 const MAX_TOTAL_UPLOAD_BYTES = positiveIntEnv('CHATGPT_MAX_TOTAL_UPLOAD_BYTES', 800 * 1024 * 1024);
 const MAX_VOICE_FILE_BYTES = positiveIntEnv('CHATGPT_VOICE_FILE_MAX_BYTES', 50 * 1024 * 1024);
 // voice 转写总超时：覆盖 session 获取 + 音频上传 + 转写返回的完整链路。
-// 实际转写 2-8s；60s 足够覆盖慢网络和大文件，超时后 voiceLock 被释放。
+// 总预算覆盖页面准备、direct 请求和 UI fallback；超时后 voiceLock 必须释放。
 const VOICE_TRANSCRIBE_TIMEOUT_MS = positiveIntEnv('CHATGPT_VOICE_TRANSCRIBE_TIMEOUT_MS', 60_000);
-// voice 页面最大年龄：超过后主动重建，防止 Service Worker 状态退化、cookie 过期等问题累积。
-// 10 分钟：voice 通常在短时内多次使用，10 分钟内不会触发重建；长时间空闲后首次使用时重建。
+// 长期复用页即使仍能 evaluate，也可能累积失效的 Service Worker/fetch 状态；到期主动换页作为健康维持上限。
 const VOICE_PAGE_MAX_AGE_MS = positiveIntEnv('CHATGPT_VOICE_PAGE_MAX_AGE_MS', 600_000);
 const MAX_FULL_PROMPT_CHARS = positiveIntEnv('CHATGPT_MAX_FULL_PROMPT_CHARS', 500_000);
 // 登录过期时 daemon 保持浏览器窗口打开，等待用户手动登录；超时后返回明确错误。
@@ -172,6 +184,22 @@ async function launchBrowser(log = () => {}) {
     defaultViewport: null,
     protocolTimeout: RESPONSE_TIMEOUT,
   }), 30_000, 'Browser launch timed out');
+}
+
+async function prepareBootstrapPage(browser, sharedBrowser) {
+  const initialPages = await browser.pages();
+  if (sharedBrowser) {
+    // CDP connect 可能指向用户日常浏览器；daemon 只新建自己的 tab，绝不接管或关闭已有页面。
+    // 新 tab 仍共享该 browser context 的 cookie，因此无需牺牲登录态来换取清晰的页面所有权。
+    return browser.newPage();
+  }
+  // 独占 profile 由 daemon 自己启动，恢复页和 about:blank 均属于本进程，可以安全收敛为一个 bootstrap。
+  // 优先保留官方页面减少一次导航，但这个优化只在“所有 tab 都归 daemon”前提下成立。
+  const bootstrap = initialPages.find(page => isOfficialChatGPTURL(page.url())) || initialPages[0] || await browser.newPage();
+  for (const page of initialPages) {
+    if (page !== bootstrap) await page.close().catch(() => {});
+  }
+  return bootstrap;
 }
 
 function browserLaunchArgs() {
@@ -397,16 +425,6 @@ function pathInside(root, target) {
   return !relative || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
-function normalizeProjectKey(value) {
-  // Project 名可能来自 URL、缓存、侧边栏文本或中文项目名；统一成宽松 key，减少显示名差异导致的找不到项目。
-  return String(value || '')
-    .trim()
-    .toLowerCase()
-    .replace(/^https?:\/\//, '')
-    .replace(/[^a-z0-9\u4e00-\u9fff_-]+/g, '-')
-    .replace(/^-+|-+$/g, '');
-}
-
 function readJSON(file, fallback) {
   // 缓存文件损坏时回退默认结构，而不是让 daemon 启动失败；Project cache 可再生，session index 也能重新创建。
   if (!fs.existsSync(file)) return fallback;
@@ -573,37 +591,6 @@ function sessionSortTime(entry) {
   return Date.parse(entry.updatedAt || entry.createdAt || '') || 0;
 }
 
-function parseProjectRef(value, name) {
-  // 支持完整 URL、g-p-id、g-p-id-slug 三种输入；解析结果只描述固定 Project，不表示某个 conversation。
-  const input = String(value || '').trim();
-  const token = input.match(/\/g\/(g-p-[^/]+)(?:\/|$)/)?.[1]
-    || input.match(/^(g-p-[a-z0-9]+(?:-[a-z0-9-]+)?)$/i)?.[1];
-  if (!token) return;
-  const id = token.match(/^(g-p-[a-z0-9]+)/i)?.[1];
-  if (!id) return;
-  // ChatGPT 改版后 /project 是设置页,/c/new 会被 SPA 重定向到 /project;
-  // 用 chatgpt.com/ 主页(有干净聊天 composer,不重定向)作为新会话入口。
-  // 项目上下文通过登录态 cookie 隐式传递;如需显式项目,用户可配置 CHATGPT_PROJECT 指向特定对话 URL。
-  const url = CHATGPT_URL;
-  const title = name || token.replace(id, '').replace(/^-/, '') || id;
-  return { id, token, key: normalizeProjectKey(title || id), name: title, url };
-}
-
-function projectIdFromUrl(url) {
-  return parseProjectRef(url)?.id;
-}
-
-function isChatSessionUrlForProject(url, project, options = {}) {
-  // /c/new 是项目内新建对话的 transient URL,ChatGPT 尚未将其改为 /c/{convId};
-  // 如果允许它通过,rememberCurrentSessionUrl 会在提交后立即记录 /c/new 而非真实会话 URL,
-  // 导致后续 restoreSessionPage 导航到 /c/new 创建新对话而非恢复已有对话。
-  if (/\/c\/new(?:[?#]|$)/.test(url)) return false;
-  // 当前页面必须严格带 Project id；已登记条目可接受普通 /c/...，因为 projectID 已单独保存在 registry。
-  if (!/\/c\//.test(url)) return false;
-  const id = projectIdFromUrl(url);
-  return id ? id === project.id : options.allowPlain === true;
-}
-
 function readProjectCache() {
   // projects.json 只是加速固定 Project 解析；结构不对时丢弃缓存，重新通过 DOM adapter 发现。
   const cache = readJSON(PROJECTS_FILE, { projects: {} });
@@ -648,7 +635,8 @@ function readSessionEntry(sessionID, project) {
   const entry = readSessionIndex().sessions[sessionID];
   if (entry?.projectID && entry.projectID !== project.id) throw new Error(`Session ${sessionID} belongs to another ChatGPT project; start a new sessionID for ${project.name}.`);
   if (entry?.lost && entry.projectID === project.id) return entry;
-  return entry && isChatSessionUrlForProject(entry.url, project, { allowPlain: true }) ? entry : null;
+  const allowPlain = entry?.projectID === project.id;
+  return entry && isChatSessionUrlForProject(entry.url, project, { allowPlain }) ? entry : null;
 }
 
 function writeSessionEntry(sessionID, project, url, updates = {}) {
@@ -684,6 +672,9 @@ function writeSessionEntry(sessionID, project, url, updates = {}) {
 function markSessionPending(sessionID, project, url, savedResponse, options = {}) {
   // pending 是“下一次同 session 先恢复”的保护标记，即使没有文本快照也要记录远端仍可能在生成。
   // 原生图片需要发送前 URL 快照；否则恢复 image-only 回答时会把同会话旧图重新收集一遍。
+  const previousPending = readSessionIndex().sessions[sessionID]?.pending;
+  // recovery 可能多次保存 partial；若调用点没有新 baseline，必须延续最初发送前计数而不是向前滚动。
+  const beforeState = options.beforeState || previousPending?.beforeState;
   writeSessionEntry(sessionID, project, url, {
     lost: null,
     completed: options.preserveCompleted ? undefined : null,
@@ -691,7 +682,11 @@ function markSessionPending(sessionID, project, url, savedResponse, options = {}
       status: 'generating',
       savedAt: new Date().toISOString(),
       savedResponse: savedResponse || null,
-      nativeImageURLs: Array.isArray(options.nativeImageURLs) ? options.nativeImageURLs : undefined,
+      nativeImageURLs: Array.isArray(options.nativeImageURLs) ? options.nativeImageURLs : previousPending?.nativeImageURLs,
+      // turn 基线用于区分“本轮尚无回答”和“页面里已有旧回答”；后续 partial 保存必须原样继承。
+      beforeState: beforeState ? { count: beforeState.count || 0, userCount: beforeState.userCount || 0, turnCount: beforeState.turnCount || 0 } : undefined,
+      // completedUndelivered 只在 HTTP 客户端错过已完成结果时出现；它要求下次先本地回放，不能扫描 DOM 覆盖产物。
+      completedUndelivered: options.completedUndelivered === true || previousPending?.completedUndelivered === true,
     },
   });
 }
@@ -700,7 +695,7 @@ function clearSessionPending(sessionID, project, url) {
   writeSessionEntry(sessionID, project, url, { pending: null });
 }
 
-function markSessionCompleted(sessionID, project, url, requestHash, savedResponse, downloads) {
+function markSessionCompleted(sessionID, project, url, requestHash, savedResponse, downloads, nativeImageURLs = []) {
   if (!requestHash) return clearSessionPending(sessionID, project, url);
   // completed 只记录可恢复的本地 snapshot 指针和 requestHash；registry 仍不承载正文内容。
   // 这样同 prompt 丢包重试可以避免重复发送，普通历史清理也不会变成回答归档系统。
@@ -711,17 +706,18 @@ function markSessionCompleted(sessionID, project, url, requestHash, savedRespons
       savedAt: new Date().toISOString(),
       savedResponse,
       downloads,
+      nativeImageURLs,
     },
   });
 }
 
-function markSessionLost(sessionID, project, reason) {
+function markSessionLost(sessionID, project, reason, options = {}) {
   // lost 是“禁止静默复用”的墓碑：如果 prompt 已可能发出但没有 /c/... URL，重启后同 ID 不能新建会话。
   // live daemon 仍可在 page.url() 变成 conversation 后补回映射；离开当前浏览器进程则只能让用户新开 session。
   const previous = readSessionIndex().sessions[sessionID];
   // 已知 URL 的旧会话不能被 send-start 覆盖成 lost；pending recovery 才是正确的“不重发”语义。
-  if (previous?.url && isChatSessionUrlForProject(previous.url, project, { allowPlain: true })) {
-    markSessionPending(sessionID, project, previous.url, null);
+  if (previous?.url && isChatSessionUrlForProject(previous.url, project, { allowPlain: previous.projectID === project.id })) {
+    markSessionPending(sessionID, project, previous.url, null, { beforeState: options.beforeState });
     return;
   }
   writeSessionEntry(sessionID, project, previous?.url || null, {
@@ -786,13 +782,14 @@ function validateVoiceInput(input) {
   let real;
   try { real = fs.realpathSync.native(abs); }
   catch { throw new Error(`Voice file does not exist: ${input.file}`); }
-  if (!VOICE_FILE_ROOTS.some(root => {
+  const allowed = VOICE_FILE_ROOTS.some(root => {
     // macOS 上 os.tmpdir() 返回 /var/...，但 realpathSync 返回 /private/var/...；
     // root 不做 realpath 会导致 pathInside 比较失败，误报 "outside allowed roots"。
     let realRoot = root;
     try { realRoot = fs.realpathSync.native(root); } catch {}
     return pathInside(realRoot, real);
-  })) throw new Error(`Voice file is outside allowed roots: ${input.file}`);
+  });
+  if (!allowed) throw new Error(`Voice file is outside allowed roots: ${input.file}`);
   const stat = fs.statSync(real);
   if (!stat.isFile()) throw new Error(`Voice path is not a regular file: ${input.file}`);
   if (stat.size > MAX_VOICE_FILE_BYTES) throw new Error(`Voice file is too large: ${real}; limit is ${MAX_VOICE_FILE_BYTES} bytes`);
@@ -884,12 +881,37 @@ function requestHash(fullPrompt, files, mode = 'auto', imageAspectRatio = null) 
   return hash.digest('hex');
 }
 
+function safeCacheFile(workspaceDir, root, candidate) {
+  if (!candidate) return null;
+  const file = path.resolve(candidate);
+  if (!pathInside(path.resolve(root), file)) return null;
+  try {
+    const link = fs.lstatSync(file);
+    if (link.isSymbolicLink() || !link.isFile()) return null;
+    const workspaceReal = fs.realpathSync.native(resolveWorkspaceDir(workspaceDir));
+    const rootReal = fs.realpathSync.native(root);
+    const fileReal = fs.realpathSync.native(file);
+    if (!pathInside(workspaceReal, rootReal) || !pathInside(rootReal, fileReal)) return null;
+    return fileReal;
+  } catch {
+    return null;
+  }
+}
+
 function readSavedResponse(workspaceDir, sessionID, savedResponse) {
   if (!savedResponse?.path) return null;
-  const file = path.resolve(savedResponse.path);
   const root = path.resolve(sessionCacheDirs(workspaceDir, sessionID).responses);
-  if (!pathInside(root, file) || !fs.existsSync(file)) return null;
-  return fs.readFileSync(file, 'utf8');
+  const file = safeCacheFile(workspaceDir, root, savedResponse.path);
+  return file ? fs.readFileSync(file, 'utf8') : null;
+}
+
+function replayDownloads(workspaceDir, sessionID, downloads) {
+  const root = sessionCacheDirs(workspaceDir, sessionID).downloads;
+  // 单个产物被用户删除或替换不应阻断正文回放；只过滤失效项，其余已验证文件仍可返回。
+  return (Array.isArray(downloads) ? downloads : []).flatMap(download => {
+    const file = safeCacheFile(workspaceDir, root, download?.path);
+    return file ? [{ ...download, name: path.basename(file), path: file }] : [];
+  });
 }
 
 function completedReplayResult(entry, workspaceDir, sessionID, saveToFile) {
@@ -902,7 +924,7 @@ function completedReplayResult(entry, workspaceDir, sessionID, saveToFile) {
     response: saveToFile ? '' : raw.length > MAX_RETURN_CHARS
       ? `${previewResponse(raw)}\n\n[Repeated request recovered from the last completed local snapshot. Lines: ${savedResponse.lines}; Characters: ${savedResponse.chars}.]`
       : raw,
-    downloads: entry.completed.downloads || [],
+    downloads: replayDownloads(workspaceDir, sessionID, entry.completed.downloads),
     savedResponse,
     sessionID,
     status: 'completed',
@@ -920,59 +942,130 @@ function previewResponse(text) {
 // ─── Project Resolution ──────────────────────────────────────────────────────
 
 function resolveCachedProject(requested) {
-  // 启动热路径先读本地 projects.json；缓存命中时不打开首页、不展开侧边栏，直接进入固定 Project。
-  // 这不是安全边界，只是性能缓存；缓存缺失或失效时仍走 resolveProject 的 DOM 发现路径。
+  // 缓存不是身份真相：live discovery 失败后才读它，随后仍由 ensureProjectHome 验证并自修复。
   const value = String(requested || DEFAULT_PROJECT).trim();
   const direct = parseProjectRef(value);
   if (direct) return direct;
   const cached = readProjectCache().projects[normalizeProjectKey(value)];
   if (cached) {
-    // 缓存中的 URL 可能是旧的 /project(ChatGPT 改版前的设置页);
-    // 用 parseProjectRef 修正为 /c/new,确保导航到聊天页而非设置页。
-    const fixed = parseProjectRef(cached.url, cached.name);
+    // 缓存可能来自不同版本的 Project/会话 URL；重新解析可恢复 token 并规范化到当前 Project 首页。
+    const cachedName = cached.titleName || (cached.name !== cached.id && cached.name !== cached.token ? cached.name : null);
+    const fixed = parseProjectRef(cached.url, cachedName) || parseProjectRef(cached.token, cachedName);
     if (fixed) return fixed;
   }
-  return cached || null;
+  return null;
 }
 
 async function resolveProject(page, requested, log) {
-  // Project 解析先走显式值和缓存；只有缓存缺失才打开 ChatGPT 首页扫描，减少对易变 DOM 的依赖。
+  // 显式 URL/token 是部署者的确定选择；名称则优先读取当前登录账号，避免把另一台设备的缓存 ID 当真。
   const value = String(requested || DEFAULT_PROJECT).trim();
-  const cached = resolveCachedProject(value);
-  if (cached) {
-    cacheProject(cached);
-    return cached;
-  }
-  const key = normalizeProjectKey(value);
+  const direct = parseProjectRef(value);
 
   log(`Resolving ChatGPT project: ${value}`);
-  const discovered = (await CHATGPT_DOM.discoverProjects(page, log))
+  const discoveredRaw = await CHATGPT_DOM.discoverProjects(page, log).catch(err => {
+    if (err.code === 'PROJECT_AMBIGUOUS') throw err;
+    // localStorage/导航/frame 任一瞬态失败都不能截断侧边栏和缓存两级恢复。
+    log(`Live Project data discovery failed: ${err.message}`);
+    return [];
+  });
+  const discovered = discoveredRaw
     .map(project => parseProjectRef(project.href, project.name))
     .filter(Boolean)
     .filter((project, index, all) => all.findIndex(item => item.id === project.id) === index);
-  for (const project of discovered) cacheProject(project);
   log(`Resolved ChatGPT project candidates: ${discovered.map(project => `${project.name}=${project.id}`).join(', ') || 'none'}`);
-  const match = discovered.find(project =>
-    normalizeProjectKey(project.name) === key ||
-    project.key === key ||
-    project.id === value ||
-    project.token === value
-  );
-  if (match) return match;
+  const selected = selectDiscoveredProject(discovered, value, direct);
+  if (selected) {
+    cacheProject(selected);
+    return selected;
+  }
+
+  // localStorage/schema 漂移时，用可见侧边栏按项目名打开首页并读取实际 URL，不要求用户复制新链接。
+  const openedURL = await CHATGPT_DOM.openProjectHome(page, value, log).catch(err => {
+    if (err.code === 'PROJECT_AMBIGUOUS') throw err;
+    log(`Live Project sidebar recovery failed: ${err.message}`);
+    return null;
+  });
+  const opened = parseProjectRef(openedURL, value);
+  if (opened) {
+    cacheProject(opened);
+    return opened;
+  }
+
+  // 页面发现不可用时才使用本地缓存；后续 ensureProjectHome 仍会验证并尝试侧边栏自修复。
+  const cached = resolveCachedProject(value);
+  if (cached) return cached;
   throw new Error(`Could not find ChatGPT project "${value}". Set CHATGPT_PROJECT to a project name or URL.`);
+}
+
+async function ensureProjectHome(page, project, log) {
+  // visit 同时验证路由、composer、标题与 Chat 模式；单独一个 h1 或可输入框都不足以证明 Project 归属。
+  const visit = async candidate => {
+    if (!sameUrl(page.url(), candidate.url)) {
+      await page.goto(candidate.url, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+    }
+    // domcontentloaded 早于 React Project header/composer hydrate；轮询页面事实，不能用一次快照误判 URL 失效。
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline) {
+      // 显式 URL 没有可信 titleName 时允许读取网页真实 h1，但 Project id 仍必须严格匹配 pathname。
+      const state = await CHATGPT_DOM.projectHomeState(page, candidate.titleName).catch(() => null);
+      if (state && isProjectHomeUrlForProject(state.url, candidate) && state.composer && state.title) {
+        if (!state.chatActive || state.workActive) {
+          await CHATGPT_DOM.ensureChatMode(page, log).catch(() => {});
+          await sleep(200);
+          continue;
+        }
+        const name = state.titleName || candidate.titleName || candidate.name;
+        return { ...candidate, name, titleName: name, key: normalizeProjectKey(name || candidate.id) };
+      }
+      await sleep(250);
+    }
+    return null;
+  };
+  // 返回新对象而非修改入参：调用方可能还有正在生成的会话持有旧 Project 快照。
+  const valid = await visit(project);
+  if (valid) {
+    cacheProject(valid);
+    return valid;
+  }
+
+  // 缓存 URL/ID 失效时不把恢复责任推给用户：从当前账号侧边栏重新打开同名 Project。
+  log(`Project page validation failed for ${project.name}; rediscovering from live sidebar`);
+  const openedURL = project.titleName ? await CHATGPT_DOM.openProjectHome(page, project.titleName, log).catch(err => {
+    if (err.code === 'PROJECT_AMBIGUOUS') throw err;
+    log(`Project page self-recovery failed: ${err.message}`);
+    return null;
+  }) : null;
+  if (openedURL) {
+    const refreshed = parseProjectRef(openedURL, project.titleName) || { ...project, url: openedURL };
+    const recovered = await visit(refreshed);
+    if (recovered) {
+      cacheProject(recovered);
+      return recovered;
+    }
+  }
+  throw new Error(`ChatGPT Project "${project.name}" could not be opened in Chat mode after automatic rediscovery.`);
 }
 
 // ─── Response Persistence And Recovery ───────────────────────────────────────
 
-async function rememberCurrentSessionUrl(page, project, sessionID, log, timeout = 20_000) {
+async function rememberCurrentSessionUrl(page, project, sessionID, log, timeout = 20_000, allowPlain = false, expectedSessionUrl = null) {
+  // 不变量一：新会话只接受首个严格 Project conversation，旧会话只接受原 conversation。
+  // 不变量二：检测到“另一条合法 conversation”应立即失败，不能靠等待或重写 registry 自愈。
+  // 不变量三：只有 URL 验证通过后才写 session entry，页面标题和 Project 文案都不能代替身份。
   // 提交后尽早记录 /c/... URL；即使后续长回答超时，用户仍可用同一个 #id 回到远端生成中的页面。
+  // 一旦出现归属不符的 conversation 就立即返回失败，因为继续轮询不能把已创建的远端会话迁回 Project。
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
     const url = page.url();
-    if (isChatSessionUrlForProject(url, project)) {
+    const valid = expectedSessionUrl
+      ? isSameConversationUrl(url, expectedSessionUrl, project, { allowPlain })
+      : isChatSessionUrlForProject(url, project, { allowPlain });
+    if (valid) {
       writeSessionEntry(sessionID, project, url);
       return url;
     }
+    // 已进入某条 conversation 但归属不符时不会再靠等待变正确；立即失败，避免多占 20 秒预算。
+    if (conversationFromUrl(url)) return null;
     await sleep(500);
   }
   log(`Could not record conversation URL for ${sessionID}; current=${page.url()}`);
@@ -1006,23 +1099,47 @@ function buildResponseResult(raw, workspaceDir, sessionID, options = {}) {
   };
 }
 
+function requireCurrentConversation(page, expectedSessionUrl, project, allowPlainUrl, sessionID, phase, promptSent) {
+  const url = page.url();
+  const valid = expectedSessionUrl
+    ? isSameConversationUrl(url, expectedSessionUrl, project, { allowPlain: allowPlainUrl === true })
+    : isChatSessionUrlForProject(url, project, { allowPlain: allowPlainUrl === true });
+  if (valid) return url;
+  if (promptSent) markSessionLost(sessionID, project, `ChatGPT page left the recorded conversation during ${phase}.`);
+  throw new Error(`Session ${sessionID} left its recorded ChatGPT conversation during ${phase}; no foreign text or artifacts were collected.`);
+}
+
 /**
  * 持久化一次 assistant 状态，并同步 session 的 pending 标记。
  *
  * completed 才收集 sandbox/native-image 产物；generating 只保存文本快照。这个分界很重要：
  * 如果在远端工具调用未结束时强行点下载按钮，容易把半成品或旧文件误当成本次结果。
  */
-async function persistAssistantResult({ page, project, workspaceDir, sessionID, raw, status, saveToFile, promptSent, requestHash, allowPlainUrl, notice, saveLabel, finalUrl, forceSave, forcePreview, shouldCancel = () => false, beforeState = null, log }) {
+async function persistAssistantResult({ page, project, workspaceDir, sessionID, raw, status, saveToFile, promptSent, requestHash, allowPlainUrl, expectedSessionUrl = null, notice, saveLabel, finalUrl, forceSave, forcePreview, shouldCancel = () => false, beforeState = null, log }) {
+  // 持久化顺序不可交换：先验证 conversation，再创建 cache、抽取 artifact，最后更新 pending/completed。
+  // 这样用户在回答等待期间手动切页时，不会把另一会话的文本、引用或文件写入当前 #sessionID。
+  // completed 与 generating 共用同一 URL 边界；“回答已完成”不能绕过身份检查。
+  // beforeState 保存发送前图片集合，它既用于本轮去重，也必须随 pending/completed 跨断连保存。
+  // 文本抽取和 artifact 点击同样属于会话归属边界；页面被手动切换后不能把另一 conversation 的结果写入本句柄。
+  finalUrl = requireCurrentConversation(page, expectedSessionUrl, project, allowPlainUrl, sessionID, 'response persistence', promptSent);
   const dirs = sessionCacheDirs(workspaceDir, sessionID);
   ensureWorkspaceCacheDir(workspaceDir, dirs.downloads);
 
   // artifact 下载会修改浏览器下载目录，因此只在最终态触发；生成中只保留文本和 pending 元数据。
   let artifactNotice = null;
+  const pageChanged = () => expectedSessionUrl
+    ? !isSameConversationUrl(page.url(), expectedSessionUrl, project, { allowPlain: allowPlainUrl === true })
+    : !isChatSessionUrlForProject(page.url(), project, { allowPlain: allowPlainUrl === true });
   const artifactSkipped = status === 'completed' && shouldCancel();
   // 已完成但调用方断连时不清 pending：下次 recovery 还应有机会收集 sandbox/native-image 产物。
   const artifactResult = status === 'completed' && !artifactSkipped
-    ? await CHATGPT_DOM.collectArtifacts(page, dirs.downloads, log, shouldCancel, beforeState).catch(err => ({ downloads: [], notices: [`Artifact collection failed: ${err.message}`] }))
+    ? await CHATGPT_DOM.collectArtifacts(page, dirs.downloads, log, () => shouldCancel() || pageChanged(), beforeState).catch(err => ({ downloads: [], notices: [`Artifact collection failed: ${err.message}`] }))
     : { downloads: [], notices: shouldCancel() ? ['Artifact collection skipped because caller disconnected.'] : [] };
+  finalUrl = requireCurrentConversation(page, expectedSessionUrl, project, allowPlainUrl, sessionID, 'artifact collection', promptSent);
+  const completedNativeImageURLs = status === 'completed'
+    ? (await CHATGPT_DOM.state(page).catch(() => null))?.nativeImageURLs || beforeState?.nativeImageURLs || []
+    : beforeState?.nativeImageURLs || [];
+  requireCurrentConversation(page, expectedSessionUrl, project, allowPlainUrl, sessionID, 'artifact snapshot', promptSent);
   const downloads = artifactResult.downloads || [];
   artifactNotice = (artifactResult.notices || []).join('\n') || null;
   // 某些 ChatGPT tool/mode 会生成空 assistant turn：页面已无 stop，但没有文本/文件。
@@ -1052,23 +1169,21 @@ async function persistAssistantResult({ page, project, workspaceDir, sessionID, 
       : null;
   }
 
-  if (isChatSessionUrlForProject(finalUrl, project, { allowPlain: promptSent || allowPlainUrl })) {
-    if (resolvedStatus === 'generating') markSessionPending(sessionID, project, finalUrl, result.savedResponse, { nativeImageURLs: beforeState?.nativeImageURLs });
-    else markSessionCompleted(
-      sessionID,
-      project,
-      finalUrl,
-      requestHash,
-      result.savedResponse || (raw
-        ? saveResponseToFile(raw, workspaceDir, sessionID)
-        : downloads.length > 0
-          ? saveResponseToFile(['Assistant artifact saved locally.', ...downloads.map(file => `- ${file.name}: ${file.path}`)].join('\n'), workspaceDir, sessionID)
-          : null),
-      downloads,
-    );
-  } else if (promptSent) {
-    markSessionLost(sessionID, project, 'Prompt may have been submitted, but no conversation URL was recorded.');
-  }
+  // plain /c/... 只服务已持久化的历史会话；新 session 必须保留 Project 路径，不能仅凭 project 字段伪装归属。
+  if (resolvedStatus === 'generating') markSessionPending(sessionID, project, finalUrl, result.savedResponse, { nativeImageURLs: beforeState?.nativeImageURLs, beforeState });
+  else markSessionCompleted(
+    sessionID,
+    project,
+    finalUrl,
+    requestHash,
+    result.savedResponse || (raw
+      ? saveResponseToFile(raw, workspaceDir, sessionID)
+      : downloads.length > 0
+        ? saveResponseToFile(['Assistant artifact saved locally.', ...downloads.map(file => `- ${file.name}: ${file.path}`)].join('\n'), workspaceDir, sessionID)
+        : null),
+    downloads,
+    completedNativeImageURLs,
+  );
 
   return result;
 }
@@ -1080,16 +1195,31 @@ async function persistAssistantResult({ page, project, workspaceDir, sessionID, 
  * 明确返回 `promptSent:false`。调用方传进来的新 prompt 在这里不会进入 ChatGPT 页面。
  */
 async function recoverCurrentAssistant(page, workspaceDir, sessionID, project, session, reason, log) {
+  const allowPlainUrl = !projectIdFromUrl(session.url);
+  requireCurrentConversation(page, session.url, project, allowPlainUrl, sessionID, 'pending recovery', false);
   await CHATGPT_DOM.focus(page);
+  requireCurrentConversation(page, session.url, project, allowPlainUrl, sessionID, 'pending recovery focus', false);
   const state = await CHATGPT_DOM.state(page);
-  const unansweredUserMessage = state.userCount > state.count;
-  const completedImageOnlyTurn = state.nativeImageCount > 0 && !state.generating && !state.placeholder;
-  const completedEmptyAssistantTurn = state.emptyAssistantTurn && !state.generating && !state.placeholder;
+  const baseline = session?.pending?.beforeState;
+  const hasBaseline = Number.isFinite(baseline?.count) && Number.isFinite(baseline?.userCount);
+  const userAdvanced = !hasBaseline || state.userCount > baseline.userCount;
+  const assistantAdvanced = !hasBaseline || state.count > baseline.count;
+  const oldImages = new Set(Array.isArray(session?.pending?.nativeImageURLs) ? session.pending.nativeImageURLs : []);
+  const imageAdvanced = (state.nativeImageURLs || []).some(url => !oldImages.has(url));
+  const completedImageOnlyTurn = imageAdvanced && !state.generating && !state.placeholder;
+  // 空 turn 不增加 assistant role 数量；conversation turn 数量才可区分连续两轮相同的“ChatGPT 说：”。
+  const emptyTurnAdvanced = state.emptyAssistantTurn && (Number.isFinite(baseline?.turnCount) ? state.turnCount > baseline.turnCount : assistantAdvanced);
+  const completedEmptyAssistantTurn = emptyTurnAdvanced && !state.generating && !state.placeholder;
+  const unansweredUserMessage = state.userCount > state.count && !completedImageOnlyTurn && !completedEmptyAssistantTurn;
+  // 有基线的 marker 必须同时看到本轮 user turn 和新的 assistant/image/empty turn；旧 DOM 不能完成新 prompt。
+  const responseAdvanced = !hasBaseline || userAdvanced && (assistantAdvanced || completedImageOnlyTurn || completedEmptyAssistantTurn);
   // 有未回答 user 消息时，lastText 属于上一轮 assistant；不能把旧回答当成本轮 recovery 结果。
-  const raw = !unansweredUserMessage && state.lastText
+  const raw = responseAdvanced && !unansweredUserMessage && state.lastText
     ? await CHATGPT_DOM.extractAssistant(page).catch(() => state.lastText)
     : '';
-  const status = completedImageOnlyTurn || completedEmptyAssistantTurn ? 'completed' : state.generating || state.placeholder || unansweredUserMessage ? 'generating' : 'completed';
+  const status = responseAdvanced && (raw || completedImageOnlyTurn || completedEmptyAssistantTurn) && !state.generating && !state.placeholder && !unansweredUserMessage
+    ? 'completed'
+    : 'generating';
   const result = await persistAssistantResult({
     page,
     project,
@@ -1098,11 +1228,15 @@ async function recoverCurrentAssistant(page, workspaceDir, sessionID, project, s
     raw,
     status,
     finalUrl: state.url,
+    expectedSessionUrl: session?.url || null,
     promptSent: false,
-    allowPlainUrl: true,
+    allowPlainUrl,
     forceSave: !!raw,
     forcePreview: !!raw,
-    beforeState: { nativeImageURLs: Array.isArray(session?.pending?.nativeImageURLs) ? session.pending.nativeImageURLs : [] },
+    beforeState: {
+      ...(session?.pending?.beforeState || {}),
+      nativeImageURLs: Array.isArray(session?.pending?.nativeImageURLs) ? session.pending.nativeImageURLs : [],
+    },
     log,
     saveLabel: status === 'generating'
       ? 'Current partial assistant response saved locally before returning to OpenCode'
@@ -1123,6 +1257,11 @@ async function recoverCurrentAssistant(page, workspaceDir, sessionID, project, s
  * HTTP handler 只需要调用 withSession/runAsk。这样并发规则不会散落到 DOM adapter 或 MCP wrapper。
  */
 function createDaemonRuntime({ browser, bootstrapPage, project }) {
+  // 三种锁承担不同职责：sessionLocks 保护单 composer，conversationCreateQueue 保护新路由，pageCreateQueue 保护容量。
+  // 它们不能合并成全局串行锁，否则不同 session 的长回答会互相阻塞，失去并发价值。
+  // 锁 promise 无论 fulfilled/rejected 都必须推进后继；一次页面或网络错误不能永久毒化队列。
+  // runtime Project 使用引用替换，ask 在入口捕获快照；恢复新 ID 时在途请求仍按旧身份完成。
+  // page retention 直接读取 registry pending，不用当前 Project 重新解释旧会话，避免身份更新后误关页面。
   // Runtime 是 daemon 的深模块：外部只看到 pageFor/withSession/waitForResponse/status。
   // 这里集中维护并发不变量，避免 HTTP handler、CLI、等待逻辑各自管理一套锁。
   const sessionPages = new Map();
@@ -1130,22 +1269,19 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
   // voice fallback 活跃时 ask 的 foregroundPulse 跳过,避免抢前台干扰听写 UI;
   // 用对象持有避免闭包变量与 runtime 属性不匹配(flags 对象被两侧闭包共享)。
   const flags = { voiceFallbackActive: false };
+  // Project 更新采用对象替换而不是原地修改；每个 ask 捕获自己的快照，避免自修复污染并发中的旧会话。
+  // 对象冻结保护“运行中 ask 的身份不可变”；更新只通过 updateProject 原子替换引用。
+  let currentProject = Object.freeze({ ...project });
   let conversationCreateQueue = Promise.resolve();
   let pageCreateQueue = Promise.resolve();
   let voiceLock = Promise.resolve();
   let sparePage = bootstrapPage;
-  // voice 转写页持久化复用：direct path 只需 chatgpt.com 同源 cookie，不需要每次新建 tab + 导航项目页。
-  // 持久化后首次转写 ~5s（含 goto），后续转写只需 ~2s（纯 API 调用）。
+  // voice 转写页持久化复用，但一旦认领就从 spare pool 移除，永远不会再交给 ask。
   let persistentVoicePage = null;
-  // 页面创建时间：超过 VOICE_PAGE_MAX_AGE_MS 后主动重建，不等健康检查失败。
-  // 主动重建比被动检测更快（跳过 5s 健康检查 + 3s 关闭 = 省 8s），且防止退化累积。
   let voicePageCreatedAt = 0;
-  // 标记转写失败过的页面，TTL 5 分钟后允许重新测试（证据：页面自愈约 3 分钟）。
-  // 避免坏页面被反复复用导致连续超时；TTL 到期后 fetch 探测会重新验证页面健康度。
-  const badVoicePages = new Map();
 
   // pending 会话仍可能承载远端生成 DOM；registry 防重发，tab 保留则服务后续 artifact/text recovery。
-  const pageCanBeClosed = id => !sessionLocks.has(id) && !isPendingFresh(readSessionEntry(id, project)?.pending);
+  const pageCanBeClosed = id => !sessionLocks.has(id) && !isPendingFresh(readSessionIndex().sessions[id]?.pending);
 
   function assertBrowserConnected() {
     // browser 是 daemon 的核心资源；用户手动关掉窗口后继续复用 page handle 只会得到 Puppeteer 协议错误。
@@ -1173,15 +1309,40 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
   };
 
   async function createSessionPage() {
-    if (!await closeIdlePageIfNeeded()) throw new Error(`Maximum active ChatGPT session pages reached (${MAX_SESSION_PAGES}); recover or wait for one pending session first: ${[...sessionPages.keys()].filter(id => isPendingFresh(readSessionEntry(id, project)?.pending)).join(', ') || 'none'}`);
+    if (!await closeIdlePageIfNeeded()) throw new Error(`Maximum active ChatGPT session pages reached (${MAX_SESSION_PAGES}); recover or wait for one pending session first: ${[...sessionPages.keys()].filter(id => isPendingFresh(readSessionIndex().sessions[id]?.pending)).join(', ') || 'none'}`);
     return browser.newPage();
   }
 
+  async function claimVoicePage() {
+    const previous = pageCreateQueue;
+    let release;
+    // 与 pageFor 共用 allocation queue，保证 bootstrap/spare 在并发 ask 与 voice 之间只会被认领一次。
+    pageCreateQueue = new Promise(resolve => { release = resolve; });
+    await previous;
+    try {
+      // persistent 页只属于 voice，不在 sessionPages 中；健康页可跨多次 Alt+V 复用以避免重复导航。
+      if (persistentVoicePage && !persistentVoicePage.isClosed()) return persistentVoicePage;
+      const page = sparePage && !sparePage.isClosed() ? sparePage : await browser.newPage();
+      // 清空 spare 必须和选择发生在同一临界区，否则 pageFor 会在 await 间隙拿到同一个引用。
+      if (page === sparePage) sparePage = null;
+      persistentVoicePage = page;
+      voicePageCreatedAt = Date.now();
+      return page;
+    } finally {
+      release();
+    }
+  }
+
   return {
-    project,
+    get project() { return currentProject; },
+    updateProject(next) {
+      // 仅后续 runAsk 会读取新对象，已经捕获旧对象的 finish/recovery 不会跨 Project 落盘。
+      currentProject = Object.freeze({ ...next });
+      return currentProject;
+    },
     status() {
       const pages = [...sessionPages.keys()];
-      const pendingPages = pages.filter(id => isPendingFresh(readSessionEntry(id, project)?.pending));
+      const pendingPages = pages.filter(id => isPendingFresh(readSessionIndex().sessions[id]?.pending));
       // status 默认只给数量，不泄露 #sessionID；调试句柄需要显式打开环境变量。
       return {
         // browserConnected 区分“Node daemon 还活着”和“可继续驱动 ChatGPT 页面”；status 仍只读，不触发重启。
@@ -1226,62 +1387,38 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
       }
     },
     async voicePage() {
-      // direct path 只需 chatgpt.com 同源 cookie 做 fetch；不需要专用页面、项目页或 composer。
-      // 优先复用 daemon 已打开的任意 chatgpt.com 页面，零创建零导航零切换。
+      // direct/fallback 都只使用专属 voice page；不能借 session page，否则并发 ask 会导航或改写同一 composer。
       assertBrowserConnected();
-      // 主动重建：页面超过年龄限制直接关闭重建，不等健康检查失败。
-      // 比被动检测快（省 5s 健康检查 + 3s 关闭 = 8s），且防止退化累积导致转写挂起。
       if (persistentVoicePage && voicePageCreatedAt && Date.now() - voicePageCreatedAt > VOICE_PAGE_MAX_AGE_MS) {
         await withTimeout(persistentVoicePage.close(), 3_000, 'close aged voice page').catch(() => {});
         persistentVoicePage = null;
         voicePageCreatedAt = 0;
       }
-      // 清理过期的坏页面标记：页面自愈约 3 分钟，TTL 5 分钟后允许重新测试
-      const now = Date.now();
-      for (const [page, expiresAt] of badVoicePages) {
-        if (now >= expiresAt || page.isClosed()) badVoicePages.delete(page);
-      }
-      // M2: 限制候选数量防止最坏情况超时；session pages 不检查（ask 可能在用，且 persistentVoicePage 通常可用）
-      const candidates = [
-        persistentVoicePage,
-        sparePage,
-      ].filter(page => page && !page.isClosed() && !badVoicePages.has(page) && /^https:\/\/chatgpt\.com/i.test(page.url()));
-      // 健康检查：用 fetch 探测替代 evaluate(() => true)。
-      // evaluate(() => true) 只验证 JS 上下文存活，无法检测 fetch 被 Service Worker 挂起的退化。
-      // fetch 探测直接测试 voice 转写使用的同源网络路径；页面侧 AbortController(4s)
-      // 确保即使 SW 卡住也不会在页面侧遗留悬挂请求（M1）。
-      // /api/auth/session 在健康页面上 <1s 响应；5s 超时足够覆盖慢网络。
-      for (const candidate of candidates) {
+      let lastError;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const candidate = await claimVoicePage();
         try {
-          await withTimeout(
-            candidate.evaluate(() => {
-              const controller = new AbortController();
-              const timer = setTimeout(() => controller.abort(), 4_000);
-              return fetch('/api/auth/session', { credentials: 'include', signal: controller.signal })
-                .then(r => r.status)
-                .finally(() => clearTimeout(timer));
-            }),
-            5_000,
-            'voice page health check'
-          );
-          return candidate;
-        } catch {
-          // 健康检查失败：标记为坏页面（5 分钟 TTL），关闭 persistentVoicePage
-          badVoicePages.set(candidate, Date.now() + 300_000);
-          if (candidate === persistentVoicePage) {
-            persistentVoicePage = null;
-            await withTimeout(candidate.close(), 3_000, 'close degraded voice page').catch(() => {});
-          } else if (candidate === sparePage) {
-            // sparePage 不关闭：pageFor() 发现 sparePage=null 会创建新页面；stale cleanup 处理孤儿
-            sparePage = null;
+          if (!isOfficialChatGPTURL(candidate.url())) {
+            await candidate.goto(CHATGPT_URL, { waitUntil: 'domcontentloaded', timeout: 15_000 });
           }
+          // 直接探测 voice fast path 依赖的同源 session fetch；普通 evaluate 存活不能发现已挂起的网络上下文。
+          await withTimeout(candidate.evaluate(() => {
+            if (location.origin !== 'https://chatgpt.com') throw new Error('Voice page left the official ChatGPT origin');
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 4_000);
+            return fetch('/api/auth/session', { credentials: 'include', signal: controller.signal })
+              .then(response => response.status)
+              .finally(() => clearTimeout(timer));
+          }), 5_000, 'voice page health check');
+          return candidate;
+        } catch (err) {
+          lastError = err;
+          if (candidate === persistentVoicePage) persistentVoicePage = null;
+          voicePageCreatedAt = 0;
+          await withTimeout(candidate.close(), 3_000, 'close degraded voice page').catch(() => {});
         }
       }
-      // 没有已在 chatgpt.com 上的可用页面时才新建，并导航到 chatgpt.com 首页（非项目页，加载更快）。
-      persistentVoicePage = await browser.newPage();
-      await persistentVoicePage.goto(CHATGPT_URL, { waitUntil: 'domcontentloaded', timeout: 15_000 });
-      voicePageCreatedAt = Date.now();
-      return persistentVoicePage;
+      throw lastError || new Error('Could not allocate a healthy ChatGPT voice page');
     },
     withSession(sessionID, task) {
       // 同一会话串行；不同会话可以并发。这个 seam 是 daemon 并发语义的唯一入口。
@@ -1321,18 +1458,17 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
     managedPages() {
       return [...sessionPages.values(), persistentVoicePage].filter(p => p && !p.isClosed());
     },
-    // 转写失败时标记页面为坏（5 分钟 TTL），关闭 persistentVoicePage。
+    // 转写失败后立即撤销 voice 所有权并关闭页面；下次调用只会认领/创建另一个干净页面。
     // 健康检查无法检测所有退化模式（如健康检查通过后转写期间才发生的退化），
     // 此方法作为兜底：失败后不再复用该页面，下次 voicePage() 会创建新页面。
     invalidateVoicePage(page) {
-      badVoicePages.set(page, Date.now() + 300_000);
       if (page === persistentVoicePage) {
         persistentVoicePage = null;
+        voicePageCreatedAt = 0;
         withTimeout(page.close(), 3_000, 'close failed voice page').catch(() => {});
       } else if (page === sparePage) {
         sparePage = null;
       }
-      // sessionPages 不再作为 voice 候选（fetch 健康检查可能干扰 ask），无需处理
     },
     // voice fallback 开始/结束标志:控制 ask 的 foregroundPulse 是否跳过。
     // fallback 需要独占前台(听写 UI 依赖 rAF);direct path 不调用这些方法(不需要前台)。
@@ -1383,37 +1519,45 @@ async function runVoiceTranscribe(runtime, input, log, shouldCancel = () => fals
  * session 并发由 runtime.withSession 保证。
  */
 async function runAsk(runtime, input, sessionID, log, shouldCancel = () => false) {
+  // 新会话与续聊在这里分叉：前者允许建立一个 conversation ID，后者从一开始就固定已有 ID。
+  // pending/completed 检查发生在任何新 prompt 填充之前，保证恢复调用绝不会偷偷追加 user turn。
+  // 本函数只持有本轮 Project 快照；runtime 后续更新不应改变 finishAsk 的验证与落盘参数。
+  // 所有可能发送的路径都经过 submitAsk，避免某个 mode/upload 分支漏掉发送前身份复核。
   const page = await runtime.pageFor(sessionID);
   const files = normalizePathList(input.uploadPaths || input.uploadPath);
   const workspaceDir = input.workspaceDir || process.cwd();
   const hash = requestHash(input.fullPrompt, files, input.mode, input.imageAspectRatio);
   const index = readSessionIndex();
-  let session = readSessionEntry(sessionID, runtime.project);
+  // 续聊绑定 registry 中的 Project 快照；daemon 自修复到同名新 ID 时也不能改写已存在会话的归属。
+  // 新会话才读取 runtime 当前身份，这条分界同时保护并发中的旧回答和之后创建的新对话。
+  let project = input.newSession ? runtime.project : projectForSessionEntry(index.sessions[sessionID], runtime.project);
+  let session = readSessionEntry(sessionID, project);
   if (input.newSession && session) throw new Error(`sessionID collision for ${sessionID}; retry the request`);
   // registry 曾损坏时只拒绝“找不到记录的旧 #id”；恢复后新建并已登记的 session 仍可正常续聊。
   if (!session && !input.newSession && index.corruptBackup) throw new Error(`Session registry was recovered from corrupt state at ${index.corruptBackup}; this unknown sessionID cannot be recovered safely. Start a new sessionID.`);
   if (!session && !input.newSession) throw new Error(`Unknown sessionID ${sessionID}; start a new sessionID for a deliberate new conversation.`);
-  if (session?.lost && isChatSessionUrlForProject(page.url(), runtime.project)) {
-    writeSessionEntry(sessionID, runtime.project, page.url());
-    session = readSessionEntry(sessionID, runtime.project);
-  }
+  // lost 没有可信 conversation ID，不能用当前 tab 的任意同 Project 会话“复活”；这会静默串到历史对话。
   if (session?.lost) throw new Error(`Session ${sessionID} previously sent a prompt but lost its conversation URL; cannot safely send another prompt. Start a new sessionID.`);
   log(`ask: sessionID=${sessionID} mode=${input.mode || 'auto'} imageAspectRatio=${input.imageAspectRatio || 'default'} saveToFile=${!!input.saveToFile} uploads=${files.length || 'none'} workspace=${workspaceDir} len=${input.fullPrompt.length}`);
 
   if (!session) {
-    const beforeState = await runtime.withNewConversationLock(async () => {
-      await restoreSessionPage(page, runtime.project, null, sessionID, log);
-      return submitAsk(page, input.fullPrompt, files, workspaceDir, input.mode, input.imageAspectRatio, sessionID, runtime.project, log, shouldCancel);
+    const submission = await runtime.withNewConversationLock(async () => {
+      project = await restoreSessionPage(page, project, null, sessionID, log);
+      runtime.updateProject(project);
+      return submitAsk(page, input.fullPrompt, files, workspaceDir, input.mode, input.imageAspectRatio, sessionID, project, false, null, log, shouldCancel);
     });
     log('Prompt sent, waiting for response...');
     return finishAsk({
       page,
       runtime,
-      beforeState,
+      project,
+      beforeState: submission.beforeState,
+      expectedSessionUrl: submission.conversationUrl,
       sessionID,
       workspaceDir,
       saveToFile: input.saveToFile,
       requestHash: hash,
+      allowPlainUrl: false,
       slow: files.length > 0 || input.fullPrompt.length > 2_000,
       shouldCancel,
       log,
@@ -1421,7 +1565,16 @@ async function runAsk(runtime, input, sessionID, log, shouldCancel = () => false
   }
 
   const execute = async () => {
-    await restoreSessionPage(page, runtime.project, session, sessionID, log);
+    await restoreSessionPage(page, project, session, sessionID, log);
+    if (session?.pending?.completedUndelivered && session.completed) {
+      // HTTP 已断开但 runAsk 已完整落盘时，直接重放原 snapshot/产物；重新扫 DOM 会过滤图片并覆盖下载元数据。
+      const replay = completedReplayResult(session, workspaceDir, sessionID, input.saveToFile);
+      if (replay) {
+        clearSessionPending(sessionID, project, session.url);
+        replay.notice = 'Previous request completed after its client disconnected; recovered the saved result without sending this prompt.';
+        return replay;
+      }
+    }
     const currentState = await CHATGPT_DOM.state(page);
     const unansweredUserMessage = currentState.userCount > currentState.count;
     // pending TTL 不是“直接允许重发”的开关：fresh 一律恢复；stale 只有在页面已经没有可恢复 DOM 时才清理。
@@ -1429,12 +1582,12 @@ async function runAsk(runtime, input, sessionID, log, shouldCancel = () => false
     const freshPending = session?.pending && isPendingFresh(session.pending);
     if (freshPending || (session?.pending && (currentState.generating || unansweredUserMessage || currentState.lastText)) || (session && (currentState.generating || unansweredUserMessage))) {
       // 已有未完成状态时，本次输入被当作“恢复请求”，不会写入 ChatGPT 页面。
-      return recoverCurrentAssistant(page, workspaceDir, sessionID, runtime.project, session, recoveryReason(sessionID, currentState, unansweredUserMessage, session), log);
+      return recoverCurrentAssistant(page, workspaceDir, sessionID, project, session, recoveryReason(sessionID, currentState, unansweredUserMessage, session), log);
     }
     if (session?.pending) {
       log(`Clearing stale pending marker for ${sessionID}; no recoverable DOM state is visible`);
-      clearSessionPending(sessionID, runtime.project, session.url);
-      session = readSessionEntry(sessionID, runtime.project);
+      clearSessionPending(sessionID, project, session.url);
+      session = readSessionEntry(sessionID, project);
     }
     if (isCompletedFresh(session?.completed, hash)) {
       const replay = completedReplayResult(session, workspaceDir, sessionID, input.saveToFile);
@@ -1442,17 +1595,22 @@ async function runAsk(runtime, input, sessionID, log, shouldCancel = () => false
       log(`Completed replay snapshot for ${sessionID} is missing; accepting the prompt as a deliberate new turn`);
     }
 
-    const beforeState = await submitAsk(page, input.fullPrompt, files, workspaceDir, input.mode, input.imageAspectRatio, sessionID, runtime.project, log, shouldCancel);
+    const allowPlainUrl = !projectIdFromUrl(session.url);
+    const submission = await submitAsk(page, input.fullPrompt, files, workspaceDir, input.mode, input.imageAspectRatio, sessionID, project, allowPlainUrl, session.url, log, shouldCancel);
     log('Prompt sent, waiting for response...');
 
     return finishAsk({
       page,
       runtime,
-      beforeState,
+      project,
+      beforeState: submission.beforeState,
+      expectedSessionUrl: submission.conversationUrl,
       sessionID,
       workspaceDir,
       saveToFile: input.saveToFile,
       requestHash: hash,
+      // 仅持久化 URL 本来就是 plain 的历史记录继续兼容；Project-scoped 会话不能在后续 turn 逃逸。
+      allowPlainUrl,
       slow: files.length > 0 || input.fullPrompt.length > 2_000,
       shouldCancel,
       log,
@@ -1463,22 +1621,30 @@ async function runAsk(runtime, input, sessionID, log, shouldCancel = () => false
 }
 
 async function restoreSessionPage(page, project, session, sessionID, log) {
-  const targetUrl = session?.url || project.url;
-  if (sameUrl(page.url(), targetUrl)) return;
-  // 新会话:当前页已在本项目(/g/{token}/c/)且无消息(干净对话)——复用,避免创建多余对话。
-  // 先 bringToFront+500ms 让虚拟化的消息 hydrate,避免后台 tab count=0 假阳性。
-  if (!session && page.url().includes(`/g/${project.token}/c/`)) {
-    await page.bringToFront().catch(() => {});
-    await sleep(500);
-    const reusable = await page.evaluate(() =>
-      !!document.querySelector('#prompt-textarea') &&
-      document.querySelectorAll('[data-message-author-role]').length === 0
-    ).catch(() => false);
-    if (reusable) { log(`Reusing current page for new session ${sessionID}`); return; }
+  // 新会话恢复的是 Project 首页；已有会话恢复的是 registry 记录的精确 conversation，两者不能互换。
+  // 目标 URL 在 goto 前先过 origin/Project policy，防止损坏 registry 产生一次危险的跨域导航。
+  // goto 后再验证一次是为了捕获删除、权限变化、登录漂移造成的服务器或 SPA 重定向。
+  // slug 可以变化，但 conversation ID 与 Project ID 必须保持；plain 历史会话也必须保持同一个 ID。
+  if (!session) {
+    log(`Starting session ${sessionID} in ${project.name}`);
+    return ensureProjectHome(page, project, log);
   }
-  log(session ? `Restoring session ${sessionID}` : `Starting session ${sessionID} in ${project.name}`);
+  const targetUrl = session.url;
+  const allowPlain = !projectIdFromUrl(targetUrl);
+  // 先验证 registry 目标再导航，阻止损坏状态把受控浏览器带到伪造 ChatGPT DOM 的第三方 origin。
+  if (!isChatSessionUrlForProject(targetUrl, project, { allowPlain })) {
+    throw new Error(`Session ${sessionID} has an invalid or foreign conversation URL; no navigation or prompt was attempted.`);
+  }
+  if (isSameConversationUrl(page.url(), targetUrl, project, { allowPlain })) return project;
+  log(`Restoring session ${sessionID}`);
   // ChatGPT 页面会长期保持流式/预取连接；等待 networkidle 容易误判超时，composer 自己再等具体 selector。
   await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+  // 被删会话、权限变化和登录漂移都会重定向；恢复失败必须在 composer 填充之前终止。
+  await sleep(500);
+  if (!isSameConversationUrl(page.url(), targetUrl, project, { allowPlain })) {
+    throw new Error(`Session ${sessionID} was redirected away from its registered ChatGPT conversation; no prompt was sent.`);
+  }
+  return project;
 }
 
 function recoveryReason(sessionID, state, unansweredUserMessage, session) {
@@ -1488,43 +1654,72 @@ function recoveryReason(sessionID, state, unansweredUserMessage, session) {
   return `session ${sessionID} is not ready for a new prompt`;
 }
 
-async function submitAsk(page, fullPrompt, files, workspaceDir, mode, imageAspectRatio, sessionID, project, log, shouldCancel) {
-  let beforeState;
-  try {
-    beforeState = await CHATGPT_DOM.submit(page, fullPrompt, files, workspaceDir, mode, imageAspectRatio, log, shouldCancel, () => markSessionLost(sessionID, project, 'Prompt send click started but no conversation URL has been recorded yet.'));
-  } catch (err) {
-    if (err.promptMayHaveBeenSent) markSessionLost(sessionID, project, `Prompt may have been submitted while clickSend failed: ${err.message}`);
-    throw err;
-  }
+async function submitAsk(page, fullPrompt, files, workspaceDir, mode, imageAspectRatio, sessionID, project, allowPlainUrl, expectedSessionUrl, log, shouldCancel) {
+  // beforeSend 是远端副作用的最后门：它在可信点击前同步验证当前页，失败时不会触发 click。
+  // 点击开始先写 lost/pending 防重发标记；取得可信 conversation URL 后再把句柄升级为可恢复状态。
+  // 新会话没有 expectedSessionUrl，因此允许记录首个 Project conversation；续聊必须精确匹配旧 URL。
+  // URL 记录失败代表 prompt 可能已发出，只能显式失败并阻止复用，不能向上层伪装 completed。
+  const beforeState = await CHATGPT_DOM.submit(page, fullPrompt, files, workspaceDir, mode, imageAspectRatio, log, shouldCancel, baseline => {
+    // 最后一刻再次验证页面归属；等待上传期间发生重定向时，可信点击绝不能落到错误页面。
+    const valid = expectedSessionUrl
+      ? isSameConversationUrl(page.url(), expectedSessionUrl, project, { allowPlain: allowPlainUrl })
+      : isProjectHomeUrlForProject(page.url(), project);
+    if (!valid) throw new Error(`ChatGPT page left the expected ${expectedSessionUrl ? 'conversation' : 'Project home'} before send; no prompt was sent.`);
+    markSessionLost(sessionID, project, 'Prompt send click started but no conversation URL has been recorded yet.', { beforeState: baseline });
+  });
   // 先记住 /c/...，再进入长等待；等待超时也能通过 registry 找回远端会话。
-  await rememberCurrentSessionUrl(page, project, sessionID, log);
-  return beforeState;
+  const recorded = await rememberCurrentSessionUrl(page, project, sessionID, log, 20_000, allowPlainUrl, expectedSessionUrl);
+  if (!recorded) {
+    // click 已发生但严格 URL 未出现：保留 lost 墓碑并显式失败，不能把 Project 外回答包装成 completed。
+    const error = new Error(`Prompt was submitted, but ChatGPT did not expose the expected ${allowPlainUrl ? 'conversation' : 'Project conversation'} URL; reuse is blocked to prevent duplicate sending.`);
+    error.promptMayHaveBeenSent = true;
+    throw error;
+  }
+  return { beforeState, conversationUrl: recorded };
 }
 
-async function finishAsk({ page, runtime, beforeState, sessionID, workspaceDir, saveToFile, requestHash, slow, shouldCancel, log }) {
+function assistantTextAdvanced(state, before) {
+  // 文本可与上一轮完全相同；assistant turn 数量增长同样能证明它属于本轮，而不是旧文本重排。
+  return !!state?.lastText && (state.count > before.count || state.lastText !== before.lastText);
+}
+
+async function finishAsk({ page, runtime, project, beforeState, expectedSessionUrl, sessionID, workspaceDir, saveToFile, requestHash, allowPlainUrl, slow, shouldCancel, log }) {
+  // 回答等待前已经固定 expectedSessionUrl；等待异常、正常完成和 artifact 收集都必须沿用同一身份。
+  // 页面离开原 conversation 时不读取 lastText，因为那可能是用户刚打开的另一条历史回答。
+  // wait failure 只在 URL 仍正确时保存 partial；身份错误优先级高于“尽量返回已有文本”。
+  // 最终持久化会再次验证 URL，形成发送前、等待后、落盘前三道独立防线。
   let waitResult;
   try {
     waitResult = await runtime.waitForResponse(page, beforeState, { slow, shouldCancel }, log);
   } catch (err) {
-    const failedUrl = isChatSessionUrlForProject(page.url(), runtime.project)
+    const failedUrl = isSameConversationUrl(page.url(), expectedSessionUrl, project, { allowPlain: allowPlainUrl === true })
       ? page.url()
-      : await rememberCurrentSessionUrl(page, runtime.project, sessionID, log, 3_000);
+      : await rememberCurrentSessionUrl(page, project, sessionID, log, 3_000, allowPlainUrl, expectedSessionUrl);
+    if (!failedUrl) {
+      markSessionLost(sessionID, project, 'ChatGPT page left the recorded conversation while waiting for a response.');
+      throw new Error(`Session ${sessionID} left its recorded ChatGPT conversation while waiting; no response was collected.`);
+    }
     await CHATGPT_DOM.focus(page).catch(() => {});
+    requireCurrentConversation(page, expectedSessionUrl, project, allowPlainUrl, sessionID, 'wait-failure focus', true);
     const state = await CHATGPT_DOM.state(page).catch(() => null);
-    const hasNewAssistantText = state?.lastText && state.lastText !== beforeState.lastText;
+    const hasNewAssistantText = assistantTextAdvanced(state, beforeState);
     // wait failure 不能把上一轮 assistant 当成本轮 partial；只有 DOM 出现新 assistant 证据才保存文本。
-    const raw = hasNewAssistantText
-      ? await CHATGPT_DOM.extractAssistant(page).catch(() => state.lastText)
-      : '';
+    let raw = '';
+    if (hasNewAssistantText) {
+      requireCurrentConversation(page, expectedSessionUrl, project, allowPlainUrl, sessionID, 'wait-failure extraction', true);
+      raw = await CHATGPT_DOM.extractAssistant(page).catch(() => state.lastText);
+    }
     return persistAssistantResult({
       page,
-      project: runtime.project,
+      project,
       workspaceDir,
       sessionID,
       raw,
       status: 'generating',
       saveToFile,
       requestHash,
+      allowPlainUrl,
+      expectedSessionUrl,
       finalUrl: failedUrl || page.url(),
       promptSent: true,
       forceSave: !!raw,
@@ -1537,32 +1732,42 @@ async function finishAsk({ page, runtime, beforeState, sessionID, workspaceDir, 
   }
   const currentUrl = page.url();
   // URL 仍属于固定 Project 时才更新 registry；避免登录页或错误页覆盖真实 conversation。
-  const finalUrl = isChatSessionUrlForProject(currentUrl, runtime.project, { allowPlain: true })
+  const finalUrl = isSameConversationUrl(currentUrl, expectedSessionUrl, project, { allowPlain: allowPlainUrl === true })
     ? currentUrl
-    : await rememberCurrentSessionUrl(page, runtime.project, sessionID, log, 5_000);
-  if (finalUrl) writeSessionEntry(sessionID, runtime.project, finalUrl);
+    : await rememberCurrentSessionUrl(page, project, sessionID, log, 5_000, allowPlainUrl, expectedSessionUrl);
+  if (!finalUrl) {
+    markSessionLost(sessionID, project, 'ChatGPT page left the recorded conversation before response collection.');
+    throw new Error(`Session ${sessionID} left its recorded ChatGPT conversation before response collection; no text or artifacts were collected.`);
+  }
+  writeSessionEntry(sessionID, project, finalUrl);
 
   const stillGenerating = waitResult.status === 'generating';
   let extractionNotice = null;
   await CHATGPT_DOM.focus(page).catch(() => {});
+  requireCurrentConversation(page, expectedSessionUrl, project, allowPlainUrl, sessionID, 'response focus', true);
   const fallbackState = await CHATGPT_DOM.state(page).catch(() => null);
-  const hasNewAssistantText = fallbackState?.lastText && fallbackState.lastText !== beforeState.lastText;
+  const hasNewAssistantText = assistantTextAdvanced(fallbackState, beforeState);
   // submitted-no-assistant / timeout 场景只落 pending，不拿上一轮 assistant 充当 partial。
-  const raw = hasNewAssistantText ? await CHATGPT_DOM.extractAssistant(page).catch(err => {
-    extractionNotice = `Markdown extraction failed; saved visible assistant text instead: ${err.message}`;
-    log(extractionNotice);
-    return fallbackState?.lastText || '';
-  }) || '' : '';
-  const sessionNotice = finalUrl ? null : 'Conversation URL was not recorded; this session handle may not survive daemon restart.';
+  let raw = '';
+  if (hasNewAssistantText) {
+    requireCurrentConversation(page, expectedSessionUrl, project, allowPlainUrl, sessionID, 'response extraction', true);
+    raw = await CHATGPT_DOM.extractAssistant(page).catch(err => {
+      extractionNotice = `Markdown extraction failed; saved visible assistant text instead: ${err.message}`;
+      log(extractionNotice);
+      return fallbackState?.lastText || '';
+    }) || '';
+  }
   const result = await persistAssistantResult({
     page,
-    project: runtime.project,
+    project,
     workspaceDir,
     sessionID,
     raw,
     status: waitResult.status,
     saveToFile,
     requestHash,
+    allowPlainUrl,
+    expectedSessionUrl,
     finalUrl: finalUrl || currentUrl,
     promptSent: true,
     shouldCancel,
@@ -1574,7 +1779,6 @@ async function finishAsk({ page, runtime, beforeState, sessionID, workspaceDir, 
     notice: [
       stillGenerating ? 'ChatGPT is still generating. Reuse the same sessionID to recover the latest text before sending another prompt.' : null,
       extractionNotice,
-      sessionNotice,
     ].filter(Boolean).join('\n') || null,
   });
   log(`Done: ${raw.length} chars`);
@@ -1627,6 +1831,16 @@ function readDaemonJsonBody(req, label, log) {
   });
 }
 
+function sendJSON(res, status, value) {
+  // 返回布尔值让离线测试同时验证“关闭时不写”和“正常时确实发送”，而不是复制 handler 逻辑。
+  // destroyed 与 writableEnded 任一成立都表示 response 所有权已经结束，此时任何写入都是进程级风险。
+  // client cancel 后 response 可能先于业务 promise 关闭；迟到结果必须被丢弃，不能让 writeHead 异常杀死共享 daemon。
+  if (res.destroyed || res.writableEnded) return false;
+  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(value));
+  return true;
+}
+
 /**
  * 启动长期运行的 daemon 进程。
  *
@@ -1645,19 +1859,13 @@ async function startDaemonProcess() {
   log('Daemon starting...');
 
   let browser, bootstrapPage, project;
+  // 任意 connect 路径都视为共享浏览器；即使端口由本配置指定，也不能证明其它 tab 归 daemon 所有。
+  const sharedBrowser = !!(BROWSER_WS_ENDPOINT || BROWSER_CDP_URL);
   try {
     browser = await launchBrowser(log);
-    // Edge 用 user-data-dir 启动时会恢复上次会话的标签页；Puppeteer 也会创建初始 about:blank。
-    // 这些无关页面拖慢启动、占用内存、可能干扰 DOM 检测。启动后立即清理，只保留一个页面做 bootstrap。
-    const initialPages = await browser.pages();
-    // 优先复用已有 chatgpt.com 页面（spawn 时打开），避免 newPage 在 cookie 加载前
-    // 导航到 project URL 被重定向到 /auth/login，导致 chatgpt.com 清除 persistent session-token cookie。
-    bootstrapPage = initialPages.find(p => /chatgpt\.com/.test(p.url())) || initialPages[0] || await browser.newPage();
-    for (const page of initialPages) {
-      if (page !== bootstrapPage) await page.close().catch(() => {});
-    }
+    bootstrapPage = await prepareBootstrapPage(browser, sharedBrowser);
     // 只导航到 chatgpt.com 首页（不导航到 project URL），避免未登录时触发 /auth/login 清除 cookie。
-    if (!/chatgpt\.com/.test(bootstrapPage.url())) {
+    if (!isOfficialChatGPTURL(bootstrapPage.url())) {
       await bootstrapPage.goto(CHATGPT_URL, { waitUntil: 'domcontentloaded', timeout: 45_000 });
     }
     // chatgpt.com 用 JS 渲染登录态；domcontentloaded 时 #prompt-textarea 可能还没出现，
@@ -1711,16 +1919,9 @@ async function startDaemonProcess() {
       log('Login detected; continuing startup.');
     }
 
-    // 已登录后才导航到 project URL，避免未登录时 /auth/login 重定向清除 persistent cookie。
-    project = resolveCachedProject(DEFAULT_PROJECT);
-    project = project || await resolveProject(bootstrapPage, DEFAULT_PROJECT, log);
-
-    if (!sameUrl(bootstrapPage.url(), project.url)) {
-      log(`Navigating to fixed project: ${project.name} (${project.id})`);
-      await bootstrapPage.goto(project.url, { waitUntil: 'domcontentloaded', timeout: 45_000 });
-    } else {
-      log(`Using fixed project from cache: ${project.name} (${project.id})`);
-    }
+    // 已登录后用当前账号实时发现 Project；缓存只做 fallback，最终页面必须通过 Chat/composer/身份验证。
+    project = await resolveProject(bootstrapPage, DEFAULT_PROJECT, log);
+    project = await ensureProjectHome(bootstrapPage, project, log);
 
     log('Browser ready and logged in.');
   } catch (err) {
@@ -1740,10 +1941,9 @@ async function startDaemonProcess() {
   let server;
   let shuttingDown = false;
 
-  // 定期清理不属于任何 session 的游离页面（Edge 恢复的旧标签、用户手动打开的标签等）。
-  // bootstrapPage 和 sessionPages 中的页面是 daemon 管理的，不清理。
+  // 只有独占 launch profile 才能把未登记 tab 判为游离页；共享 CDP 下未登记恰恰代表用户所有。
   const STALE_PAGE_CLEANUP_INTERVAL_MS = 60_000;
-  const stalePageTimer = setInterval(async () => {
+  const stalePageTimer = sharedBrowser ? null : setInterval(async () => {
     if (shuttingDown) return;
     try {
       const managedPages = new Set([bootstrapPage, ...runtime.managedPages()].filter(Boolean));
@@ -1767,7 +1967,7 @@ async function startDaemonProcess() {
       try { if (fs.existsSync(file)) fs.unlinkSync(file); } catch {}
     }
     if (server) server.close();
-    clearInterval(stalePageTimer);
+    if (stalePageTimer) clearInterval(stalePageTimer);
     // browser disconnected 回调里不再 close browser：连接已断开，重复 close 只会制造无意义的协议错误。
     if (options.closeBrowser !== false) {
       // CDP 连接模式下 disconnect 而非 close，避免 daemon 退出时杀掉用户已登录的浏览器，
@@ -1790,11 +1990,7 @@ async function startDaemonProcess() {
   server = http.createServer(async (req, res) => {
     // send 必须在 res 已关闭时静默返回:voice cancel 后客户端断开,catch 调 send(500)
     // 会在已关闭的 res 上 writeHead 抛异常,导致 daemon 崩溃且 voiceLock 永不释放。
-    const send = (status, obj) => {
-      if (res.destroyed || res.writableEnded) return;
-      res.writeHead(status, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(obj));
-    };
+    const send = (status, obj) => sendJSON(res, status, obj);
 
     if (req.method === 'GET' && req.url?.startsWith('/ping')) {
       const probe = new URL(req.url, 'http://127.0.0.1');
@@ -1810,7 +2006,7 @@ async function startDaemonProcess() {
         ok: true,
         pid: process.pid,
         daemonID,
-        project: project.name,
+        project: runtime.project.name,
         ...runtime.status(),
       });
     }
@@ -1907,9 +2103,15 @@ async function startDaemonProcess() {
             const result = await runAsk(runtime, parsed, sessionID, log, () => clientClosed);
             if (clientClosed && result?.status === 'completed') {
               // 回答已完成但 HTTP client 已走：此时不能把 pending 清掉，否则调用方既收不到答案，也不会触发恢复。
-              const entry = readSessionEntry(sessionID, runtime.project);
+              const stored = readSessionIndex().sessions[sessionID];
+              const sessionProject = projectForSessionEntry(stored, runtime.project);
+              const entry = readSessionEntry(sessionID, sessionProject);
               const saved = result.savedResponse || (result.response ? saveResponseToFile(result.response, parsed.workspaceDir, sessionID) : null);
-              if (entry?.url) markSessionPending(sessionID, runtime.project, entry.url, saved, { preserveCompleted: true });
+              if (entry?.url) markSessionPending(sessionID, sessionProject, entry.url, saved, {
+                preserveCompleted: true,
+                completedUndelivered: true,
+                nativeImageURLs: entry.completed?.nativeImageURLs || [],
+              });
               log(`Ask client disconnected after completion; saved response and marked ${sessionID} pending for recovery`);
               return;
             }
@@ -1954,7 +2156,10 @@ async function startDaemonProcess() {
   // 这里不返回：daemon 作为 HTTP server 常驻，直到收到 /stop 或进程信号。
 }
 
-module.exports = { startDaemonProcess };
+// 正常运行只暴露 daemon 入口；离线测试显式 opt-in 后才能访问无网络状态机 seam。
+module.exports = process.env.CHATGPT_TEST_HOOKS === '1'
+  ? { startDaemonProcess, testing: Object.freeze({ createDaemonRuntime, prepareBootstrapPage, restoreSessionPage, rememberCurrentSessionUrl, readSessionEntry, markSessionPending, markSessionCompleted, markSessionLost, validateVoiceInput, sendJSON, assistantTextAdvanced, runAsk, requestHash, dom: CHATGPT_DOM }) }
+  : { startDaemonProcess };
 
 if (require.main === module) {
   startDaemonProcess().catch(err => {

@@ -20,6 +20,7 @@ const os     = require('os');
 const path   = require('path');
 const { Readable, Transform } = require('stream');
 const { pipeline } = require('stream/promises');
+const { isOfficialURL: isOfficialChatGPTURL } = require('./chatgpt-project');
 
 const MAX_ARTIFACTS = 16;
 const MAX_UPLOAD_BYTES = positiveIntEnv('CHATGPT_MAX_UPLOAD_BYTES', 400 * 1024 * 1024);
@@ -29,7 +30,7 @@ const VOICE_DICTATION_TIMEOUT_MS = positiveIntEnv('CHATGPT_VOICE_DICTATION_TIMEO
 const VOICE_STOP_DELAY_MS = positiveIntEnv('CHATGPT_VOICE_STOP_DELAY_MS', 6_000);
 const VOICE_STREAM_CHUNK_MS = positiveIntEnv('CHATGPT_VOICE_STREAM_CHUNK_MS', 250);
 // sandbox 文件和原生图片共享同一个总数预算；ChatGPT 生成产物按原名保存，不额外改扩展名。
-// 产物不按类型裁剪，也不额外做固定下载超时；只保留总量护栏和外层 ask 取消信号。
+// 产物不按类型裁剪；总量、外层取消与无进展中止共同防止单个产物占住共享队列。
 
 function positiveIntEnv(name, fallback) {
   const value = Number.parseInt(process.env[name] || '', 10);
@@ -90,40 +91,49 @@ function createChatGPTDom({ responseTimeout }) {
     },
 
     async discoverProjects(page, log) {
-      // 项目发现属于 ChatGPT Web DOM/localStorage 适配，而不是 daemon 状态机。
-      // 先读 localStorage，避免依赖侧边栏是否展开；失败后再点击 Show more 并扫描 project 链接。
-      const cached = await cachedProjectsFromPage(page);
-      if (cached.length > 0) {
-        log(`Discovered cached ChatGPT projects: ${cached.map(project => project.name).join(', ')}`);
-        return cached;
-      }
+      // discovery 返回候选集合，不负责选择目标；唯一性与显式 ID 优先级由纯 Project policy 决定。
+      // 展开操作使用可信 ElementHandle click，React 菜单不会因 DOM .click() 静默失效。
+      // 名称歧义属于安全错误，必须带稳定 code 穿过 core fallback，不能降级到旧 cache。
+      // 项目发现属于 ChatGPT Web DOM 适配，而不是 daemon 状态机。
 
-      // 如果启动页已经是 chatgpt.com，就不要再刷新；只有不在 ChatGPT 域或 localStorage 为空时才回首页扫侧边栏。
+      // 根页提供最完整的 Project section；conversation/Project 页的响应式侧栏可能只渲染一个裁剪副本。
       if (!/^https:\/\/chatgpt\.com\/?(?:[?#].*)?$/i.test(page.url())) {
         await page.goto('https://chatgpt.com', { waitUntil: 'domcontentloaded', timeout: 45_000 });
         await sleep(1_000);
       }
 
       for (let i = 0; i < 5; i++) {
-        const clicked = await page.evaluate(() => {
-          const items = [...document.querySelectorAll('button, div.group.__menu-item, a.group.__menu-item, [role="button"]')];
-          const item = items.find(item => {
-            const text = (item.innerText || item.textContent || '').trim();
-            return /^(show more|more|显示更多|更多|展开)$/i.test(text) && (String(item.className).includes('__menu-item') || item.getAttribute('role') === 'button');
-          });
-          if (!item) return false;
-          item.click();
-          return true;
-        });
-        if (!clicked) break;
+        if (!await clickProjectListExpander(page)) break;
         await sleep(700);
       }
 
-      const projects = await page.evaluate(() => [...document.querySelectorAll('a[href*="/g/g-p-"]')]
-        .map(anchor => ({ name: (anchor.innerText || anchor.textContent || '').trim().split('\n')[0], href: anchor.href }))
-        .filter(project => project.name && project.href));
+      const sidebar = await readSidebarProjects(page);
+      const duplicate = sidebar.names.find((name, index, names) => names.findIndex(item => item.normalize('NFKC').toLowerCase() === name.normalize('NFKC').toLowerCase()) !== index);
+      if (duplicate) {
+        const error = new Error(`Multiple ChatGPT projects are named "${duplicate}"; configure CHATGPT_PROJECT with the exact Project URL or id.`);
+        error.code = 'PROJECT_AMBIGUOUS';
+        throw error;
+      }
+      const projects = sidebar.links
+        // 响应式侧栏可能保留重复链接；按 URL 去重后再交给 core 做身份/同名裁决。
+        .filter((project, index, all) => all.findIndex(item => item.href === project.href) === index);
       log(`Discovered ChatGPT project links: ${projects.map(project => project.name).join(', ') || 'none'}`);
       return projects;
+    },
+
+    /** 读取 Project 首页事实，core 用它验证缓存 URL，而不是把“导航成功”误当成 Project 可用。 */
+    async projectHomeState(page, name) {
+      return readProjectHomeState(page, name);
+    },
+
+    /** 只在 Work 已激活时切回 Chat；正常 Chat 页面保持原状，不探索或点击 Work。 */
+    async ensureChatMode(page, log) {
+      return ensureProjectChatMode(page, log);
+    },
+
+    /** 新侧边栏不再暴露 Project href；按显示名点击首页按钮并返回网页实际采用的 URL。 */
+    async openProjectHome(page, name, log) {
+      return openProjectHomeFromSidebar(page, name, log);
     },
 
     /** 提交 prompt 前总是 bringToFront，降低后台 tab “已生成但 DOM 未刷新”的概率。 */
@@ -146,7 +156,8 @@ function createChatGPTDom({ responseTimeout }) {
         try {
           // click 后的 frame/navigation 异常属于“可能已提交”；core 会用 lost tombstone 阻止重发。
           await clickSend(page, expectedPrompt, () => {
-            beforeSend();
+            // core 需要发送前 turn 基线，pending recovery 才能证明后续文本属于本轮而非历史回答。
+            beforeSend(before);
             sent = true;
           });
         } catch (err) {
@@ -165,7 +176,7 @@ function createChatGPTDom({ responseTimeout }) {
       // Node 侧只读取一次文件；direct upload 和 fallback fake mic 共用同一份 base64，避免两次磁盘读取产生 TOCTOU 窗口。
       const audioBase64 = fs.readFileSync(file).toString('base64');
       // direct path 零页面操作：不 bringToFront、不 goto、不依赖任何 DOM 状态。
-      // 它只在页面 JS 上下文中做 fetch 调用，对正在使用该页面的 ask 会话无副作用。
+      // 它只在 runtime 专属 voice page 的 JS 上下文中 fetch，不会与 ask session 共用 composer。
       try {
         // direct upload 是性能优化路径：成功时不触碰听写按钮，也不污染 composer 文本。
         const direct = await transcribeAudioFileDirect(page, audioBase64, file);
@@ -180,7 +191,7 @@ function createChatGPTDom({ responseTimeout }) {
         // err.message 中包含 "abort" 字样，因此用 /abort/i 而非 err.name === 'AbortError'。
         // "target closed"/"protocol error" 表示页面已被外部关闭（stale cleanup、浏览器断开等），
         // fallback 同样会立即失败，不应在此页面上尝试。
-        if (/timed out|timeout|abort|target closed|protocol error/i.test(err.message)) throw err;
+        if (/timed out|timeout|abort|target closed|protocol error|official ChatGPT origin/i.test(err.message)) throw err;
         // 客户端已断开时不需要进入 ~90s 的 fallback 听写 UI。
         if (shouldCancel()) throw new Error('Voice transcription cancelled before fallback');
         // ChatGPT Web 的私有 endpoint/header 可能随前端版本调整；fallback 继续用已验证的听写 UI，避免一次网页变更让语音输入彻底不可用。
@@ -192,7 +203,7 @@ function createChatGPTDom({ responseTimeout }) {
       // fallback 需要项目页的 composer；direct 复用的页面可能不在项目页上。
       await page.bringToFront().catch(() => {});
       // 听写 UI 在任何 chatgpt.com 聊天页都可用;不导航到项目页(避免创建多余对话和干扰 ask 会话)。
-      if (!/^https:\/\/chatgpt\.com/i.test(page.url())) {
+      if (!isOfficialChatGPTURL(page.url())) {
         await page.goto(voiceUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
       }
       // fallback 才依赖 React composer 和听写按钮；把等待放在这里，避免 direct 成功路径浪费固定 3 秒。
@@ -235,7 +246,7 @@ function createChatGPTDom({ responseTimeout }) {
     async collectArtifacts(page, downloadDir, log, shouldCancel = () => false, beforeState = null) {
       return withArtifactDownloadLock(async () => {
         // sandbox 与原生图片共用 artifact 数量/字节预算；耗时由外层 ask/MCP 生命周期决定。
-        const files = await downloadSandboxFiles(page, downloadDir, log, MAX_ARTIFACTS, MAX_ARTIFACT_BYTES, shouldCancel).catch(err => ({ downloads: [], notices: [`Sandbox artifact collection failed: ${err.message}`] }));
+        const files = await downloadSandboxFiles(page, downloadDir, log, MAX_ARTIFACTS, MAX_ARTIFACT_BYTES, shouldCancel, beforeState?.count).catch(err => ({ downloads: [], notices: [`Sandbox artifact collection failed: ${err.message}`] }));
         const images = await downloadNativeImages(page, downloadDir, log, Math.max(0, MAX_ARTIFACTS - files.downloads.length), Math.max(0, MAX_ARTIFACT_BYTES - downloadedBytes(files.downloads)), shouldCancel, beforeState?.nativeImageURLs || []).catch(err => ({ downloads: [], notices: [`Native image collection failed: ${err.message}`] }));
         // 返回值保留成功产物和失败说明，core 可以展示部分成功结果而不是把整次回答判失败。
         return {
@@ -255,76 +266,242 @@ function createChatGPTDom({ responseTimeout }) {
     return run;
   }
 
-  async function cachedProjectsFromPage(page) {
-    // localStorage 结构可能很深且有循环引用；WeakSet 防止递归扫描项目缓存时重复访问对象。
-    return page.evaluate(() => {
-      const found = [];
-      const seen = new WeakSet();
-      for (const key of Object.keys(localStorage)) {
-        if (!/(snorlax-history|pinned-items|gizmo)/.test(key)) continue;
-        try { visit(JSON.parse(localStorage.getItem(key))); }
-        catch {}
-      }
-      return found.filter((project, index, all) => all.findIndex(item => item.href === project.href) === index);
-
-      function visit(value) {
-        if (!value || typeof value !== 'object' || seen.has(value)) return;
-        seen.add(value);
-        const candidate = value.gizmo && value.gizmo.id ? value.gizmo : value;
-        if (typeof candidate.id === 'string' && candidate.id.startsWith('g-p-')) {
-          const name = candidate.display?.name || candidate.name;
-          if (name) found.push({ name, href: `https://chatgpt.com/g/${candidate.short_url || candidate.id}/project` });
-        }
-        for (const child of Array.isArray(value) ? value : Object.values(value)) visit(child);
-      }
+  /**
+   * 展开侧边栏 Project 区域，但不依赖“查看更多”的当前语言。
+   * 优先使用 Project section 与 row 的结构关系；旧文案 selector 只承担兼容，不参与身份选择。
+   */
+  async function clickProjectListExpander(page) {
+    const handle = await page.evaluateHandle(() => {
+      const row = document.querySelector('[class*="project-unfurl-row"], a[href*="/g/g-p-"]');
+      const section = row?.closest('[class*="sidebar-expando-section"], section')
+        || [...document.querySelectorAll('[class*="sidebar-expando-section"], section')]
+          .find(item => item.querySelector('[class*="project-unfurl-row"], a[href*="/g/g-p-"]'));
+      const collapsed = [...(section?.querySelectorAll('button[aria-expanded="false"], [role="button"][aria-expanded="false"]') || [])][0];
+      if (collapsed) return collapsed;
+      // 当前“查看更多”没有稳定文案；它是 Project section 内唯一不属于具体 project row 的 sidebar button。
+      const structural = [...(section?.querySelectorAll('button[data-sidebar-item], [role="button"][data-sidebar-item]') || [])]
+        .find(item => !item.closest('[class*="project-unfurl-row"]'));
+      if (structural) return structural;
+      // 旧页面没有 section 结构，只把本地化文案作为最后兼容层，不能让它成为当前 UI 的唯一发现依据。
+      return [...document.querySelectorAll('button, div.group.__menu-item, a.group.__menu-item, [role="button"]')]
+        .find(item => /^(show more|more|显示更多|更多|展开)$/i.test((item.innerText || item.textContent || '').trim())) || null;
     });
+    const element = handle.asElement();
+    if (!element) {
+      await handle.dispose().catch(() => {});
+      return false;
+    }
+    try { await element.click(); }
+    finally { await handle.dispose().catch(() => {}); }
+    return true;
+  }
+
+  /**
+   * 读取 Project 首页可验证事实，不在 DOM 层猜测 URL 身份。
+   * Chat/Work 只认自身标签和属性；全页其它 radio 可能属于模型或推理级别，绝不能参与模式判断。
+   * name 为空表示显式 ID/URL 路径，此时返回网页真实 h1 供 core 建立可信标题。
+   */
+  async function readProjectHomeState(page, name) {
+    // 这里只报告页面事实，不决定 URL 是否属于目标 Project；core 会用纯 policy 做 origin/path/id 检查。
+    // 已知 Chat/Work 标签可跨语言匹配，未知组只有具备 Project mode 专属属性时才触发 fail-closed。
+    // 没有专属 mode 控件就是 Chat-only，即使页面存在任意数量的模型或 reasoning radiogroup。
+    return page.evaluate(expectedName => {
+      const norm = value => String(value || '').normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
+      const radios = [...document.querySelectorAll('[role="radio"]')];
+      const labels = item => [item.textContent, item.getAttribute('aria-label'), item.getAttribute('data-value'), item.getAttribute('value')].map(norm);
+      const chat = radios.find(item => labels(item).some(label => /^(chat|聊天|对话|会話|チャット)$/.test(label)));
+      const work = radios.find(item => labels(item).some(label => /^(work|工作|作業|ワーク)$/.test(label)));
+      const active = item => item?.getAttribute('aria-checked') === 'true' || item?.getAttribute('data-state') === 'on';
+      const unknownModeGroup = document.querySelector('[data-project-mode-switch], [data-testid="project-mode-switch"]');
+      // 没有明确 Project mode group 时是旧版 Chat-only；孤立的模型/reasoning radio 不应让页面失效。
+      const hasModeSwitch = !!chat || !!work || !!unknownModeGroup;
+      const titles = [...document.querySelectorAll('h1')].map(item => ({ item, name: String(item.textContent || '').trim() })).filter(item => item.name);
+      const title = expectedName ? titles.find(item => norm(item.name) === norm(expectedName)) : titles[0];
+      return {
+        url: location.href,
+        composer: !!document.querySelector('#prompt-textarea'),
+        title: !!title,
+        titleName: title?.name || null,
+        chatAvailable: !!chat || !hasModeSwitch,
+        // 只读取已识别的 Chat/Work 控件；模型和推理级别的 radio 不能被扩大解释成 Work。
+        // 没有任何 radio 仍代表旧版 Chat-only 页面；有 radio 但模式标签未知时 fail-closed。
+        chatActive: !hasModeSwitch || !!chat && active(chat),
+        workActive: !!work && active(work),
+      };
+    }, name);
+  }
+
+  async function openProjectHomeFromSidebar(page, name, log) {
+    await page.bringToFront().catch(() => {});
+    const current = await readProjectHomeState(page, name).catch(() => null);
+    if (current?.composer && current.title) {
+      // ambient tab 只证明当前页标题匹配；展开完整列表后仍须拒绝同名 Project，不能按用户碰巧打开的页猜身份。
+      for (let attempt = 0; attempt < 7; attempt++) {
+        const matches = await projectSidebarMatchCount(page, name);
+        if (matches > 1) {
+          const error = new Error(`Multiple ChatGPT projects are named "${name}"; configure CHATGPT_PROJECT with the exact Project URL or id.`);
+          error.code = 'PROJECT_AMBIGUOUS';
+          throw error;
+        }
+        if (!await clickProjectListExpander(page)) break;
+        await sleep(500);
+      }
+      await ensureProjectChatMode(page, log);
+      return page.url();
+    }
+    for (let attempt = 0; attempt < 7; attempt++) {
+      const matches = await projectSidebarMatchCount(page, name);
+      // 名称不是稳定身份；同名时拒绝猜测，交由显式 Project URL/ID 消除数据归属歧义。
+      if (matches > 1) {
+        const error = new Error(`Multiple ChatGPT projects are named "${name}"; configure CHATGPT_PROJECT with the exact Project URL or id.`);
+        error.code = 'PROJECT_AMBIGUOUS';
+        throw error;
+      }
+      const handle = await page.evaluateHandle(expectedName => {
+        const norm = value => String(value || '').normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
+        const visible = item => !!(item.offsetWidth || item.offsetHeight || item.getClientRects().length);
+        const row = [...document.querySelectorAll('[data-sidebar-item][role="button"]')]
+          .find(item => norm(item.textContent) === norm(expectedName) && visible(item)
+            && [...(item.closest('li')?.querySelectorAll('button[data-trailing-button]') || [])]
+              .some(button => !button.hasAttribute('aria-haspopup') && visible(button)));
+        if (!row) return null;
+        const buttons = [...(row.closest('li')?.querySelectorAll('button[data-trailing-button]') || [])];
+        // 首页按钮没有 menu popup；排除 aria-haspopup 后无需依赖中英文 aria-label。
+        return buttons.find(button => !button.hasAttribute('aria-haspopup')) || null;
+      }, name);
+      const button = handle.asElement();
+      if (button) {
+        const previous = page.url();
+        try { await button.click(); }
+        finally { await handle.dispose().catch(() => {}); }
+        await page.waitForFunction(({ previous, name }) => {
+          const norm = value => String(value || '').normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
+          return location.href !== previous
+            && !!document.querySelector('#prompt-textarea')
+            && [...document.querySelectorAll('h1')].some(item => norm(item.textContent) === norm(name));
+        }, { timeout: 15_000, polling: 200 }, { previous, name });
+        await ensureProjectChatMode(page, log);
+        log?.(`Opened ChatGPT Project from live sidebar: ${name}`);
+        return page.url();
+      }
+      await handle.dispose().catch(() => {});
+
+      // Project 列表可能折叠或只展示前几项；每轮只展开一个控件，避免一次 evaluate 连点导致 React 丢事件。
+      if (!await clickProjectListExpander(page)) break;
+      await sleep(500);
+    }
+    return null;
+  }
+
+  function projectSidebarMatchCount(page, name) {
+    const key = String(name || '').normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
+    return readSidebarProjects(page).then(sidebar => sidebar.names.filter(item => item.normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase() === key).length);
+  }
+
+  function readSidebarProjects(page) {
+    return page.evaluate(() => {
+      // discover 与 fallback 必须共享同一结构规则；旧 class 只是兼容证据，不能成为唯一入口。
+      const visible = item => !!(item.offsetWidth || item.offsetHeight || item.getClientRects().length);
+      const links = [...document.querySelectorAll('a[href*="/g/g-p-"]')]
+        .filter(visible)
+        .map(anchor => ({ name: (anchor.innerText || anchor.textContent || '').trim().split('\n')[0], href: anchor.href }))
+        .filter(project => project.name && project.href);
+      const dataItems = [...document.querySelectorAll('[data-sidebar-item][role="button"]')]
+        .filter(visible)
+        .filter(item => {
+          const row = item.closest('li, [class*="project-unfurl-row"]');
+          if (!row) return false;
+          const legacy = /project-unfurl-row/.test(row.className || '');
+          const home = [...row.querySelectorAll('button[data-trailing-button]')]
+            .some(button => !button.hasAttribute('aria-haspopup') && visible(button));
+          return legacy || home || !!row.querySelector('a[href*="/g/g-p-"]');
+        });
+      // 无 data-sidebar-item 的旧链接仍要进入名称全集；已被结构化 row 包含的链接不能重复计数。
+      const linkItems = [...document.querySelectorAll('a[href*="/g/g-p-"]')]
+        .filter(anchor => visible(anchor) && !anchor.closest('li, [class*="project-unfurl-row"]')?.querySelector('[data-sidebar-item][role="button"]'));
+      const names = [...dataItems, ...linkItems]
+        .map(item => (item.innerText || item.textContent || '').trim().split('\n')[0])
+        .filter(Boolean);
+      return { links, names };
+    });
+  }
+
+  async function ensureProjectChatMode(page, log) {
+    const state = await readProjectHomeState(page, '');
+    if (!state.chatAvailable || state.chatActive && !state.workActive) return;
+    const handle = await page.evaluateHandle(() => {
+      const norm = value => String(value || '').normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
+      const labels = item => [item.textContent, item.getAttribute('aria-label'), item.getAttribute('data-value'), item.getAttribute('value')].map(norm);
+      return [...document.querySelectorAll('[role="radio"]')]
+        .find(item => labels(item).some(label => /^(chat|聊天|对话|会話|チャット)$/.test(label))) || null;
+    });
+    const chat = handle.asElement();
+    if (!chat) {
+      await handle.dispose().catch(() => {});
+      return;
+    }
+    try { await chat.click(); }
+    finally { await handle.dispose().catch(() => {}); }
+    await page.waitForFunction(() => {
+      const norm = value => String(value || '').normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
+      return [...document.querySelectorAll('[role="radio"]')].some(item => {
+        const labels = [item.textContent, item.getAttribute('aria-label'), item.getAttribute('data-value'), item.getAttribute('value')].map(norm);
+        return labels.some(label => /^(chat|聊天|对话|会話|チャット)$/.test(label))
+          && (item.getAttribute('aria-checked') === 'true' || item.getAttribute('data-state') === 'on');
+      });
+    }, { timeout: 5_000 });
+    log?.('Selected Chat mode; Work was not used.');
   }
 
   // ─── Upload and Submit ────────────────────────────────────────────────────
 
   async function selectComposerMode(page, mode, log) {
-    // mode 选择必须发生在 fillPrompt 之前；ChatGPT 切模式会重排 composer，晚选可能清空已填文本。
-    // UI 文案会跟随账号语言变化；公开 API 不能要求用户把 ChatGPT 固定成中文界面。
-    // 因此 adapter 只在这一层维护中英文 label，schema 仍暴露稳定的 `image` 语义。
-    const labels = {
-      auto: null,
-      image: ['创建图片', 'Create image'],
-    };
-    const options = labels[mode || 'auto'];
+    const options = mode === 'image' ? ['创建图片', 'Create image'] : null;
     if (!options) return;
-    // plus 菜单的模式项是 role=menuitemradio，而不是 button；这是实机 DOM 探测得到的稳定入口。
-    await page.waitForSelector('#composer-plus-btn', { timeout: 10_000 });
-    await page.click('#composer-plus-btn');
+    const plus = await page.waitForSelector('#composer-plus-btn', { timeout: 10_000 });
+    try { await plus.click(); }
+    finally { await plus.dispose().catch(() => {}); }
     await sleep(600);
-    const clicked = await page.evaluate(options => {
+    const handle = await page.evaluateHandle(options => {
       const norm = value => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
-      const item = [...document.querySelectorAll('[role="menuitemradio"], [role="menuitem"], [role="option"], [role="radio"], button')]
-        .find(el => options.some(label => norm(el.innerText || el.textContent || el.getAttribute('aria-label')) === norm(label)));
-      if (!item) return false;
-      item.click();
-      return true;
+      return [...document.querySelectorAll('[role="menuitemradio"], [role="menuitem"], [role="option"], [role="radio"], button, div.__menu-item')]
+        .filter(element => !!(element.offsetWidth || element.offsetHeight || element.getClientRects().length))
+        .find(element => {
+          const titles = [...element.querySelectorAll('span')].map(span => norm(span.textContent)).filter(Boolean);
+          const text = norm(element.innerText || element.textContent || element.getAttribute('aria-label'));
+          return options.some(label => titles.includes(norm(label)) || text === norm(label));
+        }) || null;
     }, options);
-    if (!clicked) throw new Error(`Could not select ChatGPT composer mode: ${mode}`);
-    await sleep(800);
-    await page.keyboard.press('Escape').catch(() => {});
-    const active = await page.evaluate(mode => {
-      // 选中状态没有固定 data-testid，只能读 composer pill 的本地化文本/aria。
-      // 这里用“可见 pill + 点击以重试”而不是菜单状态，避免菜单关闭后丢失判断依据。
+    const item = handle.asElement();
+    if (!item) {
+      await handle.dispose().catch(() => {});
+      await page.keyboard.press('Escape').catch(() => {});
+      log(`ChatGPT composer mode entry unavailable for ${mode}; using workflow prompt fallback.`);
+      return;
+    }
+    try {
+      const box = await item.boundingBox();
+      if (box) await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+      else await item.click();
+    } finally {
+      await handle.dispose().catch(() => {});
+    }
+    const active = await page.waitForFunction(options => {
+      const norm = value => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
       const input = document.querySelector('#prompt-textarea');
       const form = input?.closest('form') || input?.parentElement?.parentElement;
-      if (!form) return false;
-      const text = [...form.querySelectorAll('button, [role="button"]')]
-        .map(el => `${el.innerText || el.textContent || ''} ${el.getAttribute('aria-label') || ''}`)
-        .join(' ');
-      if (mode === 'image') return /图片，点击以重试|选择图片宽高比|\b图片\b|image, click to retry|select image aspect ratio|\bimage\b/i.test(text);
-      return true;
-    }, mode);
-    if (!active) throw new Error(`ChatGPT composer mode did not become active: ${mode}`);
+      const text = norm(`${input?.innerText || input?.textContent || ''} ${form?.innerText || form?.textContent || ''}`);
+      return options.some(label => text.includes(norm(label)));
+    }, { timeout: 3_000, polling: 100 }, options).then(() => true, () => false);
+    await page.keyboard.press('Escape').catch(() => {});
+    if (!active) {
+      log(`ChatGPT composer mode click was not confirmed for ${mode}; using workflow prompt fallback.`);
+      return;
+    }
     log(`Selected ChatGPT composer mode: ${mode}`);
   }
 
   async function selectImageAspectRatio(page, mode, ratio, log) {
-    // 图片比例是“创建图片”模式下的二级 popover。每次 image ask 都显式选一次，避免沿用上次手动选择。
     if (mode !== 'image') return;
     const labels = {
       auto: ['自动', 'Auto'],
@@ -336,61 +513,64 @@ function createChatGPTDom({ responseTimeout }) {
     };
     const options = labels[ratio || 'auto'];
     if (!options) throw new Error(`Unsupported imageAspectRatio: ${ratio}`);
-    // 宽高比按钮本身也本地化：先在 composer 内找“比例/ratio”按钮，再用页面侧真实 click 打开 popover。
-    // 不直接依赖单个 aria-label，是因为中文界面显示“选择图片宽高比”，英文界面可能只保留 ratio 文案；
-    // 但入口匹配不能只看 Auto：composer 里还有模型/工具的 Auto 按钮，点错会打开无关菜单。
-    const openerSelector = () => {
+    const openerHandle = await page.evaluateHandle(() => {
       const norm = value => String(value || '').replace(/\s+/g, ' ').trim();
       const input = document.querySelector('#prompt-textarea');
       const form = input?.closest('form') || input?.parentElement?.parentElement;
       return [...(form?.querySelectorAll('button, [role="button"]') || [])]
         .find(item => /选择图片宽高比|image aspect ratio|aspect ratio|ratio|1:1|3:4|9:16|4:3|16:9|方形|正方形|square|竖版|portrait|故事版|story|横版|landscape|宽屏|wide/i.test(`${norm(item.innerText || item.textContent)} ${norm(item.getAttribute('aria-label'))}`)) || null;
-    };
-    await page.waitForFunction(openerSelector, { timeout: 10_000 });
-    const openerHandle = await page.evaluateHandle(openerSelector);
-    const openerElement = openerHandle.asElement();
-    if (!openerElement) throw new Error(`Could not open image aspect ratio menu`);
-    const openerText = await openerElement.evaluate(el => `${el?.innerText || el?.textContent || ''} ${el?.getAttribute('aria-label') || ''}`.replace(/\s+/g, ' ').trim()).catch(() => 'unknown');
-    // 这里必须用 Puppeteer 的 ElementHandle.click() 走真实鼠标事件；ChatGPT 的 popover 绑定在交互事件链上，
-    // 直接在 page.evaluate 里调用 DOM .click() 实测会出现“按钮被点了但菜单没有打开”的假成功。
-    await openerElement.click();
-    await openerHandle.dispose().catch(() => {});
+    });
+    const opener = openerHandle.asElement();
+    if (!opener) {
+      await openerHandle.dispose().catch(() => {});
+      log(`Image aspect ratio control unavailable; using workflow prompt fallback: ${ratio || 'auto'}`);
+      return;
+    }
+    const openerText = await opener.evaluate(element => `${element?.innerText || element?.textContent || ''} ${element?.getAttribute('aria-label') || ''}`.replace(/\s+/g, ' ').trim()).catch(() => 'unknown');
+    try { await opener.click(); }
+    catch (err) { await openerHandle.dispose().catch(() => {}); throw err; }
     await sleep(1_000);
-    const clicked = await page.evaluate(options => {
+    const itemHandle = await page.evaluateHandle(options => {
       const norm = value => String(value || '').replace(/\s+/g, ' ').trim();
       const numerics = options.map(label => norm(label).match(/\d+:\d+/)?.[0]).filter(Boolean);
-      const item = [...document.querySelectorAll('[role="menuitemradio"], [role="menuitem"]')]
-        .find(el => {
-          const text = [el.innerText, el.textContent, el.getAttribute('aria-label')].map(value => norm(value).toLowerCase()).join(' ');
+      return [...document.querySelectorAll('[role="menuitemradio"], [role="menuitem"], div.__menu-item')]
+        .filter(element => !!(element.offsetWidth || element.offsetHeight || element.getClientRects().length))
+        .find(element => {
+          const text = [element.innerText, element.textContent, element.getAttribute('aria-label')].map(value => norm(value).toLowerCase()).join(' ');
           return options.some(label => text.includes(norm(label).toLowerCase())) || numerics.some(numeric => text.includes(numeric));
-        });
-      if (!item) return false;
-      item.click();
-      return true;
+        }) || null;
     }, options);
-    if (!clicked) {
-      const available = await page.evaluate(() => [...document.querySelectorAll('[role="menuitemradio"], [role="menuitem"], [role="option"], [role="radio"], button')]
-        .map(el => `${el.innerText || el.textContent || ''} ${el.getAttribute('aria-label') || ''}`.replace(/\s+/g, ' ').trim())
-        .filter(Boolean)
-        .slice(0, 12));
-      throw new Error(`Could not select image aspect ratio: ${ratio || 'auto'}; opener: ${openerText || 'unknown'}; available: ${available.join(' | ') || 'none'}`);
+    const item = itemHandle.asElement();
+    if (!item) {
+      await itemHandle.dispose().catch(() => {});
+      await openerHandle.dispose().catch(() => {});
+      log(`Could not select image aspect ratio ${ratio || 'auto'}; using workflow prompt fallback. Opener: ${openerText || 'unknown'}`);
+      await page.keyboard.press('Escape').catch(() => {});
+      return;
     }
-    await sleep(500);
-    const active = await page.evaluate(options => {
-      // 选中后按钮可能只显示“方形/宽屏”而不显示完整比例；名称或数值命中任一即可确认。
-      const norm = value => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
-      const input = document.querySelector('#prompt-textarea');
-      const form = input?.closest('form') || input?.parentElement?.parentElement;
-      const text = [...(form?.querySelectorAll('button, [role="button"]') || [])]
-        .map(button => `${norm(button.innerText || button.textContent)} ${norm(button.getAttribute('aria-label'))}`)
-        .join(' ');
-      return options.some(label => {
-        const [name, numeric] = norm(label).split(' ');
-        return text.includes(norm(label)) || text.includes(name) || numeric && text.includes(numeric);
-      });
-    }, options);
-    if (!active) throw new Error(`Image aspect ratio did not become active: ${ratio || 'auto'}`);
+    let active = false;
+    try {
+      const box = await item.boundingBox();
+      if (box) await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+      else await item.click();
+      await sleep(500);
+      active = await opener.evaluate((button, options) => {
+        const norm = value => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        const text = `${norm(button.innerText || button.textContent)} ${norm(button.getAttribute('aria-label'))}`;
+        return options.some(label => {
+          const [name, numeric] = norm(label).split(' ');
+          return text.includes(norm(label)) || text.includes(name) || numeric && text.includes(numeric);
+        });
+      }, options);
+    } finally {
+      await itemHandle.dispose().catch(() => {});
+      await openerHandle.dispose().catch(() => {});
+    }
     await page.keyboard.press('Escape').catch(() => {});
+    if (!active) {
+      log(`Image aspect ratio UI did not confirm ${ratio || 'auto'}; workflow prompt fallback remains active.`);
+      return;
+    }
     log(`Selected image aspect ratio: ${ratio || 'auto'}`);
   }
 
@@ -399,7 +579,7 @@ function createChatGPTDom({ responseTimeout }) {
    *
    * ChatGPT Web 在重复文件、frame 重建或大文件解析时会出现短暂 toast/dialog。
    * 这里不把 toast 文案当成功标准，只等待 send button 重新可用；如果 frame 已 detached，
-   * 最多重试三次同一上传动作。
+   * 对 frame/context 重建保留两次有界重试，避免瞬态恢复刚好跨过单次重试窗口。
    */
   async function uploadFiles(page, files, workspaceDir, log, shouldCancel = () => false) {
     // 上传失败不能降级成无附件发送；先校验本地文件存在，再碰 ChatGPT 页面。
@@ -408,17 +588,18 @@ function createChatGPTDom({ responseTimeout }) {
     }
     if (files.length === 0) return;
 
+    // Chromium 在 detached frame 与 file chooser 重建时可能连续失败两次；保留第三次有界恢复机会。
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
         log(`Uploading ${files.length} file(s), attempt ${attempt}: ${files.map(file => path.basename(file)).join(', ')}`);
         await page.waitForSelector('#prompt-textarea', { timeout: 15_000 });
         if (shouldCancel()) throw new Error('Ask cancelled during upload preparation');
         const names = files.map(file => path.basename(file));
-        // 重试不能把“同名 chip 已存在”当作成功：它可能是上次取消/崩溃留下的旧附件。
-        // 发现同名 chip 时先清理再重传，宁可多走一次 upload，也不要把旧文件发给新 prompt。
-        if (await hasAttachmentNames(page, names)) {
+        // 任意既有 chip 都可能是上次 partial batch；必须整体清空，不能只在所有文件名齐全时清理。
+        if (await attachmentCount(page) > 0) {
           await clearComposerAttachments(page, log);
           await sleep(500);
+          await assertNoComposerAttachments(page);
         }
         const prepared = prepareUploadFiles(files, workspaceDir);
         try {
@@ -520,11 +701,13 @@ function createChatGPTDom({ responseTimeout }) {
 
   async function transcribeAudioFileDirect(page, audioBase64, file) {
     // fetchTimeoutMs 传给页面侧 AbortController；按文件大小缩放避免大文件误杀。
-    // 最低 15s：实际转写 2-8s，15s 足够覆盖慢网络。每 100KB base64 额外给 0.5s 上传时间。
+    // direct 请求按音频大小扩展预算，但始终受外层 voice 总 deadline 约束。
     // 上限 45s：必须低于外层 VOICE_TRANSCRIBE_TIMEOUT_MS(60s)，留余量给 session fetch + 开销。
     const fetchTimeoutMs = Math.min(45_000, Math.max(15_000, audioBase64.length * 0.005));
     return page.evaluate(async (config) => {
       const startedAt = performance.now();
+      // 必须在页面任务内部检查；Node 的 page.url() 与 evaluate 之间存在导航竞态，不能保护录音字节。
+      if (location.origin !== config.requiredOrigin) throw new Error('Voice page left the official ChatGPT origin');
       // 页面侧 fetch 超时：页面复用数小时后 Service Worker 或后端可能挂起 fetch。
       // AbortController 在超时后强制中断，让外层创建新页面重试而不是永久挂起。
       // 注意：如果页面事件循环本身冻结，此 timer 不会触发——由 Node 侧 withTimeout 兜底。
@@ -543,10 +726,12 @@ function createChatGPTDom({ responseTimeout }) {
       // base64 是从 Node 传入的音频字节；页面只看到 bytes/File，不知道本地绝对路径。
       const bytes = Uint8Array.from(atob(config.audioBase64), char => char.charCodeAt(0));
       const form = new FormData();
-      // FormData 字段名必须是 file，保持和 ChatGPT 前端 Rlr.transcribe client 的请求形状一致。
+      // 私有 direct endpoint 当前接受 file 字段；结构漂移时抛错并回退到 UI dictation。
       // 这里复用 ChatGPT 前端 batch fallback 的 /backend-api/transcribe 语义：上传一个 File，由网页会话 bearer token 授权。
       // 只传文件名和 MIME，不传本地绝对路径；token 只用于当前请求，永远不返回到 Node 日志。
       form.append('file', new File([bytes], config.name, { type: config.mimeType }));
+      // session fetch 后仍可能发生 SPA/外部导航；POST 音频前再次在同一 execution context 核验 origin。
+      if (location.origin !== config.requiredOrigin) throw new Error('Voice page left the official ChatGPT origin');
       // credentials=include 保持和 ChatGPT 前端 client 一致；Authorization 负责真正的 backend-api 鉴权。
       const response = await fetchWithTimeout('/backend-api/transcribe', {
         method: 'POST',
@@ -579,26 +764,12 @@ function createChatGPTDom({ responseTimeout }) {
       // basename 只用于 File.name；真实路径校验已经在 daemon/client 边界完成。
       name: path.basename(file),
       // MIME 单独传入，避免页面上下文重新推导本地路径扩展名。
-      mimeType: audioMimeType(file),
+      // daemon 入口只接受 RIFF/WAVE；不维护当前不可达的其它音频 MIME 分支。
+      mimeType: 'audio/wav',
       // fetch 超时传给页面侧 AbortController
       fetchTimeoutMs,
+      requiredOrigin: 'https://chatgpt.com',
     });
-  }
-
-  function audioMimeType(file) {
-    // MIME 只按扩展名声明上传格式；真正文件合法性仍由上游 voice file/WAV 校验负责。
-    const ext = path.extname(file).toLowerCase();
-    // ChatGPT 前端 bundle 明确接受这些音频类型；保留枚举比把任意扩展转成 audio/* 更安全。
-    if (ext === '.wav') return 'audio/wav';
-    // webm 是浏览器 MediaRecorder 常见输出，保留它便于未来复用已有录音文件测试。
-    if (ext === '.webm') return 'audio/webm';
-    if (ext === '.m4a') return 'audio/m4a';
-    // mp3 用 audio/mpeg 而不是 audio/mp3，贴近浏览器和后端更通用的 MIME 识别。
-    if (ext === '.mp3') return 'audio/mpeg';
-    if (ext === '.ogg') return 'audio/ogg';
-    if (ext === '.flac') return 'audio/flac';
-    // 未知扩展交给后端判断；这里不猜测 MIME，避免错误声明导致转写结果不可预测。
-    return 'application/octet-stream';
   }
 
   function applyVoiceInputPatch(config) {
@@ -846,9 +1017,11 @@ function createChatGPTDom({ responseTimeout }) {
 
   async function waitForUploadReady(page, log, shouldCancel) {
     // 大文件上传后前端会解析一段时间，send button disabled 是解析中信号，不应提前点击发送。
-    // 不再给上传解析单独设固定超时；外层 MCP/CLI 取消才是统一生命周期边界。
+    // 上传解析继承 responseTimeout，但 60 秒没有进入可发送态视为网页退化，避免永久占住 session lock。
+    const startedAt = Date.now();
     for (;;) {
       if (shouldCancel()) throw new Error('Ask cancelled while waiting for upload readiness');
+      if (Date.now() - startedAt > Math.min(responseTimeout, 60_000)) throw new Error('Upload did not become ready within the browser progress window');
       if (await page.evaluate(() => {
         const input = document.querySelector('#prompt-textarea');
         const button = input?.closest('form')?.querySelector('button[data-testid="send-button"]');
@@ -862,17 +1035,22 @@ function createChatGPTDom({ responseTimeout }) {
   }
 
   async function attachmentCount(page) {
-    // 不再假设文件名一定有扩展名；计数只用于 cleanup 后的 sanity check，真正上传成功看期望 basename。
-    // 只认 attachment/file chip 容器；普通按钮 aria-label（进阶、语音、项目菜单）不能算附件。
-    return page.evaluate(() => {
-      return attachmentTexts().length;
+    return (await attachmentState(page)).texts.length;
+  }
+
+  function attachmentState(page, names = []) {
+    // cleanup、计数和 ready 判断共用同一 DOM 解释，避免 ChatGPT chip 结构漂移时三处分别更新。
+    return page.evaluate(names => {
+      const texts = attachmentTexts();
+      const haystack = texts.join(' ');
+      return { texts, namesPresent: names.every(name => haystack.includes(normalize(name))) };
 
       function attachmentTexts() {
         const input = document.querySelector('#prompt-textarea');
         const root = input?.closest('form') || input?.parentElement?.parentElement;
         if (!root) return [];
         const texts = new Set();
-        // 2026 版 ChatGPT 文件 tile 没有稳定 data-testid；真正稳定的是 role=group + 文件名 aria-label。
+        // 当前文件 tile 优先暴露 role=group + 文件名 aria-label；data-testid 只作后备。
         // 先读 tile 容器可以避免把“移除文件”按钮和同一个文件名重复计数成两份附件。
         for (const el of root.querySelectorAll('[role="group"][aria-label]')) {
           const text = normalize(`${el.getAttribute('aria-label') || ''} ${el.textContent || ''}`);
@@ -894,39 +1072,6 @@ function createChatGPTDom({ responseTimeout }) {
       function normalize(value) {
         return String(value || '').normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
       }
-    });
-  }
-
-  async function hasAttachmentNames(page, names) {
-    return page.evaluate(names => {
-      const haystack = attachmentHaystack();
-      // basename 可能重复；用计数而不是 every/includes，避免一个 chip 伪装成两份同名附件。
-      return names.every(name => haystack.includes(normalize(name)));
-
-      function attachmentHaystack() {
-        const input = document.querySelector('#prompt-textarea');
-        const root = input?.closest('form') || input?.parentElement?.parentElement;
-        if (!root) return '';
-        // ChatGPT chip 文本不稳定：文件名可能在 aria-label 或可见文本里，统一拼接后按 basename 搜索。
-        const parts = [];
-        // role=group 是当前文件卡片的语义容器；data-testid 只作为旧版/变体 UI 的后备。
-        for (const el of root.querySelectorAll('[role="group"][aria-label]')) {
-          parts.push(`${el.getAttribute('aria-label') || ''} ${el.textContent || ''}`);
-        }
-        for (const el of root.querySelectorAll('[data-testid*="attachment"], [data-testid*="file"]')) {
-          if (isUploadControl(el)) continue;
-          parts.push(`${el.textContent || ''} ${el.getAttribute('aria-label') || ''}`);
-        }
-        return normalize(parts.join(' '));
-      }
-
-      function isUploadControl(el) {
-        return /^(input|textarea)$/i.test(el.tagName) || /^(upload-files|upload-photos|upload-camera)$/.test(el.id || '') || /upload-photos-input|composer-plus-btn/.test(el.getAttribute('data-testid') || '');
-      }
-
-      function normalize(value) {
-        return String(value || '').normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
-      }
     }, names);
   }
 
@@ -935,47 +1080,26 @@ function createChatGPTDom({ responseTimeout }) {
     // 同时校验文件名，是为了挡住一种很隐蔽的失败：历史附件或页面其它 file 卡片让数量达标，
     // 但本次真正要发的附件并未挂到 composer 上。这里宁可等待外层取消，也不要发送“缺附件”的 prompt。
     // basename 可以包含空格、中文或没有扩展名；比较前统一 NFKC/空白/大小写，避免 UI 文本形态差异导致误判。
+    const startedAt = Date.now();
+    let lastProgressAt = startedAt;
+    let lastSnapshot = '';
     for (;;) {
       if (shouldCancel()) throw new Error('Ask cancelled while waiting for attachment chips');
-      if (await page.evaluate(({ count, names }) => {
-        const texts = attachmentTexts();
-        const haystack = texts.join(' ');
-        return texts.length >= count && names.every(name => haystack.includes(normalize(name)));
-
-        function attachmentTexts() {
-          const input = document.querySelector('#prompt-textarea');
-          const root = input?.closest('form') || input?.parentElement?.parentElement;
-          if (!root) return [];
-          const texts = new Set();
-          // 等待上传完成时同样优先按 tile 容器计数；否则同一附件的标题、类型、删除按钮会制造假数量。
-          for (const el of root.querySelectorAll('[role="group"][aria-label]')) {
-            const text = normalize(`${el.getAttribute('aria-label') || ''} ${el.textContent || ''}`);
-            if (text) texts.add(text);
-          }
-          if (texts.size > 0) return [...texts];
-          for (const el of root.querySelectorAll('[data-testid*="attachment"], [data-testid*="file"]')) {
-            if (isUploadControl(el)) continue;
-            const text = normalize(`${el.textContent || ''} ${el.getAttribute('aria-label') || ''}`);
-            if (text && !/^(send|stop|attach files?|upload files?|发送|停止|上传文件|添加文件等)$/.test(text)) texts.add(text);
-          }
-          return [...texts];
-        }
-
-        function isUploadControl(el) {
-          return /^(input|textarea)$/i.test(el.tagName) || /^(upload-files|upload-photos|upload-camera)$/.test(el.id || '') || /upload-photos-input|composer-plus-btn/.test(el.getAttribute('data-testid') || '');
-        }
-
-        function normalize(value) {
-          return String(value || '').normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
-        }
-      }, { count: expected, names })) return;
+      if (Date.now() - startedAt > responseTimeout || Date.now() - lastProgressAt > 30_000) throw new Error('Attachment chips made no progress after upload');
+      const state = await attachmentState(page, names);
+      if (state.texts.length >= expected && state.namesPresent) return;
+      const snapshot = state.texts.join('\0');
+      if (snapshot !== lastSnapshot) {
+        lastSnapshot = snapshot;
+        lastProgressAt = Date.now();
+      }
       await sleep(1_000);
     }
   }
 
   function isRecoverableBrowserError(err) {
-    // 这些错误通常来自 React/Frame 重建，重试同一次上传动作比直接失败更符合浏览器实际行为。
-    return /detached Frame|Execution context was destroyed|Cannot find context|Node is detached|Target closed|Protocol error|Runtime\.callFunctionOn timed out/i.test(err.message || '');
+    // 只重试同一 page 上可恢复的 frame/context/node 重建；Target closed 和泛化协议错误需要上层换页。
+    return /detached Frame|Execution context was destroyed|Cannot find context|Node is detached/i.test(err.message || '');
   }
 
   async function fillPrompt(page, text) {
@@ -1030,6 +1154,11 @@ function createChatGPTDom({ responseTimeout }) {
   }
 
   async function clickSend(page, expectedPrompt, beforeClick) {
+    // 可信点击只解决浏览器事件语义，不能单独证明远端接受；user turn 或路由变化才是接受证据。
+    // core 的 beforeClick 回调在同一个同步栈中复核页面身份，因此 URL 漂移会阻止鼠标事件发出。
+    // 点击后的路由仍可能错误，core 随后用 conversation policy 再验证，DOM 层不擅自写 registry。
+    // 发送具有远端副作用：点击前失败可以安全重试，点击开始后则必须先写 lost/pending 防重发标记。
+    // 接受证据只认新增 user turn；composer 清空和 URL 变化都可能由手动导航造成，不能单独证明提交成功。
     // send button 必须来自当前 composer 的 form；全局 querySelector 可能点到隐藏/历史 composer。
     // 这里和 fillPrompt 做两次文本校验：第一次验证填充成功，第二次验证点击瞬间没有被 React 重置或用户焦点切换。
     await page.waitForFunction(value => {
@@ -1046,15 +1175,15 @@ function createChatGPTDom({ responseTimeout }) {
         return String(value || '').replace(/[ \t]+/g, ' ').replace(/[ \t]*\n[ \t]*/g, '\n').replace(/\n+/g, '\n').trim();
       }
     }, { timeout: 10_000, polling: 250 }, expectedPrompt);
-    // waitForFunction 已通过后才布置 tombstone；这样 pre-click 校验失败不会污染 session registry。
-    beforeClick();
-    const clicked = await page.evaluate(value => {
+    const before = await page.evaluate(value => {
       const input = document.querySelector('#prompt-textarea');
       const form = input?.closest('form');
       const button = form?.querySelector('button[data-testid="send-button"]');
-      if (!button || button.disabled || composerText(input) !== value) return false;
-      button.click();
-      return true;
+      return {
+        valid: !!button && !button.disabled && composerText(input) === value,
+        userCount: document.querySelectorAll('[data-message-author-role="user"]').length,
+        url: location.href,
+      };
 
       function composerText(input) {
         return normalize((input?.innerText || input?.textContent || '').replace(/\r\n?/g, '\n'));
@@ -1064,7 +1193,25 @@ function createChatGPTDom({ responseTimeout }) {
         return String(value || '').replace(/[ \t]+/g, ' ').replace(/[ \t]*\n[ \t]*/g, '\n').replace(/\n+/g, '\n').trim();
       }
     }, expectedPrompt);
-    if (!clicked) throw new Error('Send button verification failed before click');
+    if (!before.valid) throw new Error('Send button verification failed before click');
+
+    // Project 首页忽略 DOM button.click() 的非可信事件；ElementHandle.click 才会产生浏览器级鼠标事件。
+    // 句柄仍从当前 composer form 内获取，避免全局 selector 点到隐藏或历史 composer。
+    const handle = await page.evaluateHandle(() => document.querySelector('#prompt-textarea')?.closest('form')?.querySelector('button[data-testid="send-button"]'));
+    const button = handle.asElement();
+    if (!button) {
+      await handle.dispose();
+      throw new Error('Send button disappeared before trusted click');
+    }
+    // waitForFunction 已通过且句柄已取得后才布置 tombstone；pre-click 失败不会污染 session registry。
+    beforeClick();
+    try { await button.click(); }
+    finally { await handle.dispose(); }
+
+    // composer 清空或路由变化都可能来自手动导航；只有本轮 user turn 真正进入 DOM 才算网页接受。
+    await page.waitForFunction(userCount => {
+      return document.querySelectorAll('[data-message-author-role="user"]').length > userCount;
+    }, { timeout: 10_000, polling: 100 }, before.userCount);
   }
 
   function normalizeComposerText(text) {
@@ -1104,6 +1251,7 @@ function createChatGPTDom({ responseTimeout }) {
         if (options.shouldCancel?.() && submitted) return { status: 'generating', reason: 'client-disconnected' };
         // 原生图片可能没有 assistant 文本；图片数量增长也说明回答已经开始出现。
         if (submitted && current.nativeImageCount > before.nativeImageCount) return;
+        if (submitted && current.emptyAssistantTurn && current.turnCount > (before.turnCount || 0)) return;
         if (submitted && ((current.count > before.count && current.lastText) || (current.lastText && current.lastText !== before.lastText))) return;
       }
       if (Date.now() > deadline) {
@@ -1145,6 +1293,7 @@ function createChatGPTDom({ responseTimeout }) {
       const hasNewText = (state.count > before.count && len > 0) || (state.lastText && state.lastText !== before.lastText);
       const responseLen = hasNewText ? len : 0;
       const hasNewNativeImage = state.nativeImageCount > before.nativeImageCount;
+      const hasNewEmptyAssistant = state.emptyAssistantTurn && state.turnCount > (before.turnCount || 0);
       if (responseLen !== lastLen || state.nativeImageCount !== lastImageCount) {
         lastLen = responseLen;
         lastImageCount = state.nativeImageCount;
@@ -1152,13 +1301,9 @@ function createChatGPTDom({ responseTimeout }) {
         continue;
       }
 
-      const stableMs = responseStableMs(responseLen, options.slow);
-      // stop button 消失是必要条件；消息底部操作按钮（copy/regenerate 等）渲染到 DOM 才是安全完成的充分条件。
-      // stop button 消失但操作按钮未出现时，DOM 可能仍在更新，不能提前返回。
-      // 操作按钮出现时只需 750ms 稳定窗口（一个轮询周期）防最后一帧竞态。
-      const fullyRendered = responseLen > 0 && !state.generating && !state.placeholder && state.actionButtons;
-      const doneStableMs = fullyRendered ? Math.min(stableMs, 750) : stableMs;
-      if (!state.generating && !state.placeholder && (hasNewText || hasNewNativeImage) && Date.now() - lastChangedAt >= doneStableMs) {
+      // Copy/Regenerate 等操作只在完整 assistant turn hydrate 后出现；它是安全的加速信号，不替代 stop 与本轮归属检查。
+      const stableMs = state.completionControls || hasNewEmptyAssistant ? 750 : responseStableMs(responseLen, options.slow);
+      if (!state.generating && !state.placeholder && (hasNewText || hasNewNativeImage || hasNewEmptyAssistant) && Date.now() - lastChangedAt >= stableMs) {
         return { status: 'completed', reason: 'stable' };
       }
     }
@@ -1185,16 +1330,13 @@ function createChatGPTDom({ responseTimeout }) {
       const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
       const userCount = document.querySelectorAll('[data-message-author-role="user"]').length;
       const lastText = msgs.length > 0 ? (msgs[msgs.length - 1].innerText || '').trim() : '';
-      const lastAssistant = msgs.length > 0 ? msgs[msgs.length - 1] : null;
-      const emptyAssistantTurn = emptyUnroleAssistantTurn();
-      // 操作按钮（copy/regenerate 等）在 conversation-turn 容器底部，不在 assistant 消息元素内部。
-      // 只搜索 assistant 元素会漏掉这些按钮；必须搜索整个 turn 容器。
-      const lastTurn = lastAssistant?.closest('[data-testid^="conversation-turn-"]')
-        || [...document.querySelectorAll('[data-testid^="conversation-turn-"]')].pop();
-      const turnButtonLabels = [...(lastTurn?.querySelectorAll('button') || [])]
-        .map(button => `${button.getAttribute('aria-label') || ''} ${button.getAttribute('data-testid') || ''} ${button.textContent || ''}`.trim())
-        .filter(Boolean);
+      const turns = [...document.querySelectorAll('[data-testid^="conversation-turn"]')];
+      const emptyAssistantTurn = emptyUnroleAssistantTurn(turns);
       const stopButton = !!document.querySelector('button[data-testid="stop-button"], button[aria-label*="Stop"], button[aria-label*="停止"]');
+      const latestAssistant = msgs.length > 0 ? msgs[msgs.length - 1] : null;
+      const completionControls = [...(latestAssistant?.querySelectorAll('button') || [])]
+        .filter(button => !!(button.offsetWidth || button.offsetHeight || button.getClientRects().length))
+        .some(button => /copy|复制|regenerate|重新生成|share|分享|read aloud|朗读|like|点赞|dislike|踩/i.test(`${button.getAttribute('aria-label') || ''} ${button.textContent || ''}`));
       // 图片 URL 快照既用于完成判定，也用于下载阶段过滤旧图；复用同一 session 时不能把历史图片当本轮产物。
       // 原生绘图回答会生成 image-turn，而不是 assistant role；全页快照才能让 image-only 任务从 pending 恢复。
       const nativeImageURLs = generatedImageURLs(document);
@@ -1203,22 +1345,23 @@ function createChatGPTDom({ responseTimeout }) {
         userCount,
         nativeImageCount: nativeImageURLs.length,
         nativeImageURLs,
+        turnCount: turns.length,
         lastText,
-        copyButton: turnButtonLabels.some(label => /copy|复制/i.test(label)),
-        // actionButtons 是比 copyButton 更宽的完成信号：copy/regenerate/share/like 等任意操作按钮出现都说明 DOM 已完全渲染。
-        // stop button 消失只表示生成停止，但 DOM 可能还在更新；操作按钮出现才是安全返回的条件。
-        actionButtons: turnButtonLabels.some(label => /copy|复制|regenerate|重新生成|share|分享|read aloud|朗读|like|点赞|dislike|踩/i.test(label)),
         generating: stopButton,
         placeholder: /^(thinking|thinking\.\.\.|思考中|正在思考)$/i.test(lastText.replace(/\s+/g, ' ').trim()),
+        completionControls,
         emptyAssistantTurn,
         url: location.href,
       };
 
-      function emptyUnroleAssistantTurn() {
+      function emptyUnroleAssistantTurn(turns) {
         // Deep Research 实测会留下一个只有“ChatGPT 说：”的 turn，但没有 assistant role 节点。
-        // stop button 已消失时，它不应让同一个 session 永久 pending。
-        const turns = [...document.querySelectorAll('[data-testid^="conversation-turn"]')];
-        return msgs.length === 0 && turns.some(turn => /^(ChatGPT\s*说[:：]?|ChatGPT said[:：]?)$/.test((turn.innerText || turn.textContent || '').replace(/\s+/g, ' ').trim()));
+        // 只检查最新 turn；历史里是否已有普通 assistant 不影响本轮空完成判定。
+        const latest = turns.at(-1);
+        return !!latest
+          && !latest.querySelector('[data-message-author-role="assistant"]')
+          && !latest.querySelector('[data-message-author-role="user"]')
+          && /^(ChatGPT\s*说[:：]?|ChatGPT said[:：]?)$/.test((latest.innerText || latest.textContent || '').replace(/\s+/g, ' ').trim());
       }
 
       function generatedImageURLs(root) {
@@ -1425,28 +1568,43 @@ function createChatGPTDom({ responseTimeout }) {
    * 最后一条 assistant 中收集。点击前后对下载目录做快照，是为了识别真实落盘文件名，而
    * 不是盲信按钮显示的文件名。
    */
-  async function downloadSandboxFiles(page, downloadDir, log, limit, byteBudget, shouldCancel) {
+  async function downloadSandboxFiles(page, downloadDir, log, limit, byteBudget, shouldCancel, previousAssistantCount) {
+    // 候选发现仅限最后一条 assistant，避免历史回答中的同名按钮被当成本轮生成文件。
+    // 按钮和 card 可能指向同一 DOM 控件，必须先按元素索引去重再应用数量/字节预算。
+    // 预览下载与直接下载共用落盘观察；按钮点击、dialog 出现都不能替代实际稳定文件。
+    // Browser.setDownloadBehavior 是整个浏览器上下文的状态，不属于单页；外层队列保证同一时间只有一个目录生效。
+    // 每个候选再使用独占 workDir，把“本轮唯一新文件”变成可验证事实，而不是信任模型给出的文件名。
+    // CDP 默认状态必须在 finally 恢复，否则用户后续手动下载也会被静默导入 OpenCode cache。
     if (limit <= 0) return { downloads: [], notices: [] };
     ensurePrivateDir(downloadDir);
     const client = await page.target().createCDPSession();
-    await client.send('Page.setDownloadBehavior', { behavior: 'allow', downloadPath: downloadDir });
     try {
-      const files = await page.evaluate(limit => {
-        const msg = [...document.querySelectorAll('[data-message-author-role="assistant"]')].at(-1);
+      const files = await page.evaluate(({ limit, previousAssistantCount }) => {
+        const messages = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
+        // image-only/空 turn 不新增标准 assistant 节点；此时不能把上一轮 sandbox 文件重新归属给本轮。
+        if (Number.isInteger(previousAssistantCount) && messages.length <= previousAssistantCount) return [];
+        const msg = messages.at(-1);
         if (!msg) return [];
-        const inlineButtons = [...msg.querySelectorAll('button')]
+        const buttons = [...msg.querySelectorAll('button')];
+        const inlineButtons = buttons
           .map((button, index) => {
             // 有些 sandbox 卡片按钮只叫 Download，没有文件名；先记录按钮位置，落盘后再以真实文件名为准。
             const label = (button.innerText || button.textContent || button.getAttribute('aria-label') || '').trim();
-            const text = label.replace(/^(download|下载)\s+/i, '');
-            return { kind: 'button', index, text: text || `artifact-${index + 1}`, label };
+            const namedText = label.replace(/^(download|下载)(?:\s+|$)/i, '').trim();
+            return { kind: 'button', index, text: namedText || `artifact-${index + 1}`, named: !!namedText, label };
           })
           .filter(button => /download|下载/i.test(button.label) || /\.[a-z0-9]{1,16}$/i.test(button.text));
-        const cards = [...msg.querySelectorAll('.group.my-4')]
-          .map((card, index) => ({ kind: 'card', index, text: ((card.innerText || '').match(/[^\s]+\.[a-z0-9]{1,16}\b/i) || [])[0] || `artifact-card-${index + 1}` }))
-          .filter(card => [...msg.querySelectorAll('.group.my-4')][card.index].querySelector('button:not([disabled])'));
+        const cardElements = [...msg.querySelectorAll('.group.my-4')];
+        const cards = cardElements
+          .map((card, index) => {
+            const buttonIndex = buttons.indexOf(card.querySelector('button:not([disabled])'));
+            const namedText = ((card.innerText || '').match(/[^\s]+\.[a-z0-9]{1,16}\b/i) || [])[0];
+            return { kind: 'card', index, buttonIndex, text: namedText || `artifact-card-${index + 1}`, named: !!namedText };
+          })
+          // 同一个 card button 可能同时满足 inline 与 card 规则；按 DOM 身份只保留一次，避免重复下载占预算。
+          .filter(card => card.buttonIndex >= 0 && !inlineButtons.some(button => button.index === card.buttonIndex));
         return [...inlineButtons, ...cards].slice(0, limit);
-      }, limit);
+      }, { limit, previousAssistantCount });
 
       const downloads = [];
       const notices = [];
@@ -1458,22 +1616,12 @@ function createChatGPTDom({ responseTimeout }) {
         try {
           log(`Downloading generated file: ${file.text}`);
           ensurePrivateDir(workDir);
-          await client.send('Page.setDownloadBehavior', { behavior: 'allow', downloadPath: workDir });
+          // 新版文件预览从 Browser 域触发下载；旧 Page.setDownloadBehavior 不再控制其落盘目录。
+          await client.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: workDir });
           // 每个 artifact 都落在独立临时目录，失败或超时也不会把裸文件混入最终 downloads 根目录。
           const before = snapshotDownloadDir(workDir);
           const beforeTemp = snapshotTempFiles(workDir);
-          const clicked = await page.evaluate(target => {
-            const msg = [...document.querySelectorAll('[data-message-author-role="assistant"]')].at(-1);
-            const clean = value => (value || '').trim().replace(/^(download|下载)\s+/i, '');
-            // 不复用发现阶段的 DOM index；React 重排后按文件名重新定位，宁可失败也不点错按钮。
-            const button = target.kind === 'card'
-              ? ([...msg.querySelectorAll('.group.my-4')].find(card => (card.innerText || '').includes(target.text)) || [...msg.querySelectorAll('.group.my-4')][target.index])?.querySelector('button:not([disabled])')
-              : [...msg.querySelectorAll('button')].find(button => clean(button.innerText || button.textContent || button.getAttribute('aria-label') || '') === target.text) || [...msg.querySelectorAll('button')][target.index];
-            if (!button) return false;
-            button?.scrollIntoView({ block: 'center' });
-            button?.click();
-            return true;
-          }, file);
+          const clicked = await clickSandboxArtifact(page, file);
           if (!clicked) throw new Error('download control disappeared before click');
           const saved = await waitForDownloadedFile(workDir, before, beforeTemp, file.text, shouldCancel);
           const size = fs.statSync(saved).size;
@@ -1491,15 +1639,81 @@ function createChatGPTDom({ responseTimeout }) {
         } catch (err) {
           notices.push(`Sandbox artifact failed (${file.text}): ${err.message}`);
         } finally {
+          // 新版文件卡片会打开全屏预览；下载完成或失败后退出，避免遮住 composer 和下一份产物。
+          await page.keyboard.press('Escape').catch(() => {});
           cleanupDownloadWorkDir(workDir);
         }
       }
       return { downloads, notices };
     } finally {
       // 下载目录是浏览器上下文级状态；用完立即恢复并 detach，避免后续手动下载落到会话 cache。
-      await client.send('Page.setDownloadBehavior', { behavior: 'default' }).catch(() => {});
+      await client.send('Browser.setDownloadBehavior', { behavior: 'default' }).catch(() => {});
       await client.detach().catch(() => {});
     }
+  }
+
+  async function clickSandboxArtifact(page, target) {
+    // 预览可能复用旧 portal；先记录可见 dialog 的签名计数，后续只操作新增或内容已变化的实例。
+    const dialogsBefore = await page.evaluate(() => {
+      const visible = item => !!(item.offsetWidth || item.offsetHeight || item.getClientRects().length);
+      return [...document.querySelectorAll('[role="dialog"]')].filter(visible)
+        .map(dialog => `${dialog.getAttribute('aria-label') || ''}\u0000${dialog.innerText || dialog.textContent || ''}`.replace(/\s+/g, ' ').trim());
+    });
+    const handle = await page.evaluateHandle(target => {
+      const msg = [...document.querySelectorAll('[data-message-author-role="assistant"]')].at(-1);
+      if (!msg) return null;
+      const clean = value => (value || '').trim().replace(/^(download|下载)\s+/i, '');
+      return target.kind === 'card'
+        ? (target.named
+            ? [...msg.querySelectorAll('.group.my-4')].find(card => (card.innerText || '').includes(target.text))
+            : [...msg.querySelectorAll('.group.my-4')][target.index])?.querySelector('button:not([disabled])') || null
+        : target.named
+          ? [...msg.querySelectorAll('button')].find(button => clean(button.innerText || button.textContent || button.getAttribute('aria-label') || '') === target.text) || null
+          : [...msg.querySelectorAll('button')][target.index] || null;
+    }, target);
+    const artifact = handle.asElement();
+    if (!artifact) {
+      await handle.dispose().catch(() => {});
+      return false;
+    }
+    try {
+      await page.bringToFront().catch(() => {});
+      await artifact.evaluate(element => element.scrollIntoView({ block: 'center', inline: 'nearest' }));
+      await sleep(100);
+      const box = await artifact.boundingBox();
+      if (box) await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+      else await artifact.click();
+    } finally {
+      await handle.dispose().catch(() => {});
+    }
+
+    // 旧版会直接下载；新版可能先开预览。这里只尝试最新可见 dialog，最终仍以文件落盘为准。
+    const deadline = Date.now() + 3_000;
+    while (Date.now() < deadline) {
+      const downloadHandle = await page.evaluateHandle(dialogsBefore => {
+        const visible = item => !!(item.offsetWidth || item.offsetHeight || item.getClientRects().length);
+        const counts = new Map();
+        dialogsBefore.forEach(signature => counts.set(signature, (counts.get(signature) || 0) + 1));
+        const dialog = [...document.querySelectorAll('[role="dialog"]')].filter(visible).find(item => {
+          const signature = `${item.getAttribute('aria-label') || ''}\u0000${item.innerText || item.textContent || ''}`.replace(/\s+/g, ' ').trim();
+          const remaining = counts.get(signature) || 0;
+          if (!remaining) return true;
+          counts.set(signature, remaining - 1);
+          return false;
+        });
+        return [...(dialog?.querySelectorAll('button:not([disabled])') || [])]
+          .find(button => /^(download|下载)$/i.test(`${button.getAttribute('aria-label') || button.textContent || ''}`.replace(/\s+/g, ' ').trim()) && visible(button)) || null;
+      }, dialogsBefore);
+      const download = downloadHandle.asElement();
+      if (download) {
+        try { await download.click(); }
+        finally { await downloadHandle.dispose().catch(() => {}); }
+        break;
+      }
+      await downloadHandle.dispose().catch(() => {});
+      await sleep(200);
+    }
+    return true;
   }
 
   /**
@@ -1509,6 +1723,10 @@ function createChatGPTDom({ responseTimeout }) {
    * 因此只在 page.evaluate 内发现 URL，实际 fetch/write 由 Node stream 完成。
    */
   async function downloadNativeImages(page, downloadDir, log, limit, byteBudget, shouldCancel, previousURLs = []) {
+    // 原生图片不在 sandbox，发现范围必须覆盖 image-generation turn，但发送前 URL 快照仍排除历史图片。
+    // fetch 复用登录 cookie，origin 候选已由页面侧过滤；Node 侧只负责流式字节与磁盘预算。
+    // headers/body 共享无进展 abort，确保一个挂起 estuary 响应不会占住全局 artifact 队列数分钟。
+    // 每张图失败只清理自己的 partial file 并记录 notice，其它候选仍继续，保留部分成功语义。
     if (limit <= 0) return { downloads: [], notices: [] };
     ensurePrivateDir(downloadDir);
     // 只在页面里发现候选 URL；实际字节用 Node stream 写盘，避免大图经过 CDP/base64 双重放大。
@@ -1546,7 +1764,9 @@ function createChatGPTDom({ responseTimeout }) {
       let file;
       try {
         const controller = new AbortController();
-        cancelPoll = setInterval(() => { if (shouldCancel()) controller.abort(); }, 500);
+        let lastProgressAt = Date.now();
+        // headers 和 body 共用无进展窗口；每个 stream chunk 刷新时间，慢速但持续传输的图片不会被误杀。
+        cancelPoll = setInterval(() => { if (shouldCancel() || Date.now() - lastProgressAt > 30_000) controller.abort(); }, 500);
         const cookies = await page.cookies(image.src).catch(() => []);
         const response = await fetch(image.src, { headers: cookies.length > 0 ? { cookie: cookies.map(cookie => `${cookie.name}=${cookie.value}`).join('; ') } : {}, signal: controller.signal });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -1561,13 +1781,10 @@ function createChatGPTDom({ responseTimeout }) {
         // 不覆盖旧图：同一回答 recovery 多次运行时，保留每次实际落盘结果，便于人工对照。
         file = nextAvailablePath(path.join(downloadDir, provenanceFileName(`${label}-${stableID}.${ext}`, `native-image-${index + 1}.${ext}`)));
         // 从 Node 侧串流落盘，避免 page.evaluate 把大图转 base64 后通过 CDP 一次性传回。
-        if (fs.existsSync(file)) {
-          // cache hit 只能复用普通文件；workspace cache 若被 symlink 污染，本张图失败但其它图继续保存。
-          const stat = fs.lstatSync(file);
-          if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`native image cache path is not a regular file: ${file}`);
-        } else if (response.body) await pipeline(Readable.fromWeb(response.body), byteLimitStream(byteBudget - usedBytes), fs.createWriteStream(file, { mode: 0o600 }));
+        if (response.body) await pipeline(Readable.fromWeb(response.body), byteLimitStream(byteBudget - usedBytes, () => { lastProgressAt = Date.now(); }), fs.createWriteStream(file, { mode: 0o600 }));
         else {
           const buffer = Buffer.from(await response.arrayBuffer());
+          lastProgressAt = Date.now();
           if (usedBytes + buffer.length > byteBudget) throw new Error(`artifact byte budget exceeded (${byteBudget} bytes)`);
           fs.writeFileSync(file, buffer, { mode: 0o600 });
         }
@@ -1593,13 +1810,14 @@ function createChatGPTDom({ responseTimeout }) {
     }, 0);
   }
 
-  function byteLimitStream(limit) {
+  function byteLimitStream(limit, onProgress = () => {}) {
     // Node fetch 能 streaming；无 content-length 时也能在写盘过程中及时停止，而不是等磁盘写满。
     let size = 0;
     return new Transform({
       transform(chunk, _encoding, callback) {
         size += chunk.length;
         if (size > limit) return callback(new Error(`artifact byte budget exceeded (${limit} bytes)`));
+        onProgress();
         callback(null, chunk);
       },
     });
@@ -1632,25 +1850,29 @@ function createChatGPTDom({ responseTimeout }) {
   }
 
   async function waitForDownloadedFile(downloadDir, before, beforeTemp, expectedName, shouldCancel) {
-    // progress-aware 超时:120s 硬上限防止无限等待;30s 停滞(临时文件大小不变)检测卡死。
-    // 原设计(dom.js:32)不做固定超时,但 ask deadline 540s 内无进展的下载会永久阻塞 session lock。
-    const MAX_WAIT = 120_000;
-    const start = Date.now();
-    let lastProgressAt = start;
-    let lastTempSize = 0;
+    // 硬上限继承外层 responseTimeout，不另造更短的“文件大小”预算；30 秒无任何字节/文件变化才判定卡死。
+    // 这样慢速大文件只要持续增长就继续，而失效按钮不会永久占住浏览器级 artifact 队列。
+    const startedAt = Date.now();
+    let lastProgressAt = startedAt;
+    let lastSignature = '';
     // 先找期望文件；只允许 Chrome 对同名文件追加 "(1)" 这类重命名，不接受任意变化文件。
     for (;;) {
       if (shouldCancel()) throw new Error('caller cancelled while waiting for generated file download');
-      const elapsed = Date.now() - start;
-      const stalled = Date.now() - lastProgressAt;
-      // 总超时 120s(硬上限,防止无限等待)或停滞 30s(临时文件大小不变,区分"下载中"和"卡住")
-      if (elapsed > MAX_WAIT || stalled > 30_000) throw new Error(`Artifact download ${elapsed > MAX_WAIT ? 'timed out' : 'stalled'}: ${expectedName}`);
+      if (Date.now() - startedAt > responseTimeout) throw new Error(`Artifact download timed out with the outer response budget: ${expectedName}`);
+      if (Date.now() - lastProgressAt > 30_000) throw new Error(`Artifact download made no progress for 30000ms: ${expectedName}`);
       await sleep(500);
-      // 检测临时文件增长(progress-aware):大小变化时重置停滞计时器。
       const tempFiles = fs.readdirSync(downloadDir).filter(name => name.endsWith('.crdownload') || name.endsWith('.tmp'));
-      let currentTempSize = 0;
-      for (const name of tempFiles) { try { currentTempSize += fs.statSync(path.join(downloadDir, name)).size; } catch {} }
-      if (currentTempSize !== lastTempSize) { lastTempSize = currentTempSize; lastProgressAt = Date.now(); }
+      const signature = fs.readdirSync(downloadDir).flatMap(name => {
+        // 文件名、大小或 mtime 任一变化都算进展；仅 wall-clock 变长不会替卡死下载续命。
+        try {
+          const stat = fs.statSync(path.join(downloadDir, name));
+          return [`${name}:${stat.size}:${stat.mtimeMs}`];
+        } catch { return []; }
+      }).sort().join('|');
+      if (signature !== lastSignature) {
+        lastSignature = signature;
+        lastProgressAt = Date.now();
+      }
       if (tempFiles.some(name => !beforeTemp.has(name))) continue;
       const current = snapshotDownloadDir(downloadDir);
       const expected = current.get(expectedName);

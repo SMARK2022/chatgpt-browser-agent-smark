@@ -25,6 +25,7 @@ OpenCode MCP client
   -> mcp-server.js (JSON-RPC stdio)
   -> chatgpt.js CLI/client request builder
   -> chatgpt-core.js local HTTP daemon/session lifecycle
+  -> chatgpt-project.js pure Project/conversation identity policy
   -> chatgpt-dom.js ChatGPT Web DOM/artifact adapter
   -> Puppeteer-controlled Edge/Chrome tab
   -> chatgpt.com project/chat page
@@ -40,6 +41,7 @@ need to leave full request JSON in the OS temp directory.
 ```text
 chatgpt.js       CLI/client layer: argv, stdin, git/context, JSON payload, HTTP call
 chatgpt-core.js  Daemon, project/session registry, pending recovery, result persistence
+chatgpt-project.js Pure Unicode/origin/Project/conversation identity policy
 chatgpt-dom.js   Single ChatGPT Web DOM adapter for upload/wait/extract/artifacts
 mcp-server.js    MCP stdio server for OpenCode and other MCP clients
 agent.js         No-exec one-shot ChatGPT helper CLI; no local RUN/FILE actions
@@ -83,7 +85,7 @@ CHATGPT_LOGIN_WAIT_TIMEOUT_MS     Login wait window when cookies expire, default
 CHATGPT_MAX_RETURN_CHARS          Safe response return threshold, default 6000
 CHATGPT_RESPONSE_PREVIEW_CHARS    Preview length returned after local save, default 4000
 CHATGPT_MCP_MAX_RETURN_CHARS      Final MCP wrapper output cap, default 8000
-CHATGPT_MAX_SESSION_PAGES         Idle page pool cap, default 8
+CHATGPT_MAX_SESSION_PAGES         Idle page pool cap, default 12
 CHATGPT_PENDING_TTL_MS            Stale pending marker TTL, default 43200000
 CHATGPT_COMPLETED_RETRY_TTL_MS    Same-prompt completed replay window, default 600000
 CHATGPT_JSON_LOCK_TIMEOUT_MS      Session/project JSON lock wait, default 30000
@@ -97,6 +99,12 @@ CHATGPT_MAX_UPLOAD_FILES          Per-request upload file count cap, default 12
 CHATGPT_MAX_UPLOAD_BYTES          Per-file upload size cap, default 419430400
 CHATGPT_MAX_TOTAL_UPLOAD_BYTES    Per-request aggregate upload cap, default 838860800
 CHATGPT_MAX_ARTIFACT_BYTES        Per-response aggregate downloaded artifact cap, default 4294967296
+CHATGPT_VOICE_FILE_MAX_BYTES      Voice WAV size cap, default 52428800
+CHATGPT_VOICE_TRANSCRIBE_TIMEOUT_MS Complete direct/fallback transcription timeout, default 60000
+CHATGPT_VOICE_PAGE_MAX_AGE_MS     Dedicated voice-page reuse age, default 600000
+CHATGPT_VOICE_DICTATION_TIMEOUT_MS Fallback dictation control timeout, default 45000
+CHATGPT_VOICE_STOP_DELAY_MS       Fallback delay before stopping dictation, default 6000
+CHATGPT_VOICE_STREAM_CHUNK_MS     Fake-microphone audio scheduling chunk, default 250
 CHATGPT_TEXT_FILE_MAX_BYTES       CLI --file text size cap, default 2097152
 CHATGPT_GIT_DIFF_MAX_CHARS        git diff context cap, default 100000
 CHATGPT_MAX_FULL_PROMPT_CHARS     Final prompt cap after expansion, default 500000
@@ -105,10 +113,14 @@ CHATGPT_MAX_FULL_PROMPT_CHARS     Final prompt cap after expansion, default 5000
 `CHATGPT_PROJECT` is deployment configuration, not an MCP model parameter. The
 daemon resolves it on startup as the fixed ChatGPT Project used for all sessions.
 Prefer a short project name such as `MCP` for config migration. A project id or
-full Project URL is accepted as a troubleshooting override when name discovery is
-unreliable. Name discovery reads cached project data and visible sidebar links;
-if ChatGPT changes or localizes the project sidebar, set `CHATGPT_PROJECT` to the
-full Project URL to bypass sidebar discovery.
+full Project URL is accepted as a troubleshooting override. Name discovery first
+reads the current logged-in browser's project data, then validates the Project
+home, exact Project id, composer, and Chat/Work state. A stale name-cache entry
+triggers automatic sidebar rediscovery and cache refresh; the cache is only a
+fallback, so moving the same name config to another device does not pin it to the
+previous account's Project id. Duplicate visible names are rejected instead of
+guessing. A stale explicit id/URL with no discoverable current-account match cannot
+be repaired by name, because its URL slug is not treated as a verified display name.
 
 Browser reuse has two modes. If an existing Edge/Chrome was started with a DevTools
 port, set `CHATGPT_BROWSER_CDP_URL`, `CHATGPT_BROWSER_WS_ENDPOINT`, or
@@ -117,16 +129,26 @@ already-running Edge window cannot be attached after the fact by Puppeteer. To r
 the normal Edge login state without a DevTools port, set `CHATGPT_BROWSER_USER_DATA_DIR`
 and `CHATGPT_BROWSER_PROFILE_DIRECTORY`; Chromium may require closing the regular
 Edge process using that profile before the daemon can launch a controlled window.
+Connect mode treats the browser as shared: it creates a dedicated bootstrap tab and
+never adopts or closes pre-existing/untracked tabs. Launch mode owns its profile and
+may reclaim only pages created inside that dedicated browser process.
 
 `CHATGPT_SESSION_DIR` stores the internal global session registry keyed by short
 handles such as `#4fa92c9d10`. Entries include the ChatGPT conversation URL, Project
 metadata, timestamps, and pending recovery state. If omitted, the default
 user-level opencode data directory is used, for example
 `%LOCALAPPDATA%\opencode\chatgpt-browser-agent` on Windows.
+New sessions must expose `/g/{project}/c/{conversation}` before they are recorded.
+For registries created by older releases, a plain `/c/{conversation}` entry remains
+usable only when it already carries the same stored Project id and every later
+navigation preserves that exact conversation id; plain routes are never accepted
+for newly created sessions and never establish Project ownership by themselves.
 
 `CHATGPT_PENDING_TTL_MS` controls how long a pending session is considered fresh
 for page retention and automatic recovery. Stale pending markers still get one
-live DOM recovery attempt before being cleared. Old ordinary session entries are
+live DOM recovery attempt before being cleared. New pending markers retain the
+pre-submit user/assistant turn counts, so an older visible assistant message cannot
+be returned as the answer to a prompt whose accepted turn has not advanced. Old ordinary session entries are
 retained by `CHATGPT_SESSION_MAX_ENTRIES` (default `256`) and
 `CHATGPT_SESSION_MAX_AGE_MS` (default 90 days). Corrupt `sessions.json` backups use
 the same private file mode and age-based cleanup. Conversation URLs are still local
@@ -306,17 +328,21 @@ conversation from any OpenCode working directory.
 `git: true` attaches `git branch --show-current`, `git status --short`, and
 `git diff HEAD` from the OpenCode working directory.
 
-`mode` selects only behaviors that change the ChatGPT composer itself. Supported
-values are `auto` and `image`. Use `auto` for normal text, research, file,
+`mode` adds a semantic workflow instruction to the prompt. Supported values are
+`auto` and `image`. Use `auto` for normal text, research, file,
 sandbox, and document tasks; put any web-search/source requirement directly in
 `prompt`. Use `image` only for native ChatGPT image generation.
 
 Only `auto` and `image` are exposed. Other ChatGPT UI modes are intentionally not
-part of this MCP API.
+part of this MCP API. The bridge keeps Project sessions in Chat and never selects
+Work. It also inherits the model and reasoning level already selected by the user
+or Project (for example GPT-5.6 Sol with High reasoning) instead of exposing a
+second brittle model-selector API.
 
 `imageAspectRatio` is optional and only applies to native ChatGPT image generation.
-If it is provided without `mode`, the bridge infers `mode: "image"`. Supported
-values map to the live ChatGPT image-ratio popover:
+If it is provided without `mode`, the bridge infers `mode: "image"`. When the live
+ChatGPT UI changes, the bridge does not chase its transient ratio menus; the ratio
+travels in the image workflow prompt. Supported values are:
 
 ```text
 auto       -> 自动
@@ -364,15 +390,16 @@ Detected ChatGPT sandbox/download files are saved under:
 The model does not control absolute output directories. ChatGPT-generated filenames
 are normalized to a short ASCII-safe local name, prefixed with `chatgpt-`, and kept
 under the original extension when one survives sanitization. The tool returns saved
-and downloaded file paths plus the `Session: #xxxxxxxxxx` handle. The resolved
-project cache follows the `workspaceDir` supplied by the MCP wrapper;
+and downloaded file paths plus the `Session: #xxxxxxxxxx` handle. Response and
+artifact caches follow the `workspaceDir` supplied by the MCP wrapper;
 `CHATGPT_WORKSPACE_ROOTS` controls which roots that workspace may use. Sandbox artifact
 collection is intentionally narrow and selector-based: it attempts currently known
 filename-bearing buttons/cards in the latest assistant message, and reports partial
 success plus notices when a candidate cannot be discovered or downloaded. Sandbox
 files and native images share a 16-artifact count cap and a generous aggregate
-byte budget. Upload parsing and artifact download do not have separate fixed local
-timeouts; they follow the outer ask/MCP cancellation lifecycle. Generated files are
+byte budget. Artifact downloads inherit the outer browser response budget and are
+cancelled earlier after 30 seconds without any file/byte progress, so one broken
+download cannot retain the browser-wide queue indefinitely. Generated files are
 kept under their original extension; the bridge does not append `.untrusted`.
 
 Native ChatGPT image-generation results are captured separately from sandbox
