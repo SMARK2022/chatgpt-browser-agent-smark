@@ -141,6 +141,7 @@ function createChatGPTDom({ responseTimeout }) {
       await page.bringToFront().catch(() => {});
       let sent = false;
       try {
+        await dismissConversationHistoryRateLimit(page, log);
         await waitForComposer(page, log);
         // 每次提交都从“无附件 composer”开始；新附件随后重新上传，避免任何上一轮 stale chip 串入本轮。
         await clearComposerAttachments(page, log);
@@ -692,6 +693,25 @@ function createChatGPTDom({ responseTimeout }) {
     log?.('Composer ready');
   }
 
+  async function dismissConversationHistoryRateLimit(page, log) {
+    // 稳定 testid 将范围限制在历史访问限流 modal；可信点击只确认提示，不伪造“解除限流”。
+    const modal = await page.$('[data-testid="modal-conversation-history-rate-limit"]');
+    if (!modal) return;
+    const buttons = await modal.$$('button');
+    try {
+      const labels = await Promise.all(buttons.map(button => button.evaluate(element => (element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim())));
+      // 只选择明确确认动作，跳过可能排在前面的关闭图标；服务端冷却仍不能在这里自动重试。
+      const button = buttons[labels.findIndex(label => /^(明白了|知道了|got it|understood)$/i.test(label))];
+      if (!button) throw new Error('ChatGPT rate-limit dialog requires manual handling');
+      await button.click();
+      log?.('Dismissed ChatGPT conversation-history rate-limit dialog');
+      await sleep(250);
+    } finally {
+      await Promise.all(buttons.map(button => button.dispose().catch(() => {})));
+      await modal.dispose().catch(() => {});
+    }
+  }
+
   async function installVoiceAudioInput(page, audioBase64) {
     // getUserMedia patch 只装在当前 voice page：它不进入普通 session page，且每次转写都会覆盖上一次音频。
     // 音频以 data buffer 进入浏览器 AudioContext，避免把本地文件路径暴露给网页脚本。
@@ -1119,7 +1139,7 @@ function createChatGPTDom({ responseTimeout }) {
       }
 
       function normalize(value) {
-        return String(value || '').replace(/[ \t]+/g, ' ').replace(/[ \t]*\n[ \t]*/g, '\n').replace(/\n+/g, '\n').trim();
+        return String(value || '').replace(/\u00a0/g, ' ').replace(/[ \t]+/g, ' ').replace(/[ \t]*\n[ \t]*/g, '\n').replace(/\n+/g, '\n').trim();
       }
     }, { timeout: 5_000 }, 'x');
     const actual = await replaceComposerText(page, text);
@@ -1140,7 +1160,7 @@ function createChatGPTDom({ responseTimeout }) {
       }
 
       function normalize(value) {
-        return String(value || '').replace(/[ \t]+/g, ' ').replace(/[ \t]*\n[ \t]*/g, '\n').replace(/\n+/g, '\n').trim();
+        return String(value || '').replace(/\u00a0/g, ' ').replace(/[ \t]+/g, ' ').replace(/[ \t]*\n[ \t]*/g, '\n').replace(/\n+/g, '\n').trim();
       }
     }, text);
   }
@@ -1172,7 +1192,7 @@ function createChatGPTDom({ responseTimeout }) {
       }
 
       function normalize(value) {
-        return String(value || '').replace(/[ \t]+/g, ' ').replace(/[ \t]*\n[ \t]*/g, '\n').replace(/\n+/g, '\n').trim();
+        return String(value || '').replace(/\u00a0/g, ' ').replace(/[ \t]+/g, ' ').replace(/[ \t]*\n[ \t]*/g, '\n').replace(/\n+/g, '\n').trim();
       }
     }, { timeout: 10_000, polling: 250 }, expectedPrompt);
     const before = await page.evaluate(value => {
@@ -1190,7 +1210,7 @@ function createChatGPTDom({ responseTimeout }) {
       }
 
       function normalize(value) {
-        return String(value || '').replace(/[ \t]+/g, ' ').replace(/[ \t]*\n[ \t]*/g, '\n').replace(/\n+/g, '\n').trim();
+        return String(value || '').replace(/\u00a0/g, ' ').replace(/[ \t]+/g, ' ').replace(/[ \t]*\n[ \t]*/g, '\n').replace(/\n+/g, '\n').trim();
       }
     }, expectedPrompt);
     if (!before.valid) throw new Error('Send button verification failed before click');
@@ -1216,8 +1236,8 @@ function createChatGPTDom({ responseTimeout }) {
 
   function normalizeComposerText(text) {
     // Windows 文本和 ChatGPT contenteditable 的换行表示不同；校验比较语义文本而不是 CRLF 字节形态。
-    // ProseMirror 会把纯文本换行渲染为多个段落，innerText 读回时可能额外插入空行；发送前只校验字符顺序与语义空白。
-    return String(text || '').replace(/\r\n?/g, '\n').replace(/[ \t]+/g, ' ').replace(/[ \t]*\n[ \t]*/g, '\n').replace(/\n+/g, '\n').trim();
+    // ProseMirror 还会把续行空格读回 NBSP；先还原普通空格，再校验字符顺序与语义换行。
+    return String(text || '').replace(/\u00a0/g, ' ').replace(/\r\n?/g, '\n').replace(/[ \t]+/g, ' ').replace(/[ \t]*\n[ \t]*/g, '\n').replace(/\n+/g, '\n').trim();
   }
 
   // ─── Response Waiting ─────────────────────────────────────────────────────
@@ -1653,11 +1673,11 @@ function createChatGPTDom({ responseTimeout }) {
   }
 
   async function clickSandboxArtifact(page, target) {
-    // 预览可能复用旧 portal；先记录可见 dialog 的签名计数，后续只操作新增或内容已变化的实例。
-    const dialogsBefore = await page.evaluate(() => {
+    // 预览可能复用旧 portal；只跟踪已确认的 dialog/thread flyout，避免把页面其它下载按钮当成本轮产物。
+    const previewsBefore = await page.evaluate(() => {
       const visible = item => !!(item.offsetWidth || item.offsetHeight || item.getClientRects().length);
-      return [...document.querySelectorAll('[role="dialog"]')].filter(visible)
-        .map(dialog => `${dialog.getAttribute('aria-label') || ''}\u0000${dialog.innerText || dialog.textContent || ''}`.replace(/\s+/g, ' ').trim());
+      return [...document.querySelectorAll('[role="dialog"], [data-testid="stage-thread-flyout"]')].filter(visible)
+        .map(preview => `${preview.getAttribute('aria-label') || ''}\u0000${preview.innerText || preview.textContent || ''}`.replace(/\s+/g, ' ').trim());
     });
     const handle = await page.evaluateHandle(target => {
       const msg = [...document.querySelectorAll('[data-message-author-role="assistant"]')].at(-1);
@@ -1687,23 +1707,23 @@ function createChatGPTDom({ responseTimeout }) {
       await handle.dispose().catch(() => {});
     }
 
-    // 旧版会直接下载；新版可能先开预览。这里只尝试最新可见 dialog，最终仍以文件落盘为准。
+    // 旧版会直接下载；新版可能先开 dialog 或 thread flyout，最终仍以文件落盘为准。
     const deadline = Date.now() + 3_000;
     while (Date.now() < deadline) {
-      const downloadHandle = await page.evaluateHandle(dialogsBefore => {
+      const downloadHandle = await page.evaluateHandle(previewsBefore => {
         const visible = item => !!(item.offsetWidth || item.offsetHeight || item.getClientRects().length);
         const counts = new Map();
-        dialogsBefore.forEach(signature => counts.set(signature, (counts.get(signature) || 0) + 1));
-        const dialog = [...document.querySelectorAll('[role="dialog"]')].filter(visible).find(item => {
+        previewsBefore.forEach(signature => counts.set(signature, (counts.get(signature) || 0) + 1));
+        const preview = [...document.querySelectorAll('[role="dialog"], [data-testid="stage-thread-flyout"]')].filter(visible).find(item => {
           const signature = `${item.getAttribute('aria-label') || ''}\u0000${item.innerText || item.textContent || ''}`.replace(/\s+/g, ' ').trim();
           const remaining = counts.get(signature) || 0;
           if (!remaining) return true;
           counts.set(signature, remaining - 1);
           return false;
         });
-        return [...(dialog?.querySelectorAll('button:not([disabled])') || [])]
+        return [...(preview?.querySelectorAll('button:not([disabled])') || [])]
           .find(button => /^(download|下载)$/i.test(`${button.getAttribute('aria-label') || button.textContent || ''}`.replace(/\s+/g, ' ').trim()) && visible(button)) || null;
-      }, dialogsBefore);
+      }, previewsBefore);
       const download = downloadHandle.asElement();
       if (download) {
         try { await download.click(); }
@@ -1906,15 +1926,25 @@ function isChromeRenameOf(name, expectedName) {
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
-// 滚动到对话最下方,确保最新 assistant 消息在视口内渲染。
-// ChatGPT 虚拟化视口外的消息;后台恢复前台后必须滚动,否则 assistantState 读到空/过期文本。
-// 同步 JS 操作(scrollTop/scrollIntoView),不依赖 rAF,后台也能执行。
+// ChatGPT 的 main 只承载布局；从语义 thread 向上找 scroll root，避免误选侧栏或内嵌滚动区。
+// 滚动不依赖 assistant role，确保本轮仅有 user、图片或空 turn 时也不会回到历史回答。
 function scrollToEnd(page) {
   return page.evaluate(() => {
-    const main = document.querySelector('main');
-    if (main) main.scrollTop = main.scrollHeight;
-    const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
-    if (msgs.length > 0) msgs[msgs.length - 1].scrollIntoView({ block: 'end' });
+    const turns = document.querySelectorAll('[data-testid^="conversation-turn"]');
+    const latestTurn = turns[turns.length - 1];
+    const anchor = document.querySelector('#thread') || latestTurn;
+    const ancestors = [];
+    for (let current = anchor; current; current = current.parentElement) ancestors.push(current);
+    // overflow:auto 只声明滚动能力；未溢出的中间 wrapper 必须跳过，继续寻找真正承载内容的外层容器。
+    const scrollRoot = ancestors.find(element =>
+      ['auto', 'scroll', 'overlay'].includes(getComputedStyle(element).overflowY) && element.scrollHeight > element.clientHeight
+    );
+    if (scrollRoot) {
+      scrollRoot.scrollTop = scrollRoot.scrollHeight;
+      return;
+    }
+    // DOM 改版移除 thread 时只降级到最新 turn，不能重新选择可能属于上一轮的 assistant。
+    latestTurn?.scrollIntoView({ block: 'end' });
   }).catch(() => {});
 }
 

@@ -935,16 +935,23 @@ async function testSubmitUsesTrustedClick() {
   const { createChatGPTDom } = require('./chatgpt-dom');
   await withBrowserPage('trusted submit', 'chatgpt-submit-test-', async page => {
     await page.setContent(`
+      <div data-testid="modal-conversation-history-rate-limit"><div role="dialog"><h2>请求过于频繁</h2><button aria-label="关闭">×</button><button>明白了</button></div></div>
       <form>
         <div id="prompt-textarea" contenteditable="true"></div>
         <input id="upload-files" type="file">
         <button type="button" data-testid="send-button">Send</button>
       </form>
       <script>
-        window.submitProbe = { trusted: null, accepted: false };
+        window.submitProbe = { trusted: null, accepted: false, rateDismissed: false };
+        // 频率提示只接受可信确认；send 也必须等待 modal 消失，模拟真实 overlay 的阻塞语义。
+        document.querySelector('[data-testid="modal-conversation-history-rate-limit"] button:last-child').addEventListener('click', event => {
+          if (!event.isTrusted) return;
+          window.submitProbe.rateDismissed = true;
+          document.querySelector('[data-testid="modal-conversation-history-rate-limit"]').remove();
+        });
         document.querySelector('[data-testid="send-button"]').addEventListener('click', event => {
           window.submitProbe.trusted = event.isTrusted;
-          if (!event.isTrusted) return;
+          if (!event.isTrusted || !window.submitProbe.rateDismissed) return;
           window.submitProbe.accepted = true;
           document.querySelector('#prompt-textarea').textContent = '';
           const user = document.createElement('div');
@@ -954,13 +961,14 @@ async function testSubmitUsesTrustedClick() {
         });
       </script>
     `);
-    await createChatGPTDom({ responseTimeout: 5_000 }).submit(page, 'project submit probe', [], process.cwd(), 'auto', null, () => {});
+    // Chromium contenteditable 会原生把续行空格读回 NBSP；必须保持语义一致才能继续可信提交。
+    await createChatGPTDom({ responseTimeout: 5_000 }).submit(page, 'project submit probe\n  continuation', [], process.cwd(), 'auto', null, () => {});
     const probe = await page.evaluate(() => ({
       ...window.submitProbe,
       userCount: document.querySelectorAll('[data-message-author-role="user"]').length,
       composerText: document.querySelector('#prompt-textarea').innerText.trim(),
     }));
-    assert.deepStrictEqual(probe, { trusted: true, accepted: true, userCount: 1, composerText: '' });
+    assert.deepStrictEqual(probe, { trusted: true, accepted: true, rateDismissed: true, userCount: 1, composerText: '' });
 
     await page.setContent(`
       <form><div id="prompt-textarea" contenteditable="true"></div><input id="upload-files" type="file"><button type="button" data-testid="send-button">Send</button></form>
@@ -1283,39 +1291,49 @@ async function testImageModeUsesCurrentComposerMenu() {
 }
 
 async function testSandboxArtifactPreviewDownload() {
-  // 新版文件卡片先开全屏预览，再由 dialog 的下载按钮触发 Browser 域下载；两步都必须是可信事件。
+  // 文件按钮可能打开旧 dialog 或当前 thread flyout，再由其中的下载按钮触发 Browser 域下载；两步都必须是可信事件。
   // 文件按钮同时位于 card 中，断言最终只有一个下载，用行为覆盖候选 DOM 身份去重。
-  // 下载内容使用固定 marker，确保测试验证 Browser 域真实落盘，而不是只观察 preview dialog。
+  // 每种预览使用独立 marker，确保测试验证 Browser 域真实落盘，而不是只观察预览 DOM。
   const { createChatGPTDom } = require('./chatgpt-dom');
   const downloadDir = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-artifact-result-'));
   try {
     await withBrowserPage('artifact download', 'chatgpt-artifact-browser-', async (page, browser) => {
       const dom = createChatGPTDom({ responseTimeout: 5_000 });
-      await page.setContent(`
-        <div data-message-author-role="assistant"><div class="group my-4">fixture.txt<button aria-label="fixture.txt">fixture.txt</button></div></div>
-        <script>
-          document.querySelector('[data-message-author-role="assistant"] [aria-label="fixture.txt"]').addEventListener('click', event => {
-            if (!event.isTrusted) return;
-            const dialog = document.createElement('div');
-            dialog.setAttribute('role', 'dialog');
-            dialog.setAttribute('aria-label', 'fixture.txt');
-            dialog.innerHTML = '<button aria-label="Download">Download</button>';
-            dialog.querySelector('button').addEventListener('click', downloadEvent => {
-              if (!downloadEvent.isTrusted) return;
-              const link = document.createElement('a');
-              link.href = 'data:text/plain;charset=utf-8,ARTIFACT-FIXTURE';
-              link.download = 'fixture.txt';
-              document.body.appendChild(link);
-              link.click();
+      // 两个变体只改变预览容器身份，可信点击和落盘断言必须等强，避免兼容路径出现弱测试。
+      const previewVariants = [
+        { name: 'flyout.txt', attribute: 'data-testid', value: 'stage-thread-flyout', marker: 'ARTIFACT-FLYOUT' },
+        { name: 'dialog.txt', attribute: 'role', value: 'dialog', marker: 'ARTIFACT-DIALOG' },
+      ];
+      // 同页顺序执行可确保 dialog 与 flyout 都经过同一个 adapter 及 download queue 生命周期。
+      for (const variant of previewVariants) {
+        await page.setContent(`
+          <div data-message-author-role="assistant"><div class="group my-4">${variant.name}<button aria-label="${variant.name}">${variant.name}</button></div></div>
+          <script>
+            document.querySelector('[data-message-author-role="assistant"] button').addEventListener('click', event => {
+              if (!event.isTrusted) return;
+              const preview = document.createElement('div');
+              // 容器在文件按钮可信点击后才出现，避免预置 DOM 让“新增预览”判定假通过。
+              preview.setAttribute('${variant.attribute}', '${variant.value}');
+              preview.setAttribute('aria-label', '${variant.name}');
+              preview.innerHTML = '<button aria-label="Download">Download</button>';
+              preview.querySelector('button').addEventListener('click', downloadEvent => {
+                if (!downloadEvent.isTrusted) return;
+                const link = document.createElement('a');
+                link.href = 'data:text/plain;charset=utf-8,${variant.marker}';
+                link.download = '${variant.name}';
+                document.body.appendChild(link);
+                link.click();
+              });
+              document.body.appendChild(preview);
             });
-            document.body.appendChild(dialog);
-          });
-        </script>
-      `);
-      const result = await dom.collectArtifacts(page, downloadDir, () => {}, () => false, { nativeImageURLs: [] });
-      assert.strictEqual(result.notices.length, 0, result.notices.join('\n'));
-      assert.strictEqual(result.downloads.length, 1);
-      assert.strictEqual(fs.readFileSync(result.downloads[0].path, 'utf8'), 'ARTIFACT-FIXTURE');
+          </script>
+        `);
+        const result = await dom.collectArtifacts(page, downloadDir, () => {}, () => false, { nativeImageURLs: [] });
+        assert.strictEqual(result.notices.length, 0, result.notices.join('\n'));
+        assert.strictEqual(result.downloads.length, 1);
+        // 固定 marker 证明预览按钮被可信点击，且 Browser download behavior 确实完成落盘。
+        assert.strictEqual(fs.readFileSync(result.downloads[0].path, 'utf8'), variant.marker);
+      }
 
       // 旧版按钮会直接触发下载而不打开预览；3 秒预览探测结束后仍应认领已经落盘的文件。
       // 两种网页路径在同一个隔离 downloadDir 中顺序执行，独占 workDir 必须让第二轮不认领第一轮文件。
@@ -1952,24 +1970,44 @@ async function testEmptyAssistantTurnCompletes() {
 }
 
 async function testForegroundPulseInterval8s() {
-  // 后台 hydration 健康维持必须保留 8 秒节奏，避免回归到高频抢前台或完全不激活。
+  // 后台 hydration 健康维持必须保留 8 秒节奏；滚动断言走公开 waitForResponse seam，避免绑定私有 helper。
   const { createChatGPTDom } = require('./chatgpt-dom');
   await withBrowserPage('foreground pulse', 'chatgpt-foreground-pulse-', async page => {
-    await page.setContent('<main id="fixture"></main>');
+    // 当前 ChatGPT 的 main 只承载布局；中间 auto wrapper 不溢出，防止仅凭 CSS 误选非滚动祖先。
+    await page.setContent(`
+      <style>
+        #scroll-root { height: 240px; overflow-y: auto; }
+        #non-scrolling-auto { overflow-y: auto; }
+        #fixture { overflow: visible; }
+        .history-turn { height: 420px; }
+        .current-user { height: 300px; }
+        .current-answer { height: 320px; }
+        .turn-tail { height: 174px; }
+      </style>
+      <div id="scroll-root"><div id="non-scrolling-auto"><main id="fixture"><div id="thread">
+        <section class="history-turn" data-testid="conversation-turn-1"><div data-message-author-role="user">old question</div></section>
+        <section class="history-turn" data-testid="conversation-turn-2"><div data-message-author-role="assistant">old answer</div></section>
+        <section class="current-user" data-testid="conversation-turn-3"><div data-message-author-role="user">question</div></section>
+      </div></main></div></div>
+    `);
     await page.evaluate(() => setTimeout(() => {
-      document.querySelector('#fixture').innerHTML = '<div data-testid="conversation-turn-1"><div data-message-author-role="user">question</div><div data-message-author-role="assistant">answer<button aria-label="Copy">Copy</button></div></div>';
-    }, 8_500));
+      // 提前一秒插入，保证第二次 8 秒 pulse 看见新回答，避免把调度抖动误判成滚动失败。
+      document.querySelector('#thread').insertAdjacentHTML('beforeend', '<section data-testid="conversation-turn-4"><div class="current-answer" data-message-author-role="assistant">answer<button aria-label="Copy">Copy</button></div><div class="turn-tail"></div></section>');
+    }, 7_000));
     let frontCount = 0;
     const bringToFront = page.bringToFront.bind(page);
     page.bringToFront = async () => { frontCount++; return bringToFront(); };
     const startedAt = Date.now();
     const result = await createChatGPTDom({ responseTimeout: 15_000 }).waitForResponse(page, {
-      count: 0, userCount: 0, lastText: '', nativeImageCount: 0,
+      count: 1, userCount: 1, turnCount: 2, lastText: 'old answer', nativeImageCount: 0,
     }, { foregroundPulseMs: 8_000 }, () => {});
     assert.strictEqual(result.status, 'completed');
     const elapsed = Date.now() - startedAt;
     assert.ok(elapsed >= 8_000 && elapsed < 12_500, `rendered completion controls should avoid the generic quiet delay: ${elapsed}`);
     assert.strictEqual(frontCount, 2);
+    // assistant 后仍有 action/footer 空间；只有真实 conversation scroll root 到底时 gap 才为零。
+    const bottomGap = await page.$eval('#scroll-root', element => element.scrollHeight - element.scrollTop - element.clientHeight);
+    assert.ok(bottomGap <= 1, `foreground pulse must reach the conversation bottom: gap=${bottomGap}`);
   });
 }
 
