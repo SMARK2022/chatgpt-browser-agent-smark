@@ -37,14 +37,13 @@ function positiveIntEnv(name, fallback) {
   return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
-function uploadRoots(workspaceDir) {
-  const explicit = (process.env.CHATGPT_UPLOAD_ROOTS || '').split(path.delimiter).map(item => item.trim()).filter(Boolean).map(item => path.resolve(item));
-  return [...explicit, path.join(path.resolve(workspaceDir || process.cwd()), '.opencode', 'cache', 'chatgpt', 'uploads')];
+function uploadRoots() {
+  return (process.env.CHATGPT_UPLOAD_ROOTS || '').split(path.delimiter).map(item => item.trim()).filter(Boolean).map(item => path.resolve(item));
 }
 
-function realUploadRoots(workspaceDir) {
-  // 上传 root 在最后一跳重新 realpath；staging 目录若被移动/替换，直接失败而不是沿用启动时旧判断。
-  return uploadRoots(workspaceDir).map(root => fs.realpathSync.native(root));
+function realUploadRoots() {
+  // 显式 root 在最后一跳重新 realpath；默认 unrestricted 时仍由 regular-file 与私有副本阻断路径替换竞态。
+  return uploadRoots().map(root => fs.realpathSync.native(root));
 }
 
 function pathInside(root, target) {
@@ -137,7 +136,7 @@ function createChatGPTDom({ responseTimeout }) {
     },
 
     /** 提交 prompt 前总是 bringToFront，降低后台 tab “已生成但 DOM 未刷新”的概率。 */
-    async submit(page, prompt, files, workspaceDir, mode = 'auto', imageAspectRatio = null, log, shouldCancel = () => false, beforeSend = () => {}) {
+    async submit(page, prompt, files, mode = 'auto', imageAspectRatio = null, log, shouldCancel = () => false, beforeSend = () => {}) {
       await page.bringToFront().catch(() => {});
       let sent = false;
       try {
@@ -148,7 +147,7 @@ function createChatGPTDom({ responseTimeout }) {
         await assertNoComposerAttachments(page);
         await selectComposerMode(page, mode, log);
         await selectImageAspectRatio(page, mode, imageAspectRatio, log);
-        await uploadFiles(page, files, workspaceDir, log, shouldCancel);
+        await uploadFiles(page, files, log, shouldCancel);
         if (shouldCancel()) throw new Error('Ask cancelled before prompt fill');
         const expectedPrompt = await fillPrompt(page, prompt);
         if (shouldCancel()) throw new Error('Ask cancelled before prompt submit');
@@ -582,7 +581,7 @@ function createChatGPTDom({ responseTimeout }) {
    * 这里不把 toast 文案当成功标准，只等待 send button 重新可用；如果 frame 已 detached，
    * 对 frame/context 重建保留两次有界重试，避免瞬态恢复刚好跨过单次重试窗口。
    */
-  async function uploadFiles(page, files, workspaceDir, log, shouldCancel = () => false) {
+  async function uploadFiles(page, files, log, shouldCancel = () => false) {
     // 上传失败不能降级成无附件发送；先校验本地文件存在，再碰 ChatGPT 页面。
     for (const file of files) {
       if (!fs.existsSync(file)) throw new Error(`Upload file not found: ${file}`);
@@ -602,12 +601,12 @@ function createChatGPTDom({ responseTimeout }) {
           await sleep(500);
           await assertNoComposerAttachments(page);
         }
-        const prepared = prepareUploadFiles(files, workspaceDir);
+        const prepared = prepareUploadFiles(files);
         try {
           const input = await page.waitForSelector('#upload-files', { timeout: 15_000 });
           const beforeCount = await attachmentCount(page);
 
-          // CDP 只接收 path；先复制到 daemon 私有目录，再把稳定副本交给 Chromium，切断 staging 目录 TOCTOU。
+          // CDP 只接收 path；先复制到 daemon 私有目录，再把稳定快照交给 Chromium，切断源路径 TOCTOU。
           await input.uploadFile(...prepared.files);
           if (shouldCancel()) throw new Error('Ask cancelled after uploadFile');
           await page.evaluate(() => document.getElementById('upload-files')?.dispatchEvent(new Event('change', { bubbles: true })));
@@ -629,30 +628,41 @@ function createChatGPTDom({ responseTimeout }) {
     }
   }
 
-  function prepareUploadFiles(files, workspaceDir) {
-    // 最后一跳不把 staging 路径直接交给 Chromium：先复制到 0700 临时目录，
-    // 这样外部进程即使随后替换 staging 文件，也影响不到浏览器实际读取的副本。
+  function prepareUploadFiles(files) {
+    // 最后一跳不把用户源路径直接交给 Chromium：先复制到 0700 临时目录，
+    // 这样外部进程即使随后替换源文件，也影响不到浏览器实际读取的副本。
     // 这里仍保留原 basename，保证 ChatGPT composer 上展示的附件名和用户传入文件一致。
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-upload-'));
-    ensurePrivateDir(dir);
     try {
+      ensurePrivateDir(dir);
       let total = 0;
       const prepared = files.map(file => {
-        // lstat 拒绝 symlink，realpath 再确认最终目标仍在 upload root 内。
+        // lstat 拒绝 symlink；realpath 固定实际目标，显式配置 roots 时再复核目录边界。
+        if (!path.isAbsolute(file)) throw new Error(`Upload path must be absolute at final check: ${file}`);
         const resolved = path.resolve(file);
         const linkStat = fs.lstatSync(resolved);
         if (!linkStat.isFile()) throw new Error(`Upload target is not a regular file at final check: ${file}`);
         const real = fs.realpathSync.native(resolved);
-        if (!realUploadRoots(workspaceDir).some(root => pathInside(root, real))) throw new Error(`Upload file escaped allowed roots before browser upload: ${file}`);
-        const stat = fs.statSync(real);
-        if (!stat.isFile()) throw new Error(`Upload target changed before browser upload: ${file}`);
-        if (stat.size > MAX_UPLOAD_BYTES) throw new Error(`Upload file grew beyond ${MAX_UPLOAD_BYTES} bytes before browser upload`);
-        total += stat.size;
-        if (total > MAX_TOTAL_UPLOAD_BYTES) throw new Error(`Upload batch grew beyond ${MAX_TOTAL_UPLOAD_BYTES} bytes before browser upload`);
+        const roots = realUploadRoots();
+        if (roots.length > 0 && !roots.some(root => pathInside(root, real))) throw new Error(`Upload file escaped allowed roots before browser upload: ${file}`);
         const target = path.join(dir, path.basename(file));
-        fs.copyFileSync(real, target);
+        // POSIX O_NOFOLLOW 阻止检查后把文件替换成 symlink；Windows 再用 lstat 复核当前路径类型。
+        const source = fs.openSync(real, fs.constants.O_RDONLY | (process.platform === 'win32' ? 0 : fs.constants.O_NOFOLLOW));
+        try {
+          if (!openedPathMatches(source, real)) throw new Error(`Upload target identity changed before browser upload: ${file}`);
+          const before = fs.fstatSync(source);
+          if (!before.isFile()) throw new Error(`Upload target changed before browser upload: ${file}`);
+          if (before.size > MAX_UPLOAD_BYTES) throw new Error(`Upload file grew beyond ${MAX_UPLOAD_BYTES} bytes before browser upload`);
+          total += before.size;
+          if (total > MAX_TOTAL_UPLOAD_BYTES) throw new Error(`Upload batch grew beyond ${MAX_TOTAL_UPLOAD_BYTES} bytes before browser upload`);
+          copyOpenFile(source, target, before.size, file);
+          const after = fs.fstatSync(source);
+          // 同一 fd 的元数据变化表示复制期间源内容不稳定；宁可失败也不能上传混合快照。
+          if (after.size !== before.size || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) throw new Error(`Upload source changed while creating private snapshot: ${file}`);
+        } finally {
+          fs.closeSync(source);
+        }
         makePrivateFile(target);
-        if (fs.statSync(target).size !== stat.size) throw new Error(`Upload copy size changed during final staging: ${file}`);
         return target;
       });
       return { dir, files: prepared };
@@ -660,6 +670,33 @@ function createChatGPTDom({ responseTimeout }) {
       cleanupUploadWorkDir(dir);
       throw err;
     }
+  }
+
+  function copyOpenFile(source, target, size, original) {
+    const destination = fs.openSync(target, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
+    try {
+      const buffer = Buffer.allocUnsafe(64 * 1024);
+      let copied = 0;
+      while (copied < size) {
+        const count = fs.readSync(source, buffer, 0, Math.min(buffer.length, size - copied), null);
+        if (count === 0) throw new Error(`Upload source shrank while creating private snapshot: ${original}`);
+        let written = 0;
+        while (written < count) {
+          const bytes = fs.writeSync(destination, buffer, written, count - written);
+          if (bytes === 0) throw new Error(`Upload snapshot write made no progress: ${original}`);
+          written += bytes;
+        }
+        copied += count;
+      }
+    } finally {
+      fs.closeSync(destination);
+    }
+  }
+
+  function openedPathMatches(descriptor, file) {
+    const opened = fs.fstatSync(descriptor, { bigint: true });
+    const current = fs.lstatSync(file, { bigint: true });
+    return current.isFile() && opened.dev === current.dev && opened.ino === current.ino;
   }
 
   function cleanupUploadWorkDir(dir) {

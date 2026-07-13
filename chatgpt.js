@@ -116,11 +116,6 @@ function uploadRoots() {
   return value.split(path.delimiter).map(item => item.trim()).filter(Boolean).map(item => path.resolve(item));
 }
 
-function defaultUploadRoot(workspaceDir) {
-  // 默认 staging 与 responses/downloads 同根，避免项目外再散落 opencode-chatgpt-uploads 这类目录。
-  return path.join(path.resolve(workspaceDir || process.cwd()), '.opencode', 'cache', 'chatgpt', 'uploads');
-}
-
 function defaultBrowserPath() {
   // MCP 配置应尽量可迁移；浏览器可执行文件路径按平台自动发现，显式 env 仍优先。
   // 这里故意只发现 browser binary，不推导系统默认 profile：登录态是敏感凭据，应该由 --login
@@ -195,15 +190,26 @@ function readStdin() {
 function readFile(filePath) {
   // `--file` 是“把文本粘进 prompt”，不是附件上传；二进制/大型文件应走 `--upload`。
   // 但它同样会把本地内容发给 ChatGPT，所以复用 upload root 和大小边界；敏感性审批留给主 agent。
+  if (!path.isAbsolute(filePath)) throw new Error(`Text file path must be absolute: ${filePath}`);
   const abs = path.resolve(filePath);
   const real = fs.realpathSync.native(abs);
-  if (!realUploadRoots().some(root => isInside(root, real))) throw new Error(`Text file is outside allowed roots: ${filePath}`);
-  const stat = fs.statSync(real);
-  if (!stat.isFile()) throw new Error(`Text path is not a regular file: ${filePath}`);
-  if (stat.size > MAX_TEXT_FILE_BYTES) throw new Error(`Text file is too large for --file; use --upload instead: ${real}`);
-  const bytes = fs.readFileSync(real);
-  try { return new TextDecoder('utf-8', { fatal: true }).decode(bytes); }
-  catch { throw new Error(`Text file is not valid UTF-8; use --upload instead: ${real}`); }
+  const roots = realUploadRoots();
+  if (roots.length > 0 && !roots.some(root => isInside(root, real))) throw new Error(`Text file is outside allowed roots: ${filePath}`);
+  const source = fs.openSync(real, fs.constants.O_RDONLY | (process.platform === 'win32' ? 0 : fs.constants.O_NOFOLLOW));
+  try {
+    if (!openedPathMatches(source, real)) throw new Error(`Text file changed before it could be read: ${filePath}`);
+    const before = fs.fstatSync(source);
+    if (!before.isFile()) throw new Error(`Text path is not a regular file: ${filePath}`);
+    if (before.size > MAX_TEXT_FILE_BYTES) throw new Error(`Text file is too large for --file; use --upload instead: ${real}`);
+    const bytes = fs.readFileSync(source);
+    const after = fs.fstatSync(source);
+    // 同一 fd 在读取期间变化会产生混合 prompt；元数据不稳定时要求调用方重新发起。
+    if (bytes.length !== before.size || after.size !== before.size || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) throw new Error(`Text file changed while it was being read: ${filePath}`);
+    try { return new TextDecoder('utf-8', { fatal: true }).decode(bytes); }
+    catch { throw new Error(`Text file is not valid UTF-8; use --upload instead: ${real}`); }
+  } finally {
+    fs.closeSync(source);
+  }
 }
 
 function isInside(root, target) {
@@ -211,21 +217,30 @@ function isInside(root, target) {
   return !relative || (!relative.startsWith('..') && !path.isAbsolute(relative));
 }
 
-function realUploadRoots(workspaceDir) {
-  return [...EXPLICIT_UPLOAD_ROOTS, defaultUploadRoot(workspaceDir)].map(root => {
+function openedPathMatches(descriptor, file) {
+  const opened = fs.fstatSync(descriptor, { bigint: true });
+  const current = fs.lstatSync(file, { bigint: true });
+  return current.isFile() && opened.dev === current.dev && opened.ino === current.ino;
+}
+
+function realUploadRoots() {
+  // 默认接受用户明确指定的本地路径；只有部署方设置 roots 时才启用目录收窄。
+  return EXPLICIT_UPLOAD_ROOTS.map(root => {
     try { return fs.realpathSync.native(root); }
     catch { throw new Error(`Upload root does not exist: ${root}`); }
   });
 }
 
-function validateUploadPaths(files, workspaceDir) {
+function validateUploadPaths(files) {
   // CLI --upload 和 MCP file 使用同一套机械边界；主 agent 决定“是否应上传”，这里不做内容语义审批。
   const list = normalizePathList(files);
   if (list.length > MAX_UPLOAD_FILES) throw new Error(`Upload accepts at most ${MAX_UPLOAD_FILES} files`);
   const safe = list.map(file => {
+    if (!path.isAbsolute(file)) throw new Error(`Upload file path must be absolute: ${file}`);
     const abs = path.resolve(file);
     const real = fs.realpathSync.native(abs);
-    if (!realUploadRoots(workspaceDir).some(root => isInside(root, real))) throw new Error(`Upload file is outside allowed roots: ${file}`);
+    const roots = realUploadRoots();
+    if (roots.length > 0 && !roots.some(root => isInside(root, real))) throw new Error(`Upload file is outside allowed roots: ${file}`);
     const stat = fs.statSync(real);
     if (!stat.isFile()) throw new Error(`Upload path is not a regular file: ${file}`);
     // 不按扩展名判断“可上传性”：OpenCode 侧已经负责读取/外发许可，bridge 只做路径和体量边界。
@@ -823,20 +838,22 @@ async function main(argv = process.argv) {
   });
 
   try {
+    const workspaceDir = opts.workspace || opts.cwd || process.cwd();
+    // 附件必须先在本地完成校验，再启动浏览器；坏路径不能产生 daemon 或窗口副作用。
+    const uploadPaths = validateUploadPaths(opts.upload);
     let daemon = await ensureDaemon();
     // CLI 只提交已归一化的请求；上传、等待、pending、落盘都由 daemon 在同一状态机里处理。
-    const workspaceDir = opts.workspace || opts.cwd || process.cwd();
     // imageAspectRatio 能隐式打开 image mode；这样 OpenCode agent 只要表达“宽屏图”，不必重复传两个字段。
     let result;
     try {
-      result = await httpJSON(daemon, 'POST', '/ask', { fullPrompt, uploadPaths: validateUploadPaths(opts.upload, workspaceDir), workspaceDir, sessionID, newSession: opts.newSession || !opts.sessionID, saveToFile: opts.saveToFile, mode: requestMode, imageAspectRatio: opts.imageAspectRatio || null }, ASK_HTTP_TIMEOUT);
+      result = await httpJSON(daemon, 'POST', '/ask', { fullPrompt, uploadPaths, workspaceDir, sessionID, newSession: opts.newSession || !opts.sessionID, saveToFile: opts.saveToFile, mode: requestMode, imageAspectRatio: opts.imageAspectRatio || null }, ASK_HTTP_TIMEOUT);
     } catch (err) {
       if (err.code !== 'BROWSER_DISCONNECTED') throw err;
       // core 只在 page 创建前返回这个 code；此时 prompt 尚未提交，重启 daemon 后复用同一个 sessionID 安全重试一次。
       // 如果断连发生在 DOM 提交之后，core 不会使用这个 code，CLI 也不会自动重发 prompt。
       await retireDaemon(daemon);
       daemon = await ensureDaemon();
-      result = await httpJSON(daemon, 'POST', '/ask', { fullPrompt, uploadPaths: validateUploadPaths(opts.upload, workspaceDir), workspaceDir, sessionID, newSession: opts.newSession || !opts.sessionID, saveToFile: opts.saveToFile, mode: requestMode, imageAspectRatio: opts.imageAspectRatio || null }, ASK_HTTP_TIMEOUT);
+      result = await httpJSON(daemon, 'POST', '/ask', { fullPrompt, uploadPaths, workspaceDir, sessionID, newSession: opts.newSession || !opts.sessionID, saveToFile: opts.saveToFile, mode: requestMode, imageAspectRatio: opts.imageAspectRatio || null }, ASK_HTTP_TIMEOUT);
     }
     if (!result.ok) throw new Error(result.error || 'Daemon returned an error');
     const responseText = formatResponse(result);

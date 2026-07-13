@@ -76,10 +76,6 @@ function uploadRoots() {
   return value.split(path.delimiter).map(item => item.trim()).filter(Boolean).map(item => path.resolve(item));
 }
 
-function defaultUploadRoot() {
-  return path.join(currentWorkspaceDir(), '.opencode', 'cache', 'chatgpt', 'uploads');
-}
-
 function workspaceRoots() {
   const value = process.env.CHATGPT_WORKSPACE_ROOTS || '';
   return value.split(path.delimiter).map(item => item.trim()).filter(Boolean).map(item => path.resolve(item));
@@ -153,23 +149,25 @@ function isInside(root, target) {
 }
 
 function realUploadRoots() {
-  return [...EXPLICIT_UPLOAD_ROOTS, defaultUploadRoot()].map(root => {
+  // 默认信任用户明确传给 Tool 的绝对文件路径；显式 roots 仅作为部署方主动开启的收窄策略。
+  return EXPLICIT_UPLOAD_ROOTS.map(root => {
     try { return fs.realpathSync.native(root); }
     catch { throw new Error(`upload root does not exist: ${root}`); }
   });
 }
 
 function uploadRootDiagnostics() {
-  // status 不触发上传，但应暴露 staging 目录是否可用，避免第一次 file 调用才发现配置错误。
-  const roots = [...EXPLICIT_UPLOAD_ROOTS, defaultUploadRoot()];
-  const lines = roots.map(root => fs.existsSync(root) ? `Upload root ok: ${root}` : `Upload root missing: ${root}`);
+  // 未配置 roots 不是异常，而是允许用户指定任意本地文件；status 仍暴露显式收窄策略是否有效。
+  if (EXPLICIT_UPLOAD_ROOTS.length === 0) return 'Upload roots: unrestricted (only attach files explicitly selected by the user)';
+  const lines = EXPLICIT_UPLOAD_ROOTS.map(root => fs.existsSync(root) ? `Upload root ok: ${root}` : `Upload root missing: ${root}`);
   return lines.join('\n');
 }
 
 function assertUploadFileSafe(file) {
   const abs = path.resolve(file);
   const real = fs.realpathSync.native(abs);
-  if (!realUploadRoots().some(root => isInside(root, real))) throw new Error(`file is outside allowed upload roots: ${file}`);
+  const roots = realUploadRoots();
+  if (roots.length > 0 && !roots.some(root => isInside(root, real))) throw new Error(`file is outside allowed upload roots: ${file}`);
   const stat = fs.statSync(real);
   if (!stat.isFile()) throw new Error(`file is not a regular file: ${file}`);
   if (stat.size > MAX_UPLOAD_BYTES) throw new Error(`file is too large: ${file}; limit is ${MAX_UPLOAD_BYTES} bytes`);
@@ -407,7 +405,7 @@ const TOOLS = [
             { type: 'string' },
             { type: 'array', maxItems: MAX_UPLOAD_FILES, items: { type: 'string' } },
           ],
-          description: 'Absolute path or array of absolute paths to upload through ChatGPT attachments. Paths must be staged under the current project chatgpt uploads cache or an allowed CHATGPT_UPLOAD_ROOTS entry.',
+          description: 'Absolute path or array of absolute paths to upload through ChatGPT attachments. File contents are sent to ChatGPT: attach only files explicitly selected by the user and never infer sensitive paths. Paths are unrestricted by default; CHATGPT_UPLOAD_ROOTS can opt into an allowlist.',
         },
         saveToFile: {
           type: 'boolean',

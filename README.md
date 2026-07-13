@@ -94,7 +94,7 @@ CHATGPT_SESSION_MAX_AGE_MS        Max age for ordinary completed session entries
 CHATGPT_DAEMON_MAX_REQUEST_BYTES  Local daemon /ask body cap, default 26214400
 CHATGPT_WORKSPACE_ROOTS           Path-delimited allowlist for response/artifact cache roots; omit to trust caller workspaceDir
 CHATGPT_WORKSPACE_DIR             Optional override for current project workspace; normally omit under OpenCode
-CHATGPT_UPLOAD_ROOTS              Extra upload allowlist roots; default is <current-project>/.opencode/cache/chatgpt/uploads
+CHATGPT_UPLOAD_ROOTS              Optional path-delimited upload allowlist; omit to accept user-selected absolute file paths
 CHATGPT_MAX_UPLOAD_FILES          Per-request upload file count cap, default 12
 CHATGPT_MAX_UPLOAD_BYTES          Per-file upload size cap, default 419430400
 CHATGPT_MAX_TOTAL_UPLOAD_BYTES    Per-request aggregate upload cap, default 838860800
@@ -241,8 +241,8 @@ node chatgpt.js --session-id #4fa92c9d10 "continue the previous research"
 node chatgpt.js --raw "Reply exactly: OK"
 node chatgpt.js --context "project uses Effect v4" "review this approach"
 node chatgpt.js --git "summarize these local changes"
-node chatgpt.js --file <upload-staging-dir>\error.log "explain this staged text file"
-node chatgpt.js --upload <upload-staging-dir>\file.txt --upload <upload-staging-dir>\notes.docx "analyze these staged files"
+node chatgpt.js --file <absolute-directory-path>\error.log "explain this local text file"
+node chatgpt.js --upload <absolute-directory-path>\file.txt --upload <absolute-directory-path>\notes.docx "analyze these local files"
 node chatgpt.js --save-to-file "write a long research report"
 node chatgpt.js --status
 node chatgpt.js --stop
@@ -252,11 +252,13 @@ node chatgpt.js --stop
 It can still include saved-response metadata, downloads, status, and the stable
 `Session: #xxxxxxxxxx` handle that MCP/OpenCode need for continuation.
 
-`--file` reads a staged text file and embeds its contents into the prompt.
-`--upload` sends staged files through ChatGPT's attachment UI and should be used
+`--file` reads a local UTF-8 text file and embeds its contents into the prompt.
+`--upload` sends local files through ChatGPT's attachment UI and should be used
 for DOCX/PDF/images, large files, or anything that ChatGPT should inspect as a
-file. Both paths must be under `CHATGPT_UPLOAD_ROOTS`; stage external material
-there deliberately instead of pointing the root at an entire user profile.
+file. Paths are unrestricted by default. Set `CHATGPT_UPLOAD_ROOTS` only when a
+deployment needs an explicit allowlist. File contents leave the local machine,
+so callers must upload only files the user explicitly selected and must not infer
+sensitive paths.
 
 ## OpenCode MCP Setup
 
@@ -367,12 +369,14 @@ automation and would modify the user's system clipboard.
 
 MCP `file` means browser attachment upload, not CLI `--file` text embedding. It
 uploads one local file or an array of local files through the ChatGPT attachment
-input. Runtime validation resolves both roots and targets through realpath,
-only allows files under `<current-project>/.opencode/cache/chatgpt/uploads` plus optional `CHATGPT_UPLOAD_ROOTS`, requires distinct basenames, and
-enforces the count, per-file, and aggregate upload caps. It does not require a
-specific file extension or type. Content sensitivity is decided by the
-caller/OpenCode permission layer, not by filename heuristics in this transport
-bridge. Uploads are retried for transient browser frame errors.
+input. By default it accepts any user-selected absolute regular-file path. If
+`CHATGPT_UPLOAD_ROOTS` is configured, every file must remain under one of those
+explicit roots. Runtime validation still resolves targets through realpath,
+requires distinct basenames, and enforces the count, per-file, and aggregate
+upload caps. It does not require a specific file extension or type. Because file
+contents are sent to ChatGPT, the caller must not infer sensitive paths; content
+approval remains the caller/OpenCode permission layer's responsibility. Uploads
+are retried for transient browser frame errors.
 
 `saveToFile: true` saves the text response to the current project cache and
 returns only metadata instead of the full response body:

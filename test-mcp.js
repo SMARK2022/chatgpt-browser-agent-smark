@@ -69,6 +69,8 @@ async function main() {
     ['testSessionIDValidationRejection', () => testSessionIDValidationRejection(), false],
     ['testFileUploadRejectsOutsideAllowlist', () => testFileUploadRejectsOutsideAllowlist(), false],
     ['testFileUploadRejectsDuplicateBasenames', () => testFileUploadRejectsDuplicateBasenames(), false],
+    ['testCliUploadPathPolicy', () => testCliUploadPathPolicy(), false],
+    ['testCoreUploadPathPolicy', () => testCoreUploadPathPolicy(), false],
     ['testStopWithoutActiveAsk', () => testStopWithoutActiveAsk(), false],
     ['testProjectIdentityPolicy', () => testProjectIdentityPolicy(), false],
     ['testCoreProjectStateMachine', () => testCoreProjectStateMachine(), false],
@@ -434,9 +436,8 @@ async function testFileUploadRejectsOutsideAllowlist() {
   // 文件不在 upload allowlist 内时，MCP wrapper 必须在启动 CLI 前就拒绝。
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-upload-outside-'));
   const allowed = path.join(workspace, 'allowed');
-  // 显式根与项目默认 staging 根都必须真实存在，否则会先命中“配置根不存在”，无法证明文件越界。
+  // 显式 root 是 opt-in 收窄策略；只创建该 root，不能偷偷依赖默认 staging 目录。
   fs.mkdirSync(allowed);
-  fs.mkdirSync(path.join(workspace, '.opencode', 'cache', 'chatgpt', 'uploads'), { recursive: true });
   const outsideFile = path.join(os.tmpdir(), `outside-allowlist-${crypto.randomBytes(4).toString('hex')}.txt`);
   fs.writeFileSync(outsideFile, 'should be rejected');
   try {
@@ -446,6 +447,10 @@ async function testFileUploadRejectsOutsideAllowlist() {
     const result = responses.find(item => item.id === 'upload-outside');
     assert.ok(result.result?.isError, 'file outside allowlist must return tool error');
     assert.match(result.result.content[0].text, /outside.*root|allowed.*root/i);
+    const missingResponses = runServer([
+      JSON.stringify({ jsonrpc: '2.0', id: 'missing-root', method: 'tools/call', params: { name: 'ask', arguments: { prompt: 'test', file: outsideFile } } }),
+    ], { CHATGPT_WORKSPACE_DIR: workspace, CHATGPT_WORKSPACE_ROOTS: workspace, CHATGPT_UPLOAD_ROOTS: path.join(workspace, 'missing-root') });
+    assert.match(missingResponses.find(item => item.id === 'missing-root').result.content[0].text, /upload root does not exist/i);
   } finally {
     try { fs.unlinkSync(outsideFile); } catch {}
     fs.rmSync(workspace, { recursive: true, force: true });
@@ -457,8 +462,7 @@ async function testFileUploadRejectsDuplicateBasenames() {
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-upload-duplicates-'));
   const uploadDir = path.join(workspace, 'uploads');
   fs.mkdirSync(uploadDir, { recursive: true });
-  // wrapper 始终同时验证项目默认 staging 根，夹具应完整模拟一个可上传 workspace。
-  fs.mkdirSync(path.join(workspace, '.opencode', 'cache', 'chatgpt', 'uploads'), { recursive: true });
+  // 未显式配置 root 时，Project cache 外的绝对路径也应进入后续安全校验，而不是要求预建 staging 目录。
   fs.mkdirSync(path.join(uploadDir, 'sub'), { recursive: true });
   const fileA = path.join(uploadDir, 'dup-name.txt');
   const fileB = path.join(uploadDir, 'sub', 'dup-name.txt');
@@ -467,10 +471,104 @@ async function testFileUploadRejectsDuplicateBasenames() {
   try {
     const responses = runServer([
       JSON.stringify({ jsonrpc: '2.0', id: 'dup-basenames', method: 'tools/call', params: { name: 'ask', arguments: { prompt: 'test', file: [fileA, fileB] } } }),
-    ], { CHATGPT_WORKSPACE_DIR: workspace, CHATGPT_WORKSPACE_ROOTS: workspace, CHATGPT_UPLOAD_ROOTS: uploadDir });
+    ], { CHATGPT_WORKSPACE_DIR: workspace, CHATGPT_WORKSPACE_ROOTS: workspace });
     const result = responses.find(item => item.id === 'dup-basenames');
     assert.ok(result.result?.isError, 'duplicate basenames must return tool error');
     assert.match(result.result.content[0].text, /basename|distinct/i);
+  } finally {
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+}
+
+async function testCliUploadPathPolicy() {
+  // 公开 CLI 必须在启动 daemon 前完成路径校验，因此本测试不会打开浏览器或发送 prompt。
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-cli-upload-policy-'));
+  const firstDir = path.join(workspace, 'first');
+  const secondDir = path.join(workspace, 'second');
+  const allowed = path.join(workspace, 'allowed');
+  fs.mkdirSync(firstDir);
+  fs.mkdirSync(secondDir);
+  fs.mkdirSync(allowed);
+  const first = path.join(firstDir, 'same.zip');
+  const second = path.join(secondDir, 'same.zip');
+  const outside = path.join(workspace, 'outside.zip');
+  const text = path.join(workspace, 'notes.txt');
+  fs.writeFileSync(first, 'first');
+  fs.writeFileSync(second, 'second');
+  fs.writeFileSync(outside, 'outside');
+  fs.writeFileSync(text, 'notes');
+  const env = { CHATGPT_WORKSPACE_DIR: workspace, CHATGPT_WORKSPACE_ROOTS: workspace, CHATGPT_UPLOAD_ROOTS: '', CHATGPT_STATE_DIR: path.join(workspace, 'state'), CHATGPT_SESSION_DIR: path.join(workspace, 'sessions') };
+  try {
+    // cache 外文件先通过 unrestricted 路径策略，再由仍然保留的 basename 约束拒绝。
+    const unrestricted = await runChatgptCLI(['--raw', '--upload', first, '--upload', second, 'test'], env);
+    assert.notStrictEqual(unrestricted.status, 0);
+    assert.match(unrestricted.stderr, /basename|distinct/i);
+    const restricted = await runChatgptCLI(['--raw', '--upload', outside, 'test'], { ...env, CHATGPT_UPLOAD_ROOTS: allowed });
+    assert.notStrictEqual(restricted.status, 0);
+    assert.match(restricted.stderr, /outside allowed roots/i);
+    const relativeUpload = await runChatgptCLI(['--raw', '--upload', 'relative.zip', 'test'], env);
+    assert.match(relativeUpload.stderr, /path must be absolute/i);
+    const relativeText = await runChatgptCLI(['--raw', '--file', 'relative.txt', 'test'], env);
+    assert.match(relativeText.stderr, /path must be absolute/i);
+    // --file 与 --upload 共用 unrestricted/显式 root 策略；用后续 duplicate 错误证明文本读取已通过。
+    const unrestrictedText = await runChatgptCLI(['--raw', '--file', text, '--upload', first, '--upload', second, 'test'], env);
+    assert.match(unrestrictedText.stderr, /basename|distinct/i);
+    const allowedText = path.join(allowed, 'inside.txt');
+    const allowedA = path.join(allowed, 'a');
+    const allowedB = path.join(allowed, 'b');
+    fs.mkdirSync(allowedA);
+    fs.mkdirSync(allowedB);
+    fs.writeFileSync(allowedText, 'inside');
+    fs.writeFileSync(path.join(allowedA, 'same.zip'), 'a');
+    fs.writeFileSync(path.join(allowedB, 'same.zip'), 'b');
+    const restrictedText = await runChatgptCLI(['--raw', '--file', allowedText, '--upload', path.join(allowedA, 'same.zip'), '--upload', path.join(allowedB, 'same.zip'), 'test'], { ...env, CHATGPT_UPLOAD_ROOTS: allowed });
+    assert.match(restrictedText.stderr, /basename|distinct/i);
+    const outsideText = await runChatgptCLI(['--raw', '--file', text, 'test'], { ...env, CHATGPT_UPLOAD_ROOTS: allowed });
+    assert.match(outsideText.stderr, /outside allowed roots/i);
+    const missingTextRoot = await runChatgptCLI(['--raw', '--file', text, 'test'], { ...env, CHATGPT_UPLOAD_ROOTS: path.join(workspace, 'missing-root') });
+    assert.match(missingTextRoot.stderr, /upload root does not exist/i);
+  } finally {
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+}
+
+function testCoreUploadPathPolicy() {
+  // daemon HTTP 校验是绕过 MCP/CLI 时的最终边界，使用既有 test hook 直接验证，不创建 browser runtime。
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-core-upload-policy-'));
+  const allowed = path.join(workspace, 'allowed');
+  fs.mkdirSync(allowed);
+  const inside = path.join(allowed, 'inside.zip');
+  const outside = path.join(workspace, 'outside.zip');
+  fs.writeFileSync(inside, 'inside');
+  fs.writeFileSync(outside, 'outside');
+  const script = String.raw`
+    const assert = require('assert');
+    const fs = require('fs');
+    const { testing } = require('./chatgpt-core');
+    const input = file => ({ fullPrompt: 'test', uploadPaths: [file], workspaceDir: process.env.FIXTURE_WORKSPACE });
+    if (process.env.EXPECT_MISSING_ROOT) {
+      assert.throws(() => testing.validateAskInput(input(process.env.FIXTURE_INSIDE)), /upload root does not exist/i);
+      process.exit(0);
+    }
+    const accepted = testing.validateAskInput(input(process.env.FIXTURE_INSIDE));
+    assert.strictEqual(accepted.uploadPaths[0], fs.realpathSync.native(process.env.FIXTURE_INSIDE));
+    assert.throws(() => testing.validateAskInput(input('relative.zip')), /absolute/i);
+    if (process.env.FIXTURE_OUTSIDE) assert.throws(() => testing.validateAskInput(input(process.env.FIXTURE_OUTSIDE)), /outside allowed roots/i);
+  `;
+  const run = env => spawnSync(process.execPath, ['-e', script], {
+    cwd: __dirname,
+    encoding: 'utf8',
+    timeout: 5_000,
+    windowsHide: true,
+    env: { ...BASE_ENV, CHATGPT_TEST_HOOKS: '1', CHATGPT_WORKSPACE_ROOTS: workspace, FIXTURE_WORKSPACE: workspace, FIXTURE_INSIDE: inside, ...env },
+  });
+  try {
+    const unrestricted = run({ CHATGPT_UPLOAD_ROOTS: '' });
+    assert.strictEqual(unrestricted.status, 0, unrestricted.stderr || unrestricted.stdout);
+    const restricted = run({ CHATGPT_UPLOAD_ROOTS: allowed, FIXTURE_OUTSIDE: outside });
+    assert.strictEqual(restricted.status, 0, restricted.stderr || restricted.stdout);
+    const missing = run({ CHATGPT_UPLOAD_ROOTS: path.join(workspace, 'missing-root'), EXPECT_MISSING_ROOT: '1' });
+    assert.strictEqual(missing.status, 0, missing.stderr || missing.stdout);
   } finally {
     fs.rmSync(workspace, { recursive: true, force: true });
   }
@@ -680,7 +778,7 @@ function testCoreProjectStateMachine() {
         let extractCalls = 0;
         let artifactCalls = 0;
         let artifactBeforeState = null;
-        let submitImpl = async (_page, _prompt, _files, _workspace, _mode, _ratio, _log, _cancel, beforeSend) => {
+        let submitImpl = async (_page, _prompt, _files, _mode, _ratio, _log, _cancel, beforeSend) => {
           submitCalls++;
           beforeSend();
           return { ...idle };
@@ -770,7 +868,7 @@ function testCoreProjectStateMachine() {
         await testing.rememberCurrentSessionUrl(fakePage(scoped), project, '#drift', () => {}, 1_000, false, scoped);
         askPage.current = scoped;
         state = { ...idle };
-        submitImpl = async (_page, _prompt, _files, _workspace, _mode, _ratio, _log, _cancel, beforeSend) => {
+        submitImpl = async (_page, _prompt, _files, _mode, _ratio, _log, _cancel, beforeSend) => {
           // 切页发生在 beforeSend 调用前，模拟附件/菜单等待期间用户打开另一 conversation。
           submitCalls++;
           askPage.current = 'https://chatgpt.com/g/g-p-abc123-mcp/c/turn-b';
@@ -782,7 +880,7 @@ function testCoreProjectStateMachine() {
         // 点击后切页时不允许抽取或下载另一 conversation 的内容。
         await testing.rememberCurrentSessionUrl(fakePage(scoped), project, '#post-switch', () => {}, 1_000, false, scoped);
         askPage.current = scoped;
-        submitImpl = async (_page, _prompt, _files, _workspace, _mode, _ratio, _log, _cancel, beforeSend) => {
+        submitImpl = async (_page, _prompt, _files, _mode, _ratio, _log, _cancel, beforeSend) => {
           submitCalls++;
           beforeSend();
           return { ...idle };
@@ -803,7 +901,7 @@ function testCoreProjectStateMachine() {
         await testing.rememberCurrentSessionUrl(fakePage(scoped), project, '#image-snapshot', () => {}, 1_000, false, scoped);
         askPage.current = scoped;
         state = { ...idle, nativeImageURLs: ['https://chatgpt.com/image-old'] };
-        submitImpl = async (_page, _prompt, _files, _workspace, _mode, _ratio, _log, _cancel, beforeSend) => {
+        submitImpl = async (_page, _prompt, _files, _mode, _ratio, _log, _cancel, beforeSend) => {
           submitCalls++;
           beforeSend();
           return { ...state };
@@ -837,7 +935,7 @@ function testCoreProjectStateMachine() {
         // 新会话若只得到 plain /c，必须留下 lost 并失败，不能返回 completed 或自动绑定其它会话。
         askPage.current = project.url;
         state = { ...idle, count: 0, userCount: 0, lastText: '' };
-        submitImpl = async (_page, _prompt, _files, _workspace, _mode, _ratio, _log, _cancel, beforeSend) => {
+        submitImpl = async (_page, _prompt, _files, _mode, _ratio, _log, _cancel, beforeSend) => {
           // beforeSend 在 Project 首页合法，点击后却只出现 plain /c；这是“可能已发送但无法安全续聊”。
           submitCalls++;
           beforeSend();
@@ -962,7 +1060,7 @@ async function testSubmitUsesTrustedClick() {
       </script>
     `);
     // Chromium contenteditable 会原生把续行空格读回 NBSP；必须保持语义一致才能继续可信提交。
-    await createChatGPTDom({ responseTimeout: 5_000 }).submit(page, 'project submit probe\n  continuation', [], process.cwd(), 'auto', null, () => {});
+    await createChatGPTDom({ responseTimeout: 5_000 }).submit(page, 'project submit probe\n  continuation', [], 'auto', null, () => {});
     const probe = await page.evaluate(() => ({
       ...window.submitProbe,
       userCount: document.querySelectorAll('[data-message-author-role="user"]').length,
@@ -976,7 +1074,7 @@ async function testSubmitUsesTrustedClick() {
     `);
     // 路由变化但没有新增 user turn 不能伪装成提交成功，否则新 session 会绑定到用户手动打开的历史会话。
     await assert.rejects(
-      () => createChatGPTDom({ responseTimeout: 12_000 }).submit(page, 'route-only fixture', [], process.cwd(), 'auto', null, () => {}),
+      () => createChatGPTDom({ responseTimeout: 12_000 }).submit(page, 'route-only fixture', [], 'auto', null, () => {}),
       error => error.promptMayHaveBeenSent === true && /waiting failed|timeout/i.test(error.message),
     );
   });
@@ -986,7 +1084,10 @@ async function testFileUploadUsesStableLocalCopy() {
   // 本地 Chromium fixture 走公开 submit seam，覆盖真实 file input/change/chip/send 链路而不连接 ChatGPT。
   const { createChatGPTDom } = require('./chatgpt-dom');
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-upload-success-'));
-  const uploadDir = path.join(workspace, '.opencode', 'cache', 'chatgpt', 'uploads');
+  const previousUploadRoots = process.env.CHATGPT_UPLOAD_ROOTS;
+  delete process.env.CHATGPT_UPLOAD_ROOTS;
+  // 带空格的任意本地目录覆盖默认 unrestricted 语义，随后仍必须复制到 adapter 私有临时目录。
+  const uploadDir = path.join(workspace, 'external upload fixtures');
   fs.mkdirSync(uploadDir, { recursive: true });
   const marker = `UPLOAD-${crypto.randomBytes(5).toString('hex')}`;
   const file = path.join(uploadDir, 'fixture upload.txt');
@@ -1049,7 +1150,39 @@ async function testFileUploadUsesStableLocalCopy() {
         return waitForSelector(selector, options);
       };
       const dom = createChatGPTDom({ responseTimeout: 5_000 });
-      await dom.submit(page, 'upload fixture', [file, secondFile], workspace, 'auto', null, () => {});
+      const allowed = path.join(workspace, 'allowed');
+      fs.mkdirSync(allowed);
+      process.env.CHATGPT_UPLOAD_ROOTS = path.join(workspace, 'missing-root');
+      await assert.rejects(() => dom.submit(page, 'missing root fixture', [file], 'auto', null, () => {}), /ENOENT|no such file/i);
+      process.env.CHATGPT_UPLOAD_ROOTS = allowed;
+      // DOM 最后一跳仍服从显式 opt-in root，不能因前层已验证就跳过 TOCTOU 前的复核。
+      await assert.rejects(() => dom.submit(page, 'blocked upload fixture', [file], 'auto', null, () => {}), /escaped allowed roots/i);
+      const raceFile = path.join(allowed, 'race.txt');
+      const replacement = path.join(workspace, 'replacement.txt');
+      fs.writeFileSync(raceFile, 'safe');
+      fs.writeFileSync(replacement, 'risk');
+      const raceReal = fs.realpathSync.native(raceFile);
+      const openSync = fs.openSync;
+      let swapped = false;
+      fs.openSync = (target, ...args) => {
+        if (!swapped && target === raceReal) {
+          swapped = true;
+          // 模拟 Windows 已跟随瞬时 symlink、但 pathname 随即恢复：fd 指向替代文件，路径则是新的安全文件。
+          const descriptor = openSync(replacement, fs.constants.O_RDONLY);
+          fs.unlinkSync(raceFile);
+          fs.writeFileSync(raceFile, 'safe');
+          return descriptor;
+        }
+        return openSync(target, ...args);
+      };
+      try {
+        // fd/path 身份不一致必须失败，不能把同尺寸替代内容复制进浏览器快照。
+        await assert.rejects(() => dom.submit(page, 'race fixture', [raceFile], 'auto', null, () => {}), /identity changed/i);
+      } finally {
+        fs.openSync = openSync;
+      }
+      delete process.env.CHATGPT_UPLOAD_ROOTS;
+      await dom.submit(page, 'upload fixture', [file, secondFile], 'auto', null, () => {});
       const probe = await page.evaluate(() => window.uploadProbe);
       assert.deepStrictEqual(probe.files, [
         { name: 'fixture upload.txt', size: marker.length, text: marker },
@@ -1059,6 +1192,8 @@ async function testFileUploadUsesStableLocalCopy() {
       assert.strictEqual(probe.removed, 2, 'both recoverable retries must remove partial attachments before the third upload');
     });
   } finally {
+    if (previousUploadRoots === undefined) delete process.env.CHATGPT_UPLOAD_ROOTS;
+    else process.env.CHATGPT_UPLOAD_ROOTS = previousUploadRoots;
     fs.rmSync(workspace, { recursive: true, force: true });
   }
 }
@@ -1260,7 +1395,7 @@ async function testImageModeUsesCurrentComposerMenu() {
         });
       </script>
     `);
-    await createChatGPTDom({ responseTimeout: 5_000 }).submit(page, 'draw fixture', [], process.cwd(), 'image', 'wide', () => {});
+    await createChatGPTDom({ responseTimeout: 5_000 }).submit(page, 'draw fixture', [], 'image', 'wide', () => {});
     assert.deepStrictEqual(await page.evaluate(() => window.imageProbe), {
       hiddenSelected: false,
       selected: true,
@@ -1283,7 +1418,7 @@ async function testImageModeUsesCurrentComposerMenu() {
       </script>
     `);
     const logs = [];
-    await createChatGPTDom({ responseTimeout: 5_000 }).submit(page, 'draw fallback', [], process.cwd(), 'image', 'wide', message => logs.push(message));
+    await createChatGPTDom({ responseTimeout: 5_000 }).submit(page, 'draw fallback', [], 'image', 'wide', message => logs.push(message));
     assert.strictEqual(await page.evaluate(() => window.imageProbe.sent), true);
     assert.ok(logs.some(message => /mode click was not confirmed/.test(message)));
     assert.ok(!logs.some(message => /^Selected ChatGPT composer mode/.test(message)));
@@ -1522,6 +1657,8 @@ function testBasicProtocol() {
   assert.ok(responses.some(item => item.id === 2 && item.result?.tools?.some(tool => tool.name === 'ask')));
   const askSchema = responses.find(item => item.id === 2).result.tools.find(tool => tool.name === 'ask').inputSchema;
   assert.ok(askSchema.properties.imageAspectRatio);
+  // 警告属于模型可见的 Tool 契约，默认 unrestricted 不能只写在 README 里。
+  assert.match(askSchema.properties.file.description, /sent to ChatGPT.*explicitly selected.*never infer sensitive paths/i);
   // schema 是主 agent 的“能力地图”：这里固定不暴露 search，让检索回到自然 prompt 和 ChatGPT 自主工具选择。
   // 这样既保留 citation DOM 提取，也避免模型为了选择 mode 而多一层无收益决策。
   assert.deepStrictEqual(askSchema.properties.mode.enum, ['auto', 'image']);

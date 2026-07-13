@@ -342,10 +342,6 @@ function uploadRoots() {
   return value.split(path.delimiter).map(item => item.trim()).filter(Boolean).map(item => path.resolve(item));
 }
 
-function defaultUploadRoot(workspaceDir) {
-  return path.join(resolveWorkspaceDir(workspaceDir), '.opencode', 'cache', 'chatgpt', 'uploads');
-}
-
 function workspaceRoots() {
   // OpenCode 本体 daemon 会按 instance directory 启动 MCP；ChatGPT browser daemon 却是全局共享的。
   // 因此 workspace allowlist 只能是显式部署策略，不能默认锁死到“第一个启动 daemon 的项目”。
@@ -383,19 +379,21 @@ function validateWorkspaceDir(value) {
   return root;
 }
 
-function realUploadRoots(workspaceDir) {
-  // root 每次上传时再 realpath，避免启动时因为 staging 目录短暂缺失导致整个 MCP server 不可用。
-  return [...EXPLICIT_UPLOAD_ROOTS, defaultUploadRoot(workspaceDir)].map(root => {
+function realUploadRoots() {
+  // 默认不限制用户明确传入的附件路径；显式 roots 仍在每次请求时 realpath，作为可选部署边界。
+  return EXPLICIT_UPLOAD_ROOTS.map(root => {
     try { return fs.realpathSync.native(root); }
     catch { throw new Error(`upload root does not exist: ${root}`); }
   });
 }
 
-function assertUploadFileSafe(file, workspaceDir) {
+function assertUploadFileSafe(file) {
   // daemon 是最后一道外发边界：即使调用者拿到了 bearer token 直接 POST /ask，
-  // 也必须重新执行 root、realpath、regular file 和大小校验，不能只相信 MCP wrapper。
+  // 也必须重新执行 realpath、regular file 和大小校验；显式 roots 配置存在时再收窄目录。
+  if (!path.isAbsolute(file)) throw new Error(`upload file path must be absolute: ${file}`);
   const real = fs.realpathSync.native(path.resolve(file));
-  if (!realUploadRoots(workspaceDir).some(root => pathInside(root, real))) throw new Error(`upload file is outside allowed roots: ${file}`);
+  const roots = realUploadRoots();
+  if (roots.length > 0 && !roots.some(root => pathInside(root, real))) throw new Error(`upload file is outside allowed roots: ${file}`);
   const stat = fs.statSync(real);
   if (!stat.isFile()) throw new Error(`upload path is not a regular file: ${file}`);
   // daemon 也不检查扩展名；否则直连 /ask 与 MCP wrapper 会在“无扩展文件”上给出不一致行为。
@@ -764,7 +762,7 @@ function validateAskInput(input) {
   return {
     ...input,
     fullPrompt: input.fullPrompt,
-    uploadPaths: safeUploadPaths(uploads, safeWorkspaceDir),
+    uploadPaths: safeUploadPaths(uploads),
     workspaceDir: safeWorkspaceDir,
     saveToFile: input.saveToFile === true,
     newSession: input.newSession === true || !input.sessionID,
@@ -801,8 +799,8 @@ function validateVoiceInput(input) {
   return { file: real };
 }
 
-function safeUploadPaths(uploads, workspaceDir) {
-  const safe = uploads.map(file => assertUploadFileSafe(file, workspaceDir));
+function safeUploadPaths(uploads) {
+  const safe = uploads.map(file => assertUploadFileSafe(file));
   assertUniqueBasenames(safe);
   const uploadBytes = safe.reduce((sum, file) => sum + fs.statSync(file).size, 0);
   // daemon 侧重复总量校验，防止直连 bearer token 绕过 MCP wrapper 后一次塞入多份大文件。
@@ -829,10 +827,9 @@ function resolveWorkspaceDir(value) {
 }
 
 function sessionCacheDirs(workspaceDir, sessionID) {
-  // ChatGPT 相关输入/输出都归到同一个项目 cache 根：uploads、responses、downloads 分目录隔离。
+  // 本地生成内容归到项目 cache；上传源文件保持用户原路径，不在这里制造第二份长期副本。
   const root = path.join(resolveWorkspaceDir(workspaceDir), '.opencode', 'cache', 'chatgpt');
   return {
-    uploads: path.join(root, 'uploads'),
     responses: path.join(root, 'responses', sessionID),
     downloads: path.join(root, 'downloads', sessionID),
   };
@@ -1659,7 +1656,7 @@ async function submitAsk(page, fullPrompt, files, workspaceDir, mode, imageAspec
   // 点击开始先写 lost/pending 防重发标记；取得可信 conversation URL 后再把句柄升级为可恢复状态。
   // 新会话没有 expectedSessionUrl，因此允许记录首个 Project conversation；续聊必须精确匹配旧 URL。
   // URL 记录失败代表 prompt 可能已发出，只能显式失败并阻止复用，不能向上层伪装 completed。
-  const beforeState = await CHATGPT_DOM.submit(page, fullPrompt, files, workspaceDir, mode, imageAspectRatio, log, shouldCancel, baseline => {
+  const beforeState = await CHATGPT_DOM.submit(page, fullPrompt, files, mode, imageAspectRatio, log, shouldCancel, baseline => {
     // 最后一刻再次验证页面归属；等待上传期间发生重定向时，可信点击绝不能落到错误页面。
     const valid = expectedSessionUrl
       ? isSameConversationUrl(page.url(), expectedSessionUrl, project, { allowPlain: allowPlainUrl })
@@ -2158,7 +2155,7 @@ async function startDaemonProcess() {
 
 // 正常运行只暴露 daemon 入口；离线测试显式 opt-in 后才能访问无网络状态机 seam。
 module.exports = process.env.CHATGPT_TEST_HOOKS === '1'
-  ? { startDaemonProcess, testing: Object.freeze({ createDaemonRuntime, prepareBootstrapPage, restoreSessionPage, rememberCurrentSessionUrl, readSessionEntry, markSessionPending, markSessionCompleted, markSessionLost, validateVoiceInput, sendJSON, assistantTextAdvanced, runAsk, requestHash, dom: CHATGPT_DOM }) }
+  ? { startDaemonProcess, testing: Object.freeze({ createDaemonRuntime, prepareBootstrapPage, restoreSessionPage, rememberCurrentSessionUrl, readSessionEntry, markSessionPending, markSessionCompleted, markSessionLost, validateAskInput, validateVoiceInput, sendJSON, assistantTextAdvanced, runAsk, requestHash, dom: CHATGPT_DOM }) }
   : { startDaemonProcess };
 
 if (require.main === module) {
