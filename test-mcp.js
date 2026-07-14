@@ -74,6 +74,10 @@ async function main() {
     ['testStopWithoutActiveAsk', () => testStopWithoutActiveAsk(), false],
     ['testProjectIdentityPolicy', () => testProjectIdentityPolicy(), false],
     ['testCoreProjectStateMachine', () => testCoreProjectStateMachine(), false],
+    ['testProjectPinUsesSingleRecoveryChain', () => testProjectPinUsesSingleRecoveryChain(), false],
+    ['testQueuedVoiceCancelHasZeroSideEffects', () => testQueuedVoiceCancelHasZeroSideEffects(), false],
+    ['testVoiceTaskLifecycle', () => testVoiceTaskLifecycle(), false],
+    ['testVoiceDeadlineAndForeground', () => testVoiceDeadlineAndForeground(), false],
     ['testProjectDiscoveryRejectsVisibleDuplicates', () => testProjectDiscoveryRejectsVisibleDuplicates(), false],
     ['testProjectHomeDiscoveryUsesLiveSidebar', () => testProjectHomeDiscoveryUsesLiveSidebar(), false],
     ['testSubmitUsesTrustedClick', () => testSubmitUsesTrustedClick(), false],
@@ -777,6 +781,7 @@ function testCoreProjectStateMachine() {
         let submitCalls = 0;
         let extractCalls = 0;
         let artifactCalls = 0;
+        let focusCalls = 0;
         let artifactBeforeState = null;
         let submitImpl = async (_page, _prompt, _files, _mode, _ratio, _log, _cancel, beforeSend) => {
           submitCalls++;
@@ -787,7 +792,7 @@ function testCoreProjectStateMachine() {
         Object.assign(testing.dom, {
           // 所有替换都挂到 core 实际持有的 adapter 对象，runAsk 调用的仍是生产状态机而非测试副本。
           state: async () => ({ ...state, url: askPage.url() }),
-          focus: async () => {},
+          focus: async () => { focusCalls++; },
           extractAssistant: async () => { extractCalls++; return state.lastText || ''; },
           collectArtifacts: async (_page, _dir, _log, _cancel, beforeState) => { artifactCalls++; artifactBeforeState = beforeState; return { downloads: [], notices: [] }; },
           projectHomeState: async () => ({ url: askPage.url(), composer: true, title: true, titleName: 'MCP', chatActive: true, workActive: false }),
@@ -914,6 +919,15 @@ function testCoreProjectStateMachine() {
         await testing.runAsk(askRuntime, input('image snapshot'), '#image-snapshot', () => {});
         assert.deepStrictEqual(testing.readSessionEntry('#image-snapshot', project).completed.nativeImageURLs, ['https://chatgpt.com/image-old', 'https://chatgpt.com/image-new']);
 
+        await testing.rememberCurrentSessionUrl(fakePage(scoped), project, '#client-close', () => {}, 1_000, false, scoped);
+        askPage.current = scoped; state = { ...idle }; let clientClosed = false;
+        submitImpl = async (_page, _prompt, _files, _mode, _ratio, _log, _cancel, beforeSend) => { beforeSend(); state = { ...idle, userCount: 2 }; clientClosed = true; return { ...idle }; };
+        waitImpl = async () => ({ status: 'generating', reason: 'client-disconnected' });
+        const focusBeforeClose = focusCalls; const artifactsBeforeClose = artifactCalls;
+        const disconnected = await testing.runAsk(askRuntime, input('disconnect after click'), '#client-close', () => {}, () => clientClosed);
+        assert.strictEqual(disconnected.status, 'generating'); assert.ok(testing.readSessionEntry('#client-close', project).pending);
+        assert.deepStrictEqual([focusCalls, artifactCalls], [focusBeforeClose, artifactsBeforeClose], 'post-send disconnect must not regain foreground or collect artifacts');
+
         // artifact 队列等待期间切页时，collect 返回后仍要用 live page.url 再验证，不能信任早先 finalUrl。
         await testing.rememberCurrentSessionUrl(fakePage(scoped), project, '#artifact-switch', () => {}, 1_000, false, scoped);
         askPage.current = scoped;
@@ -969,6 +983,119 @@ function testCoreProjectStateMachine() {
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+}
+
+function runCoreFixture(prefix, build) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  try {
+    const child = spawnSync(process.execPath, ['-e', build(dir)], { cwd: __dirname, encoding: 'utf8', timeout: 5_000, windowsHide: true, env: { ...BASE_ENV, CHATGPT_TEST_HOOKS: '1', CHATGPT_VOICE_FILE_ROOTS: dir, CHATGPT_STATE_DIR: dir, CHATGPT_SESSION_DIR: path.join(dir, 'sessions'), ...(prefix === 'chatgpt-voice-foreground-' ? { CHATGPT_VOICE_TRANSCRIBE_TIMEOUT_MS: '700' } : {}) } });
+    assert.strictEqual(child.status, 0, child.error?.stack || child.stderr || child.stdout);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+function testProjectPinUsesSingleRecoveryChain() {
+  runCoreFixture('chatgpt-project-pin-', () => String.raw`
+      const assert = require('assert'), fs = require('fs'), path = require('path'), policy = require('./chatgpt-project'), { testing } = require('./chatgpt-core');
+      const pinned = policy.parse('g-p-pin123-mcp', 'MCP'); fs.writeFileSync(path.join(process.env.CHATGPT_STATE_DIR, 'projects.json'), JSON.stringify({ projects: { [pinned.id]: pinned, [pinned.token]: pinned, [pinned.key]: pinned } }));
+      let sidebarCalls = 0; Object.assign(testing.dom, { discoverProjects: async () => [], openProjectHome: async () => { sidebarCalls++; return null; } }); // 有效pin必须在前置sidebar等待之前交给唯一ensure。
+      (async () => {
+        const selected = await testing.resolveProject({}, 'MCP', () => {});
+        assert.strictEqual(selected.id, pinned.id); assert.strictEqual(sidebarCalls, 0, 'a valid exact-ID pin must skip the preliminary sidebar recovery');
+        const replacement = policy.parse('g-p-new456-mcp', 'MCP'); let current = pinned.url;
+        const page = { url: () => current, goto: async url => { current = url; } };
+        testing.dom.projectHomeState = async () => ({ url: current, composer: true, title: true, titleName: 'MCP', chatActive: true, workActive: false });
+        // 快进第一次无效visit的轮询；恢复sidebar开始后立即还原时钟，让新ID接受完整生产验证。
+        const realNow = Date.now; let tick = 0; Date.now = () => realNow() + ++tick * 16_000;
+        testing.dom.openProjectHome = async () => { sidebarCalls++; Date.now = realNow; current = replacement.url; return replacement.url; };
+        const recovered = await testing.ensureProjectHome(page, pinned, () => {});
+        assert.strictEqual(recovered.id, replacement.id); assert.strictEqual(sidebarCalls, 1, 'a stale pin must use the existing sidebar recovery only once');
+        const cache = JSON.parse(fs.readFileSync(path.join(process.env.CHATGPT_STATE_DIR, 'projects.json'))).projects;
+        assert.strictEqual(cache[pinned.id], undefined, 'stale exact-ID aliases must not survive recovery'); assert.strictEqual(cache[pinned.token], undefined, 'stale token aliases must not survive recovery');
+        testing.dom.discoverProjects = async () => [pinned, replacement].map(item => ({ href: item.url, name: 'MCP' }));
+        await assert.rejects(() => testing.resolveProject({}, 'MCP', () => {}), /Multiple ChatGPT projects are named/);
+      })().catch(error => { console.error(error.stack || error); process.exit(1); });
+    `);
+}
+
+function testQueuedVoiceCancelHasZeroSideEffects() {
+  runCoreFixture('chatgpt-queued-voice-', dir => {
+    const voice = path.join(dir, 'queued.wav');
+    writeTinyWav(voice);
+    return String.raw`
+      const assert = require('assert'), fs = require('fs'), policy = require('./chatgpt-project'), { testing } = require('./chatgpt-core');
+      let healthCalls = 0; const page = { url: () => 'https://chatgpt.com/', isClosed: () => false, evaluate: async () => { healthCalls++; return 200; }, close: async () => {} };
+      const runtime = testing.createDaemonRuntime({ browser: { isConnected: () => true, newPage: async () => { throw new Error('cancelled queued voice allocated a page'); } }, bootstrapPage: page, project: policy.parse('g-p-voice123-mcp', 'MCP') });
+      testing.dom.transcribeAudioFile = async () => 'third voice'; let release;
+      const first = runtime.withVoice(() => new Promise(resolve => { release = resolve; })); let closed = false;
+      (async () => {
+        await new Promise(resolve => setImmediate(resolve));
+        const second = testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, () => closed);
+        closed = true; fs.unlinkSync(${JSON.stringify(voice)}); release(); await first;
+        await assert.rejects(second, error => error.code === 'VOICE_CANCELLED'); assert.strictEqual(healthCalls, 0, 'cancelled queued voice must not validate a page');
+        // 前一项取消不能毒化voice queue；下一条合法录音必须正常进入同一生产入口。
+        fs.writeFileSync(${JSON.stringify(voice)}, Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WAVE'), Buffer.alloc(32)]));
+        assert.deepStrictEqual(await testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, () => false), { ok: true, text: 'third voice' });
+      })().catch(error => { console.error(error.stack || error); process.exit(1); });
+    `;
+  });
+}
+
+function testVoiceTaskLifecycle() {
+  runCoreFixture('chatgpt-voice-lifecycle-', dir => {
+    const voice = path.join(dir, 'voice.wav'); writeTinyWav(voice);
+    return String.raw`
+      const assert = require('assert'), policy = require('./chatgpt-project'), { testing } = require('./chatgpt-core');
+      const session = { id: 'session', url: () => 'https://chatgpt.com/c/idle', isClosed: () => false, close: async () => {} }, dedicated = { id: 'dedicated', url: () => 'https://chatgpt.com/', isClosed: () => false, evaluate: async () => 200, close: async () => {} };
+      let newPages = 0; const runtime = testing.createDaemonRuntime({ browser: { isConnected: () => true, newPage: async () => { newPages++; return dedicated; } }, bootstrapPage: session, project: policy.parse('g-p-life123-mcp', 'MCP') });
+      (async () => {
+        await runtime.pageFor('#idle'); const calls = []; let endpointFails = false;
+        testing.dom.transcribeAudioFile = async (page, _file, _url, _log, _cancel, _fallback, options) => {
+          calls.push([page.id, options?.mode]);
+          if (options?.mode === 'direct' && endpointFails) throw Object.assign(new Error('endpoint changed'), { code: 'VOICE_ENDPOINT' });
+          return options?.mode === 'fallback' ? 'fallback text' : 'direct text';
+        };
+        assert.strictEqual((await testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, () => false)).text, 'direct text');
+        assert.deepStrictEqual(calls, [['session', 'direct']]); assert.strictEqual(newPages, 0, 'idle session direct must not create a voice tab');
+        endpointFails = true;
+        assert.strictEqual((await testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, () => false)).text, 'fallback text');
+        assert.deepStrictEqual(calls.slice(-2), [['session', 'direct'], ['dedicated', 'fallback']]);
+        // direct失败后的UI fallback只能进入专用页，session composer仍可立即接受后续ask锁。
+        assert.strictEqual(await runtime.withSession('#idle', async () => 'released'), 'released');
+      })().catch(error => { console.error(error.stack || error); process.exit(1); });
+    `;
+  });
+}
+
+function testVoiceDeadlineAndForeground() {
+  runCoreFixture('chatgpt-voice-foreground-', dir => {
+    const voice = path.join(dir, 'voice.wav'); writeTinyWav(voice);
+    return String.raw`
+      const assert = require('assert'); const policy = require('./chatgpt-project'); const { testing } = require('./chatgpt-core');
+      let closed = false, closeCalls = 0, rejectFallback, fallbackStarted = false;
+      const page = { url: () => 'https://chatgpt.com/', isClosed: () => false, evaluate: async () => 200, close: async () => { closeCalls++; rejectFallback?.(new Error('target closed')); } };
+      const runtime = testing.createDaemonRuntime({ browser: { isConnected: () => true, newPage: async () => page }, bootstrapPage: page, project: policy.parse('g-p-fg123-mcp', 'MCP') });
+      testing.dom.transcribeAudioFile = async (_page, _file, _url, _log, _cancel, _start, options) => { if (options.mode === 'direct') throw Object.assign(new Error('endpoint'), { code: 'VOICE_ENDPOINT' }); fallbackStarted = true; return new Promise((_, reject) => { rejectFallback = reject; }); };
+      (async () => {
+        const task = testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, () => closed);
+        while (!fallbackStarted) await new Promise(resolve => setImmediate(resolve));
+        closed = true;
+        const bounded = Promise.race([task, new Promise((_, reject) => setTimeout(() => reject(new Error('fallback cancellation stayed pending')), 1_500))]);
+        await assert.rejects(bounded, error => error.code === 'VOICE_CANCELLED');
+        assert.strictEqual(closeCalls, 1, 'active fallback cancellation must close its dedicated page');
+        let release, lateCalls = 0, cancelled = false;
+        const first = runtime.withForeground(() => new Promise(resolve => { release = resolve; }), { assertUsable() {} });
+        const late = runtime.withForeground(() => { lateCalls++; }, { assertUsable() { if (cancelled) throw Object.assign(new Error('cancelled'), { code: 'VOICE_CANCELLED' }); } });
+        while (!first.hasStarted()) await new Promise(resolve => setImmediate(resolve));
+        cancelled = true; release(); await first.internal; await assert.rejects(late.internal, /cancelled/);
+        assert.strictEqual(lateCalls, 0, 'a cancelled queued foreground entry must remain inert');
+        testing.dom.waitForResponse = async (_page, _before, options) => { assert.strictEqual(options.shouldSkipForeground(), true); return { status: 'generating', reason: 'client-disconnected' }; };
+        assert.strictEqual((await runtime.waitForResponse(page, {}, { shouldCancel: () => true }, () => {})).reason, 'client-disconnected');
+        let killed = 0; await testing.closeOwnedBrowser({ close: () => new Promise(() => {}), process: () => ({ kill() { killed++; } }) }, 10); assert.strictEqual(killed, 1);
+        const stalled = testing.createDaemonRuntime({ browser: { isConnected: () => true, newPage: () => new Promise(() => {}) }, bootstrapPage: null, project: policy.parse('g-p-stall123-mcp', 'MCP') });
+        await assert.rejects(Promise.race([testing.runVoiceRequest(stalled, { file: ${JSON.stringify(voice)} }, () => {}, () => false), new Promise((_, reject) => setTimeout(() => reject(new Error('page preparation stayed pending')), 3_000))]), error => error.code === 'VOICE_RUNTIME_FATAL');
+      })().catch(error => { console.error(error.stack || error); process.exit(1); });
+    `;
+  });
 }
 
 async function testTableCitationExtraction() {
@@ -1792,7 +1919,7 @@ async function testDirectVoiceTranscribeSkipsComposerWait() {
       evaluate: async (_fn, config) => {
         calls.evaluate++;
         // direct upload 的唯一 page.evaluate 输入应包含音频 bytes 配置；其它 evaluate 代表意外触碰 DOM fallback。
-        if (config?.audioBase64) return { text: 'direct transcript', elapsedMs: 7 };
+        if (config?.audioBase64) return { ok: true, text: 'direct transcript', elapsedMs: 7 };
         throw new Error('unexpected page.evaluate before direct upload');
       },
     };

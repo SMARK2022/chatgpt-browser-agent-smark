@@ -242,19 +242,48 @@ function withTimeout(promise, timeout, message) {
   ]).finally(() => clearTimeout(timer));
 }
 
+async function closeOwnedBrowser(browser, grace = 5_000) {
+  const child = browser.process?.(); // close可能挂住，必须在调用前保留唯一可安全kill的自有句柄。
+  try { await withTimeout(browser.close(), grace, 'Browser close timed out'); }
+  // 只使用launch返回的process handle；connect/spawn浏览器永远不会进入此helper。
+  catch { try { child?.kill(); } catch {} }
+}
+
 // voice 转写的客户端断开检测:轮询 shouldCancel,断开时 reject 让 Promise.race 中止转写。
 // 必须通过返回的 .stop() 在 finally 中清除定时器,否则成功路径会永久轮询泄漏。
 function cancelSignal(shouldCancel, pollMs) {
   let timer;
   const promise = new Promise((_, reject) => {
     const check = () => {
-      if (shouldCancel()) reject(new Error('Voice transcription cancelled: client disconnected'));
+      if (shouldCancel()) reject(Object.assign(new Error('Voice transcription cancelled: client disconnected'), { code: 'VOICE_CANCELLED' }));
       else timer = setTimeout(check, pollMs);
     };
     timer = setTimeout(check, pollMs);
   });
   promise.stop = () => clearTimeout(timer);
   return promise;
+}
+
+function makeRequestContext({ deadline, isClientClosed = () => false, runtime, pollMs = 500 }) {
+  let timer, notify, stopped = false; // 每个HTTP请求独占timer，禁止voice期限泄漏到ask。
+  const currentError = () => {
+    if (runtime?.fatalError) return runtime.fatalError; // fatal优先，不能被普通client-close降级为可继续状态。
+    if (isClientClosed()) return Object.assign(new Error('Voice transcription cancelled: client disconnected'), { code: 'VOICE_CANCELLED' }); // 保留用户取消语义。
+    if (Date.now() >= deadline) return Object.assign(new Error('Voice transcription timed out'), { code: 'VOICE_TIMEOUT' }); // absolute deadline从入队前起算。
+    return null;
+  };
+  // notification只resolve，排队期间尚未建立race也不会产生unhandled rejection。
+  const cancelled = new Promise(resolve => { notify = resolve; }); // 只resolve，尚未建立race时也不会产生未处理拒绝。
+  const check = () => {
+    const error = currentError();
+    if (error) notify(error); else if (!stopped) timer = setTimeout(check, pollMs);
+  };
+  timer = setTimeout(check, pollMs);
+  return {
+    cancelled, shouldCancel: Object.assign(() => !!currentError(), { remaining: () => Math.max(1, deadline - Date.now()) }), // gate与timeout共享同一时钟事实。
+    assertUsable() { const error = currentError(); if (error) throw error; },
+    stop() { stopped = true; clearTimeout(timer); },
+  };
 }
 
 function tcpConnect(host, port) {
@@ -607,6 +636,15 @@ function cacheProject(project) {
   });
 }
 
+function removeCachedProject(project) {
+  withJSONFileLock(PROJECTS_FILE, () => {
+    const cache = readProjectCache(); // 必须读取锁内最新值，不能基于锁外快照删除alias。
+    // 锁内按当前值比较ID，不能删除另一个daemon刚更新到同名alias的新Project。
+    for (const [key, value] of Object.entries(cache.projects)) if ((value?.id || projectIdFromUrl(value?.url)) === project.id) delete cache.projects[key]; // 只删除仍指向旧ID的项。
+    writeJSON(PROJECTS_FILE, cache);
+  });
+}
+
 // ─── Session Registry and Project Cache ──────────────────────────────────────
 
 function readSessionIndex() {
@@ -939,7 +977,7 @@ function previewResponse(text) {
 // ─── Project Resolution ──────────────────────────────────────────────────────
 
 function resolveCachedProject(requested) {
-  // 缓存不是身份真相：live discovery 失败后才读它，随后仍由 ensureProjectHome 验证并自修复。
+  // 缓存只提供免等sidebar的候选；启动层仍用唯一ensure验证身份并负责自修复。
   const value = String(requested || DEFAULT_PROJECT).trim();
   const direct = parseProjectRef(value);
   if (direct) return direct;
@@ -976,6 +1014,10 @@ async function resolveProject(page, requested, log) {
     return selected;
   }
 
+  // exact-ID pin比启发式sidebar稳定；先交给ensure验证，失效时仍走同一条live恢复链。
+  const cached = resolveCachedProject(value); // pin只是候选，身份仍由启动层唯一ensure确认。
+  if (cached) return cached;
+
   // localStorage/schema 漂移时，用可见侧边栏按项目名打开首页并读取实际 URL，不要求用户复制新链接。
   const openedURL = await CHATGPT_DOM.openProjectHome(page, value, log).catch(err => {
     if (err.code === 'PROJECT_AMBIGUOUS') throw err;
@@ -988,9 +1030,6 @@ async function resolveProject(page, requested, log) {
     return opened;
   }
 
-  // 页面发现不可用时才使用本地缓存；后续 ensureProjectHome 仍会验证并尝试侧边栏自修复。
-  const cached = resolveCachedProject(value);
-  if (cached) return cached;
   throw new Error(`Could not find ChatGPT project "${value}". Set CHATGPT_PROJECT to a project name or URL.`);
 }
 
@@ -1026,6 +1065,7 @@ async function ensureProjectHome(page, project, log) {
   }
 
   // 缓存 URL/ID 失效时不把恢复责任推给用户：从当前账号侧边栏重新打开同名 Project。
+  removeCachedProject(project);
   log(`Project page validation failed for ${project.name}; rediscovering from live sidebar`);
   const openedURL = project.titleName ? await CHATGPT_DOM.openProjectHome(page, project.titleName, log).catch(err => {
     if (err.code === 'PROJECT_AMBIGUOUS') throw err;
@@ -1112,7 +1152,7 @@ function requireCurrentConversation(page, expectedSessionUrl, project, allowPlai
  * completed 才收集 sandbox/native-image 产物；generating 只保存文本快照。这个分界很重要：
  * 如果在远端工具调用未结束时强行点下载按钮，容易把半成品或旧文件误当成本次结果。
  */
-async function persistAssistantResult({ page, project, workspaceDir, sessionID, raw, status, saveToFile, promptSent, requestHash, allowPlainUrl, expectedSessionUrl = null, notice, saveLabel, finalUrl, forceSave, forcePreview, shouldCancel = () => false, beforeState = null, log }) {
+async function persistAssistantResult({ page, project, workspaceDir, sessionID, raw, status, saveToFile, promptSent, requestHash, allowPlainUrl, expectedSessionUrl = null, notice, saveLabel, finalUrl, forceSave, forcePreview, shouldCancel = () => false, beforeState = null, runForeground = task => task(), log }) {
   // 持久化顺序不可交换：先验证 conversation，再创建 cache、抽取 artifact，最后更新 pending/completed。
   // 这样用户在回答等待期间手动切页时，不会把另一会话的文本、引用或文件写入当前 #sessionID。
   // completed 与 generating 共用同一 URL 边界；“回答已完成”不能绕过身份检查。
@@ -1130,7 +1170,7 @@ async function persistAssistantResult({ page, project, workspaceDir, sessionID, 
   const artifactSkipped = status === 'completed' && shouldCancel();
   // 已完成但调用方断连时不清 pending：下次 recovery 还应有机会收集 sandbox/native-image 产物。
   const artifactResult = status === 'completed' && !artifactSkipped
-    ? await CHATGPT_DOM.collectArtifacts(page, dirs.downloads, log, () => shouldCancel() || pageChanged(), beforeState).catch(err => ({ downloads: [], notices: [`Artifact collection failed: ${err.message}`] }))
+    ? await runForeground(() => CHATGPT_DOM.collectArtifacts(page, dirs.downloads, log, () => shouldCancel() || pageChanged(), beforeState)).catch(err => ({ downloads: [], notices: [`Artifact collection failed: ${err.message}`] }))
     : { downloads: [], notices: shouldCancel() ? ['Artifact collection skipped because caller disconnected.'] : [] };
   finalUrl = requireCurrentConversation(page, expectedSessionUrl, project, allowPlainUrl, sessionID, 'artifact collection', promptSent);
   const completedNativeImageURLs = status === 'completed'
@@ -1191,10 +1231,10 @@ async function persistAssistantResult({ page, project, workspaceDir, sessionID, 
  * 这个函数是 pending suppression 的执行点：它只读取当前 DOM，保存可见文本和产物，
  * 明确返回 `promptSent:false`。调用方传进来的新 prompt 在这里不会进入 ChatGPT 页面。
  */
-async function recoverCurrentAssistant(page, workspaceDir, sessionID, project, session, reason, log) {
+async function recoverCurrentAssistant(page, workspaceDir, sessionID, project, session, reason, log, runForeground) {
   const allowPlainUrl = !projectIdFromUrl(session.url);
   requireCurrentConversation(page, session.url, project, allowPlainUrl, sessionID, 'pending recovery', false);
-  await CHATGPT_DOM.focus(page);
+  await runForeground(() => CHATGPT_DOM.focus(page));
   requireCurrentConversation(page, session.url, project, allowPlainUrl, sessionID, 'pending recovery focus', false);
   const state = await CHATGPT_DOM.state(page);
   const baseline = session?.pending?.beforeState;
@@ -1234,6 +1274,7 @@ async function recoverCurrentAssistant(page, workspaceDir, sessionID, project, s
       ...(session?.pending?.beforeState || {}),
       nativeImageURLs: Array.isArray(session?.pending?.nativeImageURLs) ? session.pending.nativeImageURLs : [],
     },
+    runForeground,
     log,
     saveLabel: status === 'generating'
       ? 'Current partial assistant response saved locally before returning to OpenCode'
@@ -1272,6 +1313,8 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
   let conversationCreateQueue = Promise.resolve();
   let pageCreateQueue = Promise.resolve();
   let voiceLock = Promise.resolve();
+  let foregroundQueue = Promise.resolve(); // 所有可抢前台动作共享一条非重入队列。
+  let fatalError = null; // 一旦无法隔离页面任务，后续请求必须一致失败。
   let sparePage = bootstrapPage;
   // voice 转写页持久化复用，但一旦认领就从 spare pool 移除，永远不会再交给 ask。
   let persistentVoicePage = null;
@@ -1279,6 +1322,27 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
 
   // pending 会话仍可能承载远端生成 DOM；registry 防重发，tab 保留则服务后续 artifact/text recovery。
   const pageCanBeClosed = id => !sessionLocks.has(id) && !isPendingFresh(readSessionIndex().sessions[id]?.pending);
+
+  function borrowVoicePage() {
+    for (const [sessionID, page] of sessionPages) { // 只借runtime管理页，绝不扫描用户自己的标签页。
+      if (!pageCanBeClosed(sessionID) || page.isClosed() || !isOfficialChatGPTURL(page.url())) continue;
+      let unlock, released = false;
+      const hold = new Promise(resolve => { unlock = resolve; }); // reservation复用session lock，ask自然排在direct之后。
+      const stored = hold.finally(() => { if (sessionLocks.get(sessionID) === stored) sessionLocks.delete(sessionID); }); // compare-delete保护后继锁。
+      // 选择与reservation同一同步段完成，ask不能在二者之间抢到composer。
+      sessionLocks.set(sessionID, stored);
+      const release = () => { if (!released) { released = true; unlock(); } }; // release幂等，错误分支不会重复推进队列。
+      return {
+        page, release,
+        async discard() {
+          if (sessionPages.get(sessionID) === page) sessionPages.delete(sessionID); // 仅退役仍绑定此引用的坏页。
+          await withTimeout(page.close(), 3_000, 'close borrowed voice page').catch(() => {});
+          release();
+        },
+      };
+    }
+    return null;
+  }
 
   function assertBrowserConnected() {
     // browser 是 daemon 的核心资源；用户手动关掉窗口后继续复用 page handle 只会得到 Puppeteer 协议错误。
@@ -1332,6 +1396,11 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
 
   return {
     get project() { return currentProject; },
+    get fatalError() { return fatalError; },
+    fail(error) {
+      fatalError ||= Object.assign(new Error(`Browser runtime could not isolate a cancelled task: ${error.message}`), { code: 'VOICE_RUNTIME_FATAL' }); // sticky fatal阻止新远端副作用。
+      return fatalError;
+    },
     updateProject(next) {
       // 仅后续 runAsk 会读取新对象，已经捕获旧对象的 finish/recovery 不会跨 Project 落盘。
       currentProject = Object.freeze({ ...next });
@@ -1417,6 +1486,7 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
       }
       throw lastError || new Error('Could not allocate a healthy ChatGPT voice page');
     },
+    borrowVoicePage,
     withSession(sessionID, task) {
       // 同一会话串行；不同会话可以并发。这个 seam 是 daemon 并发语义的唯一入口。
       const previous = sessionLocks.get(sessionID) || Promise.resolve();
@@ -1435,6 +1505,14 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
       voiceLock = run.catch(() => {});
       return run;
     },
+    withForeground(task, context) {
+      let started = false;
+      const internal = foregroundQueue.then(() => { context.assertUsable(); started = true; return task(); }); // started只在最终gate之后翻转。
+      // tail吞掉前项失败只为推进队列；caller仍观察原始internal结果。
+      internal.catch(() => {});
+      foregroundQueue = internal.catch(() => {}); // 前项失败不能永久毒化后续foreground动作。
+      return { internal, hasStarted: () => started };
+    },
     async withNewConversationLock(task) {
       // 只串行“打开 Project composer -> 提交 -> 记录 /c/... URL”的创建窗口；回答等待阶段仍可并发。
       let release;
@@ -1448,7 +1526,7 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
       // 不同 sessionID 已经绑定不同 tab；并发不再主动 detach，避免两个 ask 同跑时其中一个只拿到 partial。
       // 后台 tab 偶尔不刷新 DOM，DOM 层会按低频节奏 bringToFront，真正超时仍由 pending/recovery 兜底。
       // foregroundPulse 8s:降低 macOS 前台干扰频率;!state.generating 在生成期防护,pulse 只影响 DOM 刷新频率。
-      return CHATGPT_DOM.waitForResponse(page, beforeState, { ...waitOptions, foregroundPulseMs: 8_000, shouldSkipForeground: () => flags.voiceFallbackActive }, log);
+      return CHATGPT_DOM.waitForResponse(page, beforeState, { ...waitOptions, foregroundPulseMs: 8_000, shouldSkipForeground: () => flags.voiceFallbackActive || !!waitOptions.shouldCancel?.(), runForeground: task => this.withForeground(() => flags.voiceFallbackActive || waitOptions.shouldCancel?.() ? undefined : task(), { assertUsable() { if (fatalError) throw fatalError; } }).internal }, log);
     },
     // 返回 daemon 当前管理的所有页面引用（bootstrapPage + sessionPages + voicePage），
     // 供 stale page cleanup 判断哪些页面不该被关闭。
@@ -1458,11 +1536,11 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
     // 转写失败后立即撤销 voice 所有权并关闭页面；下次调用只会认领/创建另一个干净页面。
     // 健康检查无法检测所有退化模式（如健康检查通过后转写期间才发生的退化），
     // 此方法作为兜底：失败后不再复用该页面，下次 voicePage() 会创建新页面。
-    invalidateVoicePage(page) {
+    async invalidateVoicePage(page) {
       if (page === persistentVoicePage) {
-        persistentVoicePage = null;
+        persistentVoicePage = null; // close前先撤销所有权，下一请求不能再次取得正在退役的页。
         voicePageCreatedAt = 0;
-        withTimeout(page.close(), 3_000, 'close failed voice page').catch(() => {});
+        await withTimeout(page.close(), 3_000, 'close failed voice page').catch(() => {});
       } else if (page === sparePage) {
         sparePage = null;
       }
@@ -1477,32 +1555,84 @@ function createDaemonRuntime({ browser, bootstrapPage, project }) {
 // ─── Voice Flow ──────────────────────────────────────────────────────────────
 
 async function runVoiceTranscribe(runtime, input, log, shouldCancel = () => false) {
-  const page = await runtime.voicePage();
   log(`voice: transcribing ${path.basename(input.file)} bytes=${fs.statSync(input.file).size}`);
-  // 传 CHATGPT_URL 而非 project.url:fallback 只需 chatgpt.com 同源页,不需要导航到项目页(避免干扰 ask)。
-  // onFallbackStart:direct path 失败进入 fallback 前通知 caller,让 ask 的 foregroundPulse 跳过。
-  const transcribePromise = CHATGPT_DOM.transcribeAudioFile(page, input.file, CHATGPT_URL, log, shouldCancel, () => runtime.beginVoiceFallback());
-  // cancelSignal 轮询客户端断开;与 withTimeout 竞速,先到者决定结果。
   const cancel = cancelSignal(shouldCancel, 500);
+  const voicePage = async () => {
+    const pending = runtime.voicePage();
+    try { return await Promise.race([pending, cancel]); }
+    catch (error) { if (!shouldCancel()) { cancel.stop(); throw error; } try { await runtime.invalidateVoicePage(await withTimeout(pending, 1_000, 'voice page preparation did not settle')); } catch (cleanupError) { cancel.stop(); throw runtime.fail(cleanupError); } cancel.stop(); throw error; }
+  };
+  let lease = runtime.borrowVoicePage(), page = lease?.page || await voicePage(); // idle ask页优先只走direct。
+  if (shouldCancel()) { if (lease) lease.release(); else await runtime.invalidateVoicePage(page); throw Object.assign(new Error('Voice transcription cancelled during page preparation'), { code: 'VOICE_CANCELLED' }); }
+  const requestID = crypto.randomBytes(8).toString('hex'); // compare-and-delete和abort都绑定本次页面任务。
+  const direct = CHATGPT_DOM.transcribeAudioFile(page, input.file, CHATGPT_URL, log, shouldCancel, () => {}, { mode: 'direct', requestID });
+  // cancelSignal 轮询客户端断开;与 direct/fallback/page preparation 共用同一个取消事实。
+  let operation = direct;
   try {
-    const text = await Promise.race([
-      withTimeout(transcribePromise, VOICE_TRANSCRIBE_TIMEOUT_MS,
+    let text;
+    try {
+      text = await Promise.race([
+        withTimeout(direct, shouldCancel.remaining?.() || VOICE_TRANSCRIBE_TIMEOUT_MS, // queue/page准备已消耗的时间不能重新补满。
         `Voice transcription timed out after ${VOICE_TRANSCRIBE_TIMEOUT_MS}ms`),
-      cancel,
-    ]);
+        cancel,
+      ]);
+    } catch (err) {
+      if (err.code === 'VOICE_CANCELLED') throw err; if (shouldCancel()) throw Object.assign(new Error('Voice transcription timed out before retry'), { code: 'VOICE_TIMEOUT' });
+      if (lease) {
+        // endpoint错误不污染ask页；page/transport错误才需要丢弃这个runtime页。
+        if (err.code === 'VOICE_ENDPOINT') lease.release(); // endpoint漂移不代表借来的session页已损坏。
+        else await lease.discard();
+        lease = null;
+        page = await voicePage();
+      } else if (err.code !== 'VOICE_ENDPOINT') {
+        await runtime.invalidateVoicePage(page);
+        page = await voicePage();
+      }
+      if (shouldCancel()) throw Object.assign(new Error('Voice transcription timed out before fallback'), { code: 'VOICE_TIMEOUT' }); runtime.beginVoiceFallback();
+      const foreground = runtime.withForeground(
+        () => CHATGPT_DOM.transcribeAudioFile(page, input.file, CHATGPT_URL, log, shouldCancel, () => {}, { mode: 'fallback', requestID }),
+        { assertUsable() { if (shouldCancel()) throw Object.assign(new Error('Voice transcription cancelled before fallback'), { code: 'VOICE_CANCELLED' }); } },
+      );
+      operation = foreground.internal; // cleanup必须观察真实DOM任务，而不是外层caller race。
+      text = await Promise.race([operation, cancel]);
+    }
+    lease?.release();
     return { ok: true, text };
   } catch (err) {
     // timeout/abort/cancelled/target closed 都需要关闭坏页面,释放 voiceLock。
     // transcribePromise.catch 防止 page.close() 导致的 pending evaluate 产生 unhandled rejection。
     if (/Voice transcription cancelled|timed out|timeout|abort|target closed|protocol error/i.test(err.message)) {
-      transcribePromise.catch(() => {});
-      runtime.invalidateVoicePage(page);
+      operation.catch(() => {});
+      let aborted = false;
+      if (operation === direct && err.code === 'VOICE_CANCELLED') {
+        try { await withTimeout(CHATGPT_DOM.cancelDirectVoice(page, requestID), 500, 'abort direct voice'); await withTimeout(direct.catch(() => {}), 500, 'settle direct voice'); aborted = true; } catch {} // abort自身也必须有界。
+      }
+      if (lease) aborted ? lease.release() : await lease.discard();
+      else if (!aborted) await runtime.invalidateVoicePage(page);
+      // close后仍不settle的页面任务不得释放voice lock继续污染daemon。
+      try { await withTimeout(operation.catch(() => {}), 1_000, 'cancelled voice task did not settle'); } // settle或隔离前voice lock不能结束。
+      catch (cleanupError) { throw runtime.fail(cleanupError); }
     }
     throw err;
   } finally {
     // 无论成功/超时/取消,都清除 cancelSignal 定时器并恢复 ask 的 foregroundPulse。
     cancel.stop();
     runtime.endVoiceFallback();
+  }
+}
+
+async function runVoiceRequest(runtime, input, log, isClientClosed) {
+  const context = makeRequestContext({ deadline: Date.now() + VOICE_TRANSCRIBE_TIMEOUT_MS, isClientClosed, runtime }); // deadline包含排队时间。
+  try {
+    let started = false; const operation = runtime.withVoice(async () => {
+      // 取消或排队超时必须先于realpath/stat/read，避免TUI已删除WAV后旧任务仍访问磁盘。
+      context.assertUsable(); started = true; const parsed = validateVoiceInput(input); context.assertUsable();
+      return runVoiceTranscribe(runtime, parsed, log, context.shouldCancel);
+    });
+    operation.catch(error => runtime.onFatal?.(error)); // caller先取消后，迟到fatal仍必须触发daemon退出。
+    return await Promise.race([operation, context.cancelled.then(error => { if (started) return operation; throw error; })]);
+  } finally {
+    context.stop();
   }
 }
 
@@ -1521,6 +1651,7 @@ async function runAsk(runtime, input, sessionID, log, shouldCancel = () => false
   // 本函数只持有本轮 Project 快照；runtime 后续更新不应改变 finishAsk 的验证与落盘参数。
   // 所有可能发送的路径都经过 submitAsk，避免某个 mode/upload 分支漏掉发送前身份复核。
   const page = await runtime.pageFor(sessionID);
+  const runForeground = task => runtime.withForeground(task, { assertUsable() { if (runtime.fatalError) throw runtime.fatalError; if (shouldCancel()) throw new Error('Ask cancelled before foreground action'); } }).internal; // send后路径只调用允许的动作。
   const files = normalizePathList(input.uploadPaths || input.uploadPath);
   const workspaceDir = input.workspaceDir || process.cwd();
   const hash = requestHash(input.fullPrompt, files, input.mode, input.imageAspectRatio);
@@ -1539,9 +1670,9 @@ async function runAsk(runtime, input, sessionID, log, shouldCancel = () => false
 
   if (!session) {
     const submission = await runtime.withNewConversationLock(async () => {
-      project = await restoreSessionPage(page, project, null, sessionID, log);
+      project = await runForeground(() => restoreSessionPage(page, project, null, sessionID, log)); // 运行期Project DOM不得穿插voice fallback。
       runtime.updateProject(project);
-      return submitAsk(page, input.fullPrompt, files, workspaceDir, input.mode, input.imageAspectRatio, sessionID, project, false, null, log, shouldCancel);
+      return submitAsk(page, input.fullPrompt, files, workspaceDir, input.mode, input.imageAspectRatio, sessionID, project, false, null, log, shouldCancel, runtime);
     });
     log('Prompt sent, waiting for response...');
     return finishAsk({
@@ -1558,6 +1689,7 @@ async function runAsk(runtime, input, sessionID, log, shouldCancel = () => false
       slow: files.length > 0 || input.fullPrompt.length > 2_000,
       shouldCancel,
       log,
+      runForeground,
     });
   }
 
@@ -1579,7 +1711,7 @@ async function runAsk(runtime, input, sessionID, log, shouldCancel = () => false
     const freshPending = session?.pending && isPendingFresh(session.pending);
     if (freshPending || (session?.pending && (currentState.generating || unansweredUserMessage || currentState.lastText)) || (session && (currentState.generating || unansweredUserMessage))) {
       // 已有未完成状态时，本次输入被当作“恢复请求”，不会写入 ChatGPT 页面。
-      return recoverCurrentAssistant(page, workspaceDir, sessionID, project, session, recoveryReason(sessionID, currentState, unansweredUserMessage, session), log);
+      return recoverCurrentAssistant(page, workspaceDir, sessionID, project, session, recoveryReason(sessionID, currentState, unansweredUserMessage, session), log, runForeground);
     }
     if (session?.pending) {
       log(`Clearing stale pending marker for ${sessionID}; no recoverable DOM state is visible`);
@@ -1593,7 +1725,7 @@ async function runAsk(runtime, input, sessionID, log, shouldCancel = () => false
     }
 
     const allowPlainUrl = !projectIdFromUrl(session.url);
-    const submission = await submitAsk(page, input.fullPrompt, files, workspaceDir, input.mode, input.imageAspectRatio, sessionID, project, allowPlainUrl, session.url, log, shouldCancel);
+    const submission = await submitAsk(page, input.fullPrompt, files, workspaceDir, input.mode, input.imageAspectRatio, sessionID, project, allowPlainUrl, session.url, log, shouldCancel, runtime);
     log('Prompt sent, waiting for response...');
 
     return finishAsk({
@@ -1611,6 +1743,7 @@ async function runAsk(runtime, input, sessionID, log, shouldCancel = () => false
       slow: files.length > 0 || input.fullPrompt.length > 2_000,
       shouldCancel,
       log,
+      runForeground,
     });
   };
 
@@ -1651,19 +1784,19 @@ function recoveryReason(sessionID, state, unansweredUserMessage, session) {
   return `session ${sessionID} is not ready for a new prompt`;
 }
 
-async function submitAsk(page, fullPrompt, files, workspaceDir, mode, imageAspectRatio, sessionID, project, allowPlainUrl, expectedSessionUrl, log, shouldCancel) {
+async function submitAsk(page, fullPrompt, files, workspaceDir, mode, imageAspectRatio, sessionID, project, allowPlainUrl, expectedSessionUrl, log, shouldCancel, runtime) {
   // beforeSend 是远端副作用的最后门：它在可信点击前同步验证当前页，失败时不会触发 click。
   // 点击开始先写 lost/pending 防重发标记；取得可信 conversation URL 后再把句柄升级为可恢复状态。
   // 新会话没有 expectedSessionUrl，因此允许记录首个 Project conversation；续聊必须精确匹配旧 URL。
   // URL 记录失败代表 prompt 可能已发出，只能显式失败并阻止复用，不能向上层伪装 completed。
-  const beforeState = await CHATGPT_DOM.submit(page, fullPrompt, files, mode, imageAspectRatio, log, shouldCancel, baseline => {
+  const beforeState = await runtime.withForeground(() => CHATGPT_DOM.submit(page, fullPrompt, files, mode, imageAspectRatio, log, shouldCancel, baseline => { // 整个composer事务持有同一foreground lease。
     // 最后一刻再次验证页面归属；等待上传期间发生重定向时，可信点击绝不能落到错误页面。
     const valid = expectedSessionUrl
       ? isSameConversationUrl(page.url(), expectedSessionUrl, project, { allowPlain: allowPlainUrl })
       : isProjectHomeUrlForProject(page.url(), project);
     if (!valid) throw new Error(`ChatGPT page left the expected ${expectedSessionUrl ? 'conversation' : 'Project home'} before send; no prompt was sent.`);
     markSessionLost(sessionID, project, 'Prompt send click started but no conversation URL has been recorded yet.', { beforeState: baseline });
-  });
+  }), { assertUsable() { if (runtime.fatalError) throw runtime.fatalError; if (shouldCancel()) throw new Error('Ask cancelled before foreground submit'); } }).internal;
   // 先记住 /c/...，再进入长等待；等待超时也能通过 registry 找回远端会话。
   const recorded = await rememberCurrentSessionUrl(page, project, sessionID, log, 20_000, allowPlainUrl, expectedSessionUrl);
   if (!recorded) {
@@ -1680,7 +1813,7 @@ function assistantTextAdvanced(state, before) {
   return !!state?.lastText && (state.count > before.count || state.lastText !== before.lastText);
 }
 
-async function finishAsk({ page, runtime, project, beforeState, expectedSessionUrl, sessionID, workspaceDir, saveToFile, requestHash, allowPlainUrl, slow, shouldCancel, log }) {
+async function finishAsk({ page, runtime, project, beforeState, expectedSessionUrl, sessionID, workspaceDir, saveToFile, requestHash, allowPlainUrl, slow, shouldCancel, runForeground, log }) {
   // 回答等待前已经固定 expectedSessionUrl；等待异常、正常完成和 artifact 收集都必须沿用同一身份。
   // 页面离开原 conversation 时不读取 lastText，因为那可能是用户刚打开的另一条历史回答。
   // wait failure 只在 URL 仍正确时保存 partial；身份错误优先级高于“尽量返回已有文本”。
@@ -1696,7 +1829,7 @@ async function finishAsk({ page, runtime, project, beforeState, expectedSessionU
       markSessionLost(sessionID, project, 'ChatGPT page left the recorded conversation while waiting for a response.');
       throw new Error(`Session ${sessionID} left its recorded ChatGPT conversation while waiting; no response was collected.`);
     }
-    await CHATGPT_DOM.focus(page).catch(() => {});
+    await runForeground(() => CHATGPT_DOM.focus(page)).catch(() => {});
     requireCurrentConversation(page, expectedSessionUrl, project, allowPlainUrl, sessionID, 'wait-failure focus', true);
     const state = await CHATGPT_DOM.state(page).catch(() => null);
     const hasNewAssistantText = assistantTextAdvanced(state, beforeState);
@@ -1740,7 +1873,8 @@ async function finishAsk({ page, runtime, project, beforeState, expectedSessionU
 
   const stillGenerating = waitResult.status === 'generating';
   let extractionNotice = null;
-  await CHATGPT_DOM.focus(page).catch(() => {});
+  // send后断连只跳过前台动作，URL校验、状态快照和pending防重发仍必须完成。
+  if (waitResult.reason !== 'client-disconnected') await runForeground(() => CHATGPT_DOM.focus(page)).catch(() => {});
   requireCurrentConversation(page, expectedSessionUrl, project, allowPlainUrl, sessionID, 'response focus', true);
   const fallbackState = await CHATGPT_DOM.state(page).catch(() => null);
   const hasNewAssistantText = assistantTextAdvanced(fallbackState, beforeState);
@@ -1769,6 +1903,7 @@ async function finishAsk({ page, runtime, project, beforeState, expectedSessionU
     promptSent: true,
     shouldCancel,
     beforeState,
+    runForeground,
     log,
     saveLabel: stillGenerating
       ? 'Current partial assistant response saved locally before returning to OpenCode'
@@ -1910,7 +2045,7 @@ async function startDaemonProcess() {
         log('Startup error: Login wait timed out after ' + LOGIN_WAIT_TIMEOUT_MS + 'ms. Log in to chatgpt.com in the browser window, or run: node chatgpt.js --login');
         // CDP 连接模式下 disconnect 而非 close，避免杀掉用户已登录的浏览器窗口。
         if (BROWSER_WS_ENDPOINT || BROWSER_CDP_URL) browser.disconnect();
-        else await browser.close();
+        else await closeOwnedBrowser(browser);
         return flushAndExit(1);
       }
       log('Login detected; continuing startup.');
@@ -1926,7 +2061,7 @@ async function startDaemonProcess() {
     if (browser) {
       // CDP 连接模式下 disconnect 而非 close，避免杀掉用户已登录的浏览器。
       if (BROWSER_WS_ENDPOINT || BROWSER_CDP_URL) browser.disconnect();
-      else await browser.close().catch(() => {});
+      else await closeOwnedBrowser(browser);
     }
     // 外层 catch 同样需要刷盘后退出，否则启动期异常的日志可能丢失。
     return flushAndExit(1);
@@ -1970,10 +2105,11 @@ async function startDaemonProcess() {
       // CDP 连接模式下 disconnect 而非 close，避免 daemon 退出时杀掉用户已登录的浏览器，
       // 导致 session cookie 丢失、下次启动需要重新登录。
       if (BROWSER_WS_ENDPOINT || BROWSER_CDP_URL) browser.disconnect();
-      else await browser.close().catch(() => {});
+      else await closeOwnedBrowser(browser);
     }
     process.exit(options.exitCode ?? 0);
   };
+  runtime.onFatal = error => { if (error.code === 'VOICE_RUNTIME_FATAL') setImmediate(() => shutdownOnce(error.message, { closeBrowser: true, exitCode: 1 })); }; // 后台迟到失败也走同一幂等退出边界。
 
   browser.on('disconnected', () => {
     // 用户手动关闭浏览器代表当前 daemon 不再可服务页面请求；不自动重开，下一次 ask/voice 再按需启动。
@@ -2020,8 +2156,8 @@ async function startDaemonProcess() {
       res.on('close', () => { if (!res.writableEnded) voiceClientClosed = true; });
       try {
         res.setTimeout(RESPONSE_TIMEOUT + 60_000);
-        const parsed = validateVoiceInput(await readDaemonJsonBody(req, '/voice/transcribe-file', log));
-        const result = await runtime.withVoice(() => runVoiceTranscribe(runtime, parsed, log, () => voiceClientClosed));
+        const parsed = await readDaemonJsonBody(req, '/voice/transcribe-file', log);
+        const result = await runVoiceRequest(runtime, parsed, log, () => voiceClientClosed);
         send(200, result);
       } catch (err) {
         log(`Error: ${err.message}`);
@@ -2155,7 +2291,7 @@ async function startDaemonProcess() {
 
 // 正常运行只暴露 daemon 入口；离线测试显式 opt-in 后才能访问无网络状态机 seam。
 module.exports = process.env.CHATGPT_TEST_HOOKS === '1'
-  ? { startDaemonProcess, testing: Object.freeze({ createDaemonRuntime, prepareBootstrapPage, restoreSessionPage, rememberCurrentSessionUrl, readSessionEntry, markSessionPending, markSessionCompleted, markSessionLost, validateAskInput, validateVoiceInput, sendJSON, assistantTextAdvanced, runAsk, requestHash, dom: CHATGPT_DOM }) }
+  ? { startDaemonProcess, testing: Object.freeze({ createDaemonRuntime, prepareBootstrapPage, closeOwnedBrowser, resolveProject, ensureProjectHome, restoreSessionPage, rememberCurrentSessionUrl, readSessionEntry, markSessionPending, markSessionCompleted, markSessionLost, validateAskInput, validateVoiceInput, sendJSON, assistantTextAdvanced, runAsk, runVoiceRequest, requestHash, dom: CHATGPT_DOM }) }
   : { startDaemonProcess };
 
 if (require.main === module) {

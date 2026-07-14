@@ -172,18 +172,25 @@ function createChatGPTDom({ responseTimeout }) {
       }
     },
 
-    async transcribeAudioFile(page, file, voiceUrl, log, shouldCancel = () => false, onFallbackStart = () => {}) {
+    async transcribeAudioFile(page, file, voiceUrl, log, shouldCancel = () => false, onFallbackStart = () => {}, options = {}) { // mode由core决定，借用页不能在adapter内偷偷fallback。
       // Node 侧只读取一次文件；direct upload 和 fallback fake mic 共用同一份 base64，避免两次磁盘读取产生 TOCTOU 窗口。
       const audioBase64 = fs.readFileSync(file).toString('base64');
       // direct path 零页面操作：不 bringToFront、不 goto、不依赖任何 DOM 状态。
       // 它只在 runtime 专属 voice page 的 JS 上下文中 fetch，不会与 ask session 共用 composer。
-      try {
+      if (options.mode !== 'fallback') try { // fallback-only跳过私有endpoint，避免重复上传音频。
         // direct upload 是性能优化路径：成功时不触碰听写按钮，也不污染 composer 文本。
-        const direct = await transcribeAudioFileDirect(page, audioBase64, file);
+        const direct = await transcribeAudioFileDirect(page, audioBase64, file, options.requestID); // requestID贯穿Node取消与页面controller。
         log(`Direct voice transcription finished in ${direct.elapsedMs}ms`);
         // direct 成功时直接返回文本，让 TUI 插入光标位置；不需要模拟 ChatGPT composer 的听写结果。
         return direct.text;
       } catch (err) {
+        const code = err.code || (shouldCancel()
+          ? 'VOICE_CANCELLED'
+          : /official ChatGPT origin|target closed|protocol error/i.test(err.message) ? 'VOICE_PAGE'
+            : /timed out|timeout|abort|network/i.test(err.message) ? 'VOICE_TRANSPORT' : 'VOICE_ENDPOINT');
+        const normalized = Object.assign(new Error(code === 'VOICE_CANCELLED' ? 'Voice transcription cancelled before fallback' : err.message), { code }); // 稳定code只在Node边界生成。
+        // direct-only由core决定lease去留；adapter不能在借来的ask页上自行进入UI fallback。
+        if (options.mode === 'direct' || code !== 'VOICE_ENDPOINT') throw normalized;
         // AbortError/timeout/target closed 表示页面可能退化或已被 invalidateVoicePage 关闭。
         // 不在同一退化/已关闭页面上尝试 fallback（听写 UI 也会同样挂起或立即报错）；
         // 直接抛错让外层 withTimeout 捕获，下次 voicePage() 会创建新页面。
@@ -230,6 +237,15 @@ function createChatGPTDom({ responseTimeout }) {
       // 空白结果说明网页听写链路失败；抛错比把空字符串插入用户输入框更可诊断。
       if (!text.trim()) throw new Error('ChatGPT dictation returned empty text');
       return text;
+    },
+
+    async cancelDirectVoice(page, requestID) {
+      return page.evaluate(id => {
+        const requests = window.__opencodeVoiceRequests ||= {}; // 页面全局表只保存短期controller，不保存音频或token。
+        const request = requests[id] ||= { cancelled: true }; // cancel先到时留下tombstone，禁止迟到fetch启动。
+        request.cancelled = true; // controller建立前后共用同一取消事实。
+        request.controller?.abort(); // 已开始的session/transcribe fetch必须真实中止。
+      }, requestID);
     },
 
     /** 等待只返回状态，不保存文本；core 会基于状态决定 completed/pending 的落盘策略。 */
@@ -756,22 +772,25 @@ function createChatGPTDom({ responseTimeout }) {
     await page.evaluate(applyVoiceInputPatch, { audioBase64, streamChunkMs: VOICE_STREAM_CHUNK_MS }).catch(() => {});
   }
 
-  async function transcribeAudioFileDirect(page, audioBase64, file) {
+  async function transcribeAudioFileDirect(page, audioBase64, file, requestID) {
     // fetchTimeoutMs 传给页面侧 AbortController；按文件大小缩放避免大文件误杀。
     // direct 请求按音频大小扩展预算，但始终受外层 voice 总 deadline 约束。
     // 上限 45s：必须低于外层 VOICE_TRANSCRIBE_TIMEOUT_MS(60s)，留余量给 session fetch + 开销。
     const fetchTimeoutMs = Math.min(45_000, Math.max(15_000, audioBase64.length * 0.005));
-    return page.evaluate(async (config) => {
+    const result = await page.evaluate(async (config) => {
       const startedAt = performance.now();
+      const requests = window.__opencodeVoiceRequests ||= {}; // 同一page可复用，但每次任务必须按ID隔离。
+      if (requests[config.requestID]?.cancelled) return { ok: false, kind: 'cancelled', message: 'Voice transcription cancelled' }; // tombstone优先于任何网络副作用。
+      const request = requests[config.requestID] = { controller: new AbortController(), cancelled: false }; // 注册必须早于首个await。
+      try {
       // 必须在页面任务内部检查；Node 的 page.url() 与 evaluate 之间存在导航竞态，不能保护录音字节。
       if (location.origin !== config.requiredOrigin) throw new Error('Voice page left the official ChatGPT origin');
       // 页面侧 fetch 超时：页面复用数小时后 Service Worker 或后端可能挂起 fetch。
       // AbortController 在超时后强制中断，让外层创建新页面重试而不是永久挂起。
       // 注意：如果页面事件循环本身冻结，此 timer 不会触发——由 Node 侧 withTimeout 兜底。
       const fetchWithTimeout = (url, options = {}, ms) => {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), ms);
-        return fetch(url, { ...options, signal: controller.signal }).finally(() => clearTimeout(timer));
+        const timer = setTimeout(() => request.controller.abort(), ms); // endpoint超时与外部取消统一落到同一controller。
+        return fetch(url, { ...options, signal: request.controller.signal }).finally(() => clearTimeout(timer));
       };
       const sessionResponse = await fetchWithTimeout('/api/auth/session', { credentials: 'include' }, 10_000);
       // session JSON 结构由 ChatGPT Web 控制；解析失败按无 token 处理，让外层走 fallback 而不是崩掉 daemon。
@@ -814,7 +833,12 @@ function createChatGPTDom({ responseTimeout }) {
       // 只有 API 结构异常（非 JSON、缺 text 字段）才视为失败并 fallback。
       if (!json || typeof json.text !== 'string') throw new Error('ChatGPT direct transcribe returned invalid response');
       // elapsedMs 只用于本地诊断日志；不参与业务判断，避免慢网下误判为失败。
-      return { text: json.text, elapsedMs: Math.round(performance.now() - startedAt) };
+      return { ok: true, text: json.text, elapsedMs: Math.round(performance.now() - startedAt) }; // 页面只返回非敏感业务结果。
+      } catch (error) {
+        return { ok: false, kind: request.cancelled ? 'cancelled' : error.name === 'AbortError' || error.name === 'TypeError' ? 'transport' : /origin/i.test(error.message) ? 'origin' : 'endpoint', message: error.message };
+      } finally {
+        if (requests[config.requestID] === request) delete requests[config.requestID]; // compare-delete不能清掉同ID后继引用。
+      }
     }, {
       // 传给 page.evaluate 的对象保持最小字段，避免把 Node 侧 workspace/path 结构暴露给网页。
       audioBase64,
@@ -826,7 +850,10 @@ function createChatGPTDom({ responseTimeout }) {
       // fetch 超时传给页面侧 AbortController
       fetchTimeoutMs,
       requiredOrigin: 'https://chatgpt.com',
+      requestID,
     });
+    if (!result.ok) throw Object.assign(new Error(result.message), { code: { cancelled: 'VOICE_CANCELLED', transport: 'VOICE_TRANSPORT', origin: 'VOICE_PAGE' }[result.kind] || 'VOICE_ENDPOINT' });
+    return result;
   }
 
   function applyVoiceInputPatch(config) {
@@ -1290,7 +1317,7 @@ function createChatGPTDom({ responseTimeout }) {
     // 等待拆成“开始”和“稳定”两段：先确认远端收下 prompt，再判断回答是否完成。
     before = before || await assistantState(page);
     log(`waitForResponse: beforeCount=${before.count}`);
-    options.foreground = foregroundPulse(page, options.foregroundPulseMs || 0, options.shouldSkipForeground);
+    options.foreground = foregroundPulse(page, options.foregroundPulseMs || 0, options.shouldSkipForeground, options.runForeground);
     const startedAt = Date.now();
     // responseTimeout 是整次浏览器等待总预算；start/settle 共享同一个 deadline，避免外层 CLI 先超时。
     const deadline = startedAt + responseTimeout;
@@ -1366,7 +1393,7 @@ function createChatGPTDom({ responseTimeout }) {
     }
   }
 
-  function foregroundPulse(page, intervalMs, shouldSkip) {
+  function foregroundPulse(page, intervalMs, shouldSkip, runForeground) {
     // ChatGPT Web 有些内容在后台 tab 不会完整 hydrate；等待期间低频轮流激活页面并滚动到最下方,避免只抽到引用/空 assistant。
     // 频率不能太高，否则并发会话会互相抢前台；8s 级别足够触发渲染,又不会像 polling 一样打扰用户。
     // shouldSkip:voice fallback 活跃时跳过 pulse,避免抢前台干扰听写 UI。
@@ -1375,9 +1402,7 @@ function createChatGPTDom({ responseTimeout }) {
       if (!intervalMs || Date.now() - last < intervalMs) return;
       if (shouldSkip?.()) return;
       last = Date.now();
-      await page.bringToFront().catch(() => {});
-      await scrollToEnd(page);
-      await sleep(150);
+      await (runForeground || (task => task()))(async () => { await page.bringToFront().catch(() => {}); await scrollToEnd(page); await sleep(150); });
     };
   }
 
