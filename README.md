@@ -100,26 +100,23 @@ CHATGPT_MAX_UPLOAD_BYTES          Per-file upload size cap, default 419430400
 CHATGPT_MAX_TOTAL_UPLOAD_BYTES    Per-request aggregate upload cap, default 838860800
 CHATGPT_MAX_ARTIFACT_BYTES        Per-response aggregate downloaded artifact cap, default 4294967296
 CHATGPT_VOICE_FILE_MAX_BYTES      Voice WAV size cap, default 52428800
-CHATGPT_VOICE_TRANSCRIBE_TIMEOUT_MS Complete direct/fallback transcription timeout, default 60000
+CHATGPT_VOICE_TRANSCRIBE_TIMEOUT_MS Complete direct transcription timeout from queue entry, default 80000
 CHATGPT_VOICE_PAGE_MAX_AGE_MS     Dedicated voice-page reuse age, default 600000
-CHATGPT_VOICE_DICTATION_TIMEOUT_MS Fallback dictation control timeout, default 45000
-CHATGPT_VOICE_STOP_DELAY_MS       Fallback delay before stopping dictation, default 6000
-CHATGPT_VOICE_STREAM_CHUNK_MS     Fake-microphone audio scheduling chunk, default 250
 CHATGPT_TEXT_FILE_MAX_BYTES       CLI --file text size cap, default 2097152
 CHATGPT_GIT_DIFF_MAX_CHARS        git diff context cap, default 100000
 CHATGPT_MAX_FULL_PROMPT_CHARS     Final prompt cap after expansion, default 500000
 ```
 
 `CHATGPT_PROJECT` is deployment configuration, not an MCP model parameter. The
-daemon resolves it on startup as the fixed ChatGPT Project used for all sessions.
+daemon resolves it lazily when a new session first needs the default Project; voice
+startup and existing sessions with a stored Project identity do not depend on it.
 Prefer a short project name such as `MCP` for config migration. A project id or
-full Project URL is accepted as a troubleshooting override. Name discovery first
-reads the current logged-in browser's project data, then validates the Project
-home, exact Project id, composer, and Chat/Work state. A stale name-cache entry
-triggers automatic sidebar rediscovery and cache refresh; the cache is only a
-fallback, so moving the same name config to another device does not pin it to the
-previous account's Project id. Duplicate visible names are rejected instead of
-guessing. A stale explicit id/URL with no discoverable current-account match cannot
+full Project URL is accepted as a troubleshooting override. Resolution validates an
+exact cached candidate before opening the root/sidebar. A transient render, network,
+login, or execution-context failure preserves the candidate and returns a diagnostic;
+only a stable non-Project route or different Project id triggers live sidebar
+rediscovery. A validated replacement atomically replaces the old aliases. Different Project identities with the requested name are rejected instead of
+guessing; same-href responsive copies and unrelated duplicate names do not block discovery. Name-only sidebar rows are still rejected when the requested target is ambiguous. A stale explicit id/URL with no discoverable current-account match cannot
 be repaired by name, because its URL slug is not treated as a verified display name.
 
 Browser reuse has two modes. If an existing Edge/Chrome was started with a DevTools
@@ -452,6 +449,34 @@ text exists yet, the daemon still marks the session pending and returns
 `No assistant text is available yet` instead of allowing a later prompt to be
 silently appended to the same unfinished conversation.
 
+## Voice lifecycle
+
+`transcribe-file` starts or reuses the Edge/profile daemon without opening a
+Project page. Before audio upload, the runtime acquires either an idle daemon-owned
+Session page or a dedicated voice page. The DOM adapter reads the page's single
+`#client-bootstrap` source and classifies it as authenticated, logged out, loading,
+or inconsistent without returning credentials. A newly created or navigated voice
+page first receives a bounded terminal-convergence wait; an already converged page
+then requires two consecutive authenticated snapshots at the exact
+`https://chatgpt.com` origin. This prevents normal React composer hydration from
+consuming the one pre-upload page-renewal allowance.
+
+Daemon startup also waits for bootstrap and composer facts to agree. A logged-out
+page remains open for manual login without refreshing. A persistently mixed page
+may be reloaded once before daemon readiness; it never enters a reload loop. The
+direct request reads the current bootstrap access token inside the same page task and
+sends the web client's `SendIfAvailable` Bearer header together with same-origin
+cookies. The token is never returned to Node, status, or logs.
+
+The same-origin direct endpoint is the only transcription success path. HTTP,
+transport, origin, and response-shape failures return a diagnostic error instead of
+opening the composer, installing a fake microphone, navigating, or bringing Edge to
+the foreground. An unstable borrowed or dedicated page may be replaced once before
+audio upload; audio is never resent after the direct POST may have started. If the
+browser disconnects, the current call is not retried; its
+daemon index is retired and the next independent invocation starts a fresh lifecycle.
+Shared-CDP shutdown only disconnects, while an owned launch may close its own browser.
+
 ## Concurrency
 
 The daemon uses a bounded page pool. Each active `sessionID` is bound to its own
@@ -467,6 +492,12 @@ Project home composer is shared by the web app. After a conversation has a real
 returns `Status: generating` when the caller disconnects, the outer timeout is hit,
 or ChatGPT is still visibly processing; the caller can reuse the same `sessionID`
 to recover the final response later.
+
+Voice direct uploads and ask composer acceptance also share one short submission
+queue. An ask releases it after the accepted user turn has a trusted `/c/...` URL,
+before assistant generation and artifact collection, so those longer waits remain
+concurrent. Cancellation before queue ownership performs no upload, and a failed
+submission still advances the queue without retrying audio or a prompt.
 
 Artifact downloads are serialized because Chrome's download directory is a
 browser-context side effect. This prevents sandbox files from different pages
