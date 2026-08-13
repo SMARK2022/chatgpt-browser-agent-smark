@@ -45,7 +45,7 @@ const DAEMON_FILE = path.join(STATE_DIR, 'daemon.json');
 const DAEMON_LOCK_FILE = path.join(STATE_DIR, 'daemon.lock');
 const DAEMON_LOG = path.join(STATE_DIR, 'daemon.log');
 const DEFAULT_PROJECT = process.env.CHATGPT_PROJECT || process.env.CHATGPT_PROJECT_NAME || process.env.CHATGPT_PROJECT_URL || 'MCP';
-const DAEMON_VERSION = 23;
+const DAEMON_VERSION = 24;
 // 登录等待超时必须和 core 一致；client 用它推导 DAEMON_START_TIMEOUT，保证登录等待期间不提前放弃。
 const LOGIN_WAIT_TIMEOUT_MS = positiveIntEnv('CHATGPT_LOGIN_WAIT_TIMEOUT_MS', 120_000);
 // daemon 启动超时必须覆盖登录等待窗口；登录等待期间 daemon 活着但未写 daemon.json，
@@ -371,6 +371,8 @@ function httpJSON(daemon, method, endpoint, body, timeout = HTTP_TIMEOUT) {
           const error = new Error(parsed.error || `Daemon HTTP ${res.statusCode}`);
           // daemon 的结构化 code 只用于本地生命周期决策；错误正文仍保持原样输出给用户。
           if (parsed.code) error.code = parsed.code;
+          // producer code优先；无code 401才属于local daemon bearer边界，不能覆盖页面认证的VOICE_AUTH_REQUIRED。
+          else if (res.statusCode === 401) error.code = 'DAEMON_IDENTITY_MISMATCH';
           error.statusCode = res.statusCode;
           reject(error);
         } else resolve(parsed);
@@ -519,9 +521,17 @@ function ensureStateDirForDaemon() {
  */
 function daemonStartupErrorSince(offset) {
   try {
-    const text = fs.readFileSync(DAEMON_LOG, 'utf8').slice(offset);
-    const line = text.split(/\r?\n/).find(line => line.includes('Startup error:'));
-    return line ? line.replace(/^.*Startup error:\s*/, 'Daemon startup failed: ') : null;
+    // offset来自stat.size的UTF-8字节位置；必须先截Buffer再解码，中文日志不能按JS字符下标消费。
+    // marker可携带producer code；message继续原样展示，CLI不从登录或browser文案反推recoverability。
+    const text = fs.readFileSync(DAEMON_LOG).subarray(offset).toString('utf8');
+    const line = text.split(/\r?\n/).find(line => /Startup error(?: \[[A-Z_]+\])?:/.test(line));
+    if (!line) return null;
+    const match = line.match(/Startup error(?: \[([A-Z_]+)\])?:\s*(.*)$/);
+    // 旧无code日志保持可读但fail closed，新daemon的code才可授权自动retry。
+    // 这让升级期间的混合版本不会因未知启动错误反复打开browser。
+    const error = new Error(`Daemon startup failed: ${match?.[2] || line}`);
+    if (match?.[1]) error.code = match[1];
+    return error;
   } catch { return null; }
 }
 
@@ -529,7 +539,8 @@ function daemonStartupErrorSince(offset) {
 // "Login required;" 标记不含 "Startup error:"，不会被 daemonStartupErrorSince 误判为错误。
 function daemonLoginRequiredSince(offset) {
   try {
-    return fs.readFileSync(DAEMON_LOG, 'utf8').slice(offset).includes('Login required;');
+    // 登录提示和启动错误共享同一字节游标，避免两条consumer对多字节日志产生不同观察结果。
+    return fs.readFileSync(DAEMON_LOG).subarray(offset).includes(Buffer.from('Login required;'));
   } catch { return false; }
 }
 
@@ -577,7 +588,10 @@ async function ensureDaemon() {
         return state;
       }
       const startupError = daemonStartupErrorSince(logOffset);
-      if (startupError) throw new Error(`${startupError} Check log: ${DAEMON_LOG}`);
+      if (startupError) {
+        startupError.message += ` Check log: ${DAEMON_LOG}`;
+        throw startupError;
+      }
       // 登录等待不是错误：daemon 活着但需要用户手动登录。
       // 向 stderr 输出一次提示（含 --login 建议），让 Google OAuth 用户知道有替代方案。
       if (!loginNotified && daemonLoginRequiredSince(logOffset)) {
@@ -729,6 +743,24 @@ function formatResponse(result) {
   ].filter(Boolean).join('\n\n');
 }
 
+function voiceErrorIsRetryable(error) {
+  // 封闭集合只含可通过重新取得runtime恢复的事实；unknown、认证、4xx与响应合同错误fail closed。
+  // structured code必须优先于HTTP 500外壳，否则VOICE_AUTH_REQUIRED会被通用status再次误判可恢复。
+  // 无code的本地5xx只兼容旧daemon；协议version bump确保正常部署优先使用新producer code。
+  if (error.code) return ['VOICE_RATE_LIMIT', 'VOICE_SERVER', 'VOICE_TRANSPORT', 'VOICE_PAGE', 'BROWSER_DISCONNECTED', 'BROWSER_STARTUP', 'VOICE_TIMEOUT', 'VOICE_RUNTIME_FATAL', 'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT'].includes(error.code);
+  if (error.statusCode >= 500) return true;
+  return /Daemon HTTP request timed out/.test(error.message);
+}
+
+async function daemonIdentityChangedToUsable(previous) {
+  const current = readDaemonState();
+  // 旧token无法stop当前daemon；只有发现文件已发布不同且健康的身份，才允许既有loop继续。
+  // daemonID/token识别协议身份，PID/port识别进程与socket；四项全同才仍是原state，不能误判切换。
+  if (!current || ['daemonID', 'token', 'pid', 'port'].every(key => current[key] === previous[key])) return false;
+  // usable同时验证无token ping identity和带current token的status，避免只凭磁盘JSON接受尚未ready的替代daemon。
+  return isDaemonUsable(current);
+}
+
 // ─── CLI Dispatch ─────────────────────────────────────────────────────────────
 
 function printHelp() {
@@ -800,17 +832,30 @@ async function main(argv = process.argv) {
   if (opts.transcribeFile) {
     try {
       const file = validateVoiceFile(opts.file);
-      const daemon = await ensureDaemon();
-      let result;
-      try {
-        result = await httpJSON(daemon, 'POST', '/voice/transcribe-file', { file }, VOICE_HTTP_TIMEOUT);
-      } catch (err) {
-        if (err.code !== 'BROWSER_DISCONNECTED') throw err;
-        // daemon无法证明音频POST尚未发生；只淘汰stale索引，本次必须返回原错误而不能重发录音。
-        await retireDaemon(daemon);
-        throw err;
+      let result, lastError;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        // 每个attempt重新取得daemon，browser断连和stale索引才能在同一CLI事务内自维护。
+        // 文件校验留在循环外，确定性输入错误不会重复启动browser或发送HTTP。
+        let daemon;
+        try {
+          daemon = await ensureDaemon();
+          result = await httpJSON(daemon, 'POST', '/voice/transcribe-file', { file }, VOICE_HTTP_TIMEOUT);
+          if (!result.ok) throw new Error(result.error || 'Daemon returned an error');
+          break;
+        } catch (error) {
+          lastError = error;
+          if (daemon && ['BROWSER_DISCONNECTED', 'BROWSER_STARTUP', 'VOICE_RUNTIME_FATAL'].includes(error.code)) await retireDaemon(daemon);
+          // identity切换不调用retire/unlink；下一attempt只能复用已发布且通过ping/status的新daemon。
+          // 失败条件保留current discovery现场；这里禁止retire/unlink，否则会把健康替代daemon变成无索引owner。
+          if (error.code === 'DAEMON_IDENTITY_MISMATCH' && (!daemon || !await daemonIdentityChangedToUsable(daemon))) throw error;
+          // 只有browser/daemon生命周期失效才retire；429/5xx保留健康daemon避免制造无关cold start。
+          // retire不kill PID，只通过认证HTTP stop和索引清理准备下一次相同主路径。
+          if (attempt === 3 || (error.code !== 'DAEMON_IDENTITY_MISMATCH' && !voiceErrorIsRetryable(error))) throw error;
+          // 前一HTTP响应代表core已完成settle/隔离；退避只调节下一次同wire attempt，不覆盖旧页面任务。
+          await sleep([1_000, 2_000, 4_000][attempt]);
+        }
       }
-      if (!result.ok) throw new Error(result.error || 'Daemon returned an error');
+      if (!result) throw lastError;
       if (opts.json) console.log(JSON.stringify({ text: result.text || '' }));
       else console.log(result.text || '');
     } catch (err) {

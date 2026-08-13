@@ -47,7 +47,8 @@ let e2eSessionID = null; // E2E 测试间共享的 sessionID，避免每次都�
 async function main() {
   const PER_TEST_TIMEOUT = 60_000;
   const suiteStartedAt = Date.now();
-  const suiteDeadline = Date.now() + 180_000;
+  // 真实private/shared/debug-port acquisition新增三次本地Edge启停；总预算只容纳测试进程，不改变单项60秒门禁。
+  const suiteDeadline = Date.now() + 240_000;
   // 支持按名称运行单个测试：node test-mcp.js testE2EAskWithFileUpload
   const filter = process.argv.slice(2);
   const allTests = [
@@ -65,8 +66,20 @@ async function main() {
     ['testExistingSessionIndexStartup', () => testExistingSessionIndexStartup(), false],
     ['testStatusReportsDisconnectedBrowser', () => testStatusReportsDisconnectedBrowser(), false],
     ['testVoiceSkipsStaleBrowserDaemon', () => testVoiceSkipsStaleBrowserDaemon(), false],
-    ['testVoiceDoesNotRetryAfterBrowserDisconnect', () => testVoiceDoesNotRetryAfterBrowserDisconnect(), false],
+    ['testVoiceRetriesRecoverableFailure', () => testVoiceRetriesRecoverableFailure(), false],
+    ['testVoiceRetryCodes', () => testVoiceRetryCodes(), false],
+    ['testVoiceDoesNotRetryDeterministicFailure', () => testVoiceDoesNotRetryDeterministicFailure(), false],
+    ['testDaemonIdentityMismatchReconcilesCurrentDaemon', () => testDaemonIdentityMismatchReconcilesCurrentDaemon(), false],
+    ['testDaemonIdentityMismatchFailsClosedWithoutChangedUsableState', () => testDaemonIdentityMismatchFailsClosedWithoutChangedUsableState(), false],
     ['testOwnedBrowserDisconnectLifecycle', () => testOwnedBrowserDisconnectLifecycle(), false],
+    ['testDebugPortOwnershipSurvivesDaemonCrash', () => testDebugPortOwnershipSurvivesDaemonCrash(), false],
+    ['testBrowserSpawnFailureReturnsEarly', () => testBrowserSpawnFailureReturnsEarly(), false],
+    ['testPrivateBrowserReconnectsMarker', () => testPrivateBrowserReconnectsMarker(), false],
+    ['testExplicitBrowserConnectionIsShared', () => testExplicitBrowserConnectionIsShared(), false],
+    ['testDebugPortAcquisitionProvenance', () => testDebugPortAcquisitionProvenance(), false],
+    ['testPrivateBrowserRecoversBootstrapGracefully', () => testPrivateBrowserRecoversBootstrapGracefully(), false],
+    ['testPreReadyFailureReleasesPrivateBrowser', () => testPreReadyFailureReleasesPrivateBrowser(), false],
+    ['testDebugPortDaemonCrashReconnectsAndStops', () => testDebugPortDaemonCrashReconnectsAndStops(), false],
     ['testAskSkipsStaleBrowserDaemon', () => testAskSkipsStaleBrowserDaemon(), false],
     ['testLoginRequiredMarkerNotTreatedAsStartupError', () => testLoginRequiredMarkerNotTreatedAsStartupError(), false],
     ['testLoginWaitTimeoutErrorDetected', () => testLoginWaitTimeoutErrorDetected(), false],
@@ -231,6 +244,8 @@ async function testLoginWaitTimeoutErrorDetected() {
   // CLI 必须秒级检测到这个 Startup error 并把超时原因返回给调用方。
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-login-timeout-'));
   try {
+    // 游标来自文件字节数；中文前缀让UTF-8字节位置大于JS字符位置，旧字符串slice会越过新错误。
+    fs.writeFileSync(path.join(dir, 'daemon.log'), '[fixture] 启动日志包含中文，后续错误必须按字节读取。\n'.repeat(32));
     // stub daemon 模拟完整登录等待超时流程：先写 Login required，再写 Startup error 并退出。
     const stubScript = path.join(dir, 'stub-daemon.js');
     fs.writeFileSync(stubScript, [
@@ -239,7 +254,7 @@ async function testLoginWaitTimeoutErrorDetected() {
       "const log = path.join(process.env.CHATGPT_STATE_DIR, 'daemon.log');",
       "fs.appendFileSync(log, '[' + new Date().toISOString() + '] Daemon starting...\\n');",
       "fs.appendFileSync(log, '[' + new Date().toISOString() + '] Login required; waiting for manual login in browser window...\\n');",
-      "fs.appendFileSync(log, '[' + new Date().toISOString() + '] Startup error: Login wait timed out after 120000ms. Log in to chatgpt.com in the browser window, or run: node chatgpt.js --login\\n');",
+      "fs.appendFileSync(log, '[' + new Date().toISOString() + '] Startup error [LOGIN_REQUIRED]: Login wait timed out after 120000ms. Log in to chatgpt.com in the browser window, or run: node chatgpt.js --login\\n');",
       "process.exit(1);",
     ].join('\n'));
     const result = await runChatgptCLI(['--raw', 'test prompt'], {
@@ -688,8 +703,8 @@ function testCoreProjectStateMachine() {
       const assert = require('assert');
       const fs = require('fs');
       const path = require('path');
-      const policy = require('./chatgpt-project');
-      const { testing } = require('./chatgpt-core');
+      const policy = require(${JSON.stringify(path.join(__dirname, 'chatgpt-project.js'))});
+      const { testing } = require(${JSON.stringify(path.join(__dirname, 'chatgpt-core.js'))});
       const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
       const project = policy.parse('g-p-abc123-mcp', 'MCP');
       const scoped = 'https://chatgpt.com/g/g-p-abc123-mcp/c/turn-a';
@@ -1085,7 +1100,10 @@ function testCoreProjectStateMachine() {
         assert.strictEqual(submitCalls, submitsBeforeLostRetry, 'a lost handle cannot bind itself to an arbitrary visible conversation');
       })().catch(error => { console.error(error.stack || error); process.exit(1); });
     `;
-    const child = spawnSync(process.execPath, ['-e', script], {
+    // Windows命令行不能承载整个状态机fixture；临时脚本仍由同一隔离目录生命周期清理。
+    const fixture = path.join(dir, 'fixture.cjs');
+    fs.writeFileSync(fixture, script);
+    const child = spawnSync(process.execPath, [fixture], {
       // CHATGPT_TEST_HOOKS 只在临时子进程开启，正常 CLI/MCP 看不到内部状态机接口。
       cwd: __dirname,
       encoding: 'utf8',
@@ -1705,7 +1723,10 @@ function testVoiceDeadlineAndForeground() {
         assert.strictEqual(lateCalls, 0, 'a cancelled queued foreground entry must remain inert');
         testing.dom.waitForResponse = async (_page, _before, options) => { assert.strictEqual(options.shouldSkipForeground(), true); return { status: 'generating', reason: 'client-disconnected' }; };
         assert.strictEqual((await runtime.waitForResponse(page, {}, { shouldCancel: () => true }, () => {})).reason, 'client-disconnected');
-        let killed = 0; await testing.closeOwnedBrowser({ close: () => new Promise(() => {}), process: () => ({ kill() { killed++; } }) }, 10); assert.strictEqual(killed, 1);
+        let killed = 0, disconnected = 0;
+        const closeResult = await testing.closeOwnedBrowser({ close: () => new Promise(() => {}), disconnect: () => { disconnected++; }, process: () => ({ kill() { killed++; } }) }, 10);
+        // close超时保留browser/profile供后继daemon重连；禁止child kill，owner record也不能被当作已关闭删除。
+        assert.deepStrictEqual({ closeResult, disconnected, killed }, { closeResult: false, disconnected: 1, killed: 0 });
         const stalled = testing.createDaemonRuntime({ browser: { isConnected: () => true, newPage: () => new Promise(() => {}) }, bootstrapPage: null, project: policy.parse('g-p-stall123-mcp', 'MCP') });
         await assert.rejects(Promise.race([testing.runVoiceRequest(stalled, { file: ${JSON.stringify(voice)} }, () => {}, () => false), new Promise((_, reject) => setTimeout(() => reject(new Error('page preparation stayed pending')), 3_000))]), error => error.code === 'VOICE_RUNTIME_FATAL');
       })().catch(error => { console.error(error.stack || error); process.exit(1); });
@@ -2838,25 +2859,104 @@ async function testVoiceSkipsStaleBrowserDaemon() {
   }
 }
 
-// browser在direct期间断开时，本调用返回生命周期错误并保持提交次数一，绝不自动重发音频。
-// 恢复只属于下一次独立调用，测试拒绝任何同进程fallback成功结果。
-async function testVoiceDoesNotRetryAfterBrowserDisconnect() {
-  const fixture = await withFakeDaemon({ browserConnected: true, voiceResponse: { status: 503, body: { ok: false, code: 'BROWSER_DISCONNECTED', error: 'Browser was closed during voice transcription' } } });
+// 一个CLI事务对可恢复429执行初次加三次相同endpoint attempt；第四次成功即返回文本。
+// 重试次数来自用户合同，每次仍只有一个direct endpoint，不允许切DOM或第二上传算法。
+async function testVoiceRetriesRecoverableFailure() {
+  // 三个独立429响应是远端producer事实，第四次literal文本是独立expected；测试不复刻classifier算法。
+  // calls=4锁定“初次+三次”用户合同，也防止无界循环或成功后继续发送第五次。
+  const fixture = await withFakeDaemon({ browserConnected: true, voiceResponses: [
+    { status: 429, body: { ok: false, code: 'VOICE_RATE_LIMIT', error: 'rate limited 1' } },
+    { status: 429, body: { ok: false, code: 'VOICE_RATE_LIMIT', error: 'rate limited 2' } },
+    { status: 429, body: { ok: false, code: 'VOICE_RATE_LIMIT', error: 'rate limited 3' } },
+    { status: 200, body: { ok: true, text: 'retry recovered' } },
+  ] });
   const voice = path.join(fixture.dir, 'one request.wav');
   writeTinyWav(voice);
   try {
     const result = await runChatgptCLI(['transcribe-file', '--file', voice, '--json'], {
       ...fixture.env,
-      CHATGPT_BROWSER_PATH: path.join(fixture.dir, 'missing browser.exe'),
-      CHATGPT_DAEMON_START_TIMEOUT_MS: '1500',
-    }, 6000);
-    assert.notStrictEqual(result.status, 0);
-    // 原生命周期错误必须直接返回；若同调用重启daemon，stderr会变成startup错误且可能重复上传。
-    assert.match(result.stderr, /Browser was closed during voice transcription/);
-    assert.strictEqual(fixture.calls.voice, 1, 'one CLI invocation must submit the audio to at most one daemon endpoint');
-    assert.strictEqual(fixture.calls.stop, 1, 'the disconnected daemon index should still be retired for the next invocation');
+    }, 15_000);
+    assert.strictEqual(result.status, 0, result.stderr);
+    assert.deepStrictEqual(JSON.parse(result.stdout), { text: 'retry recovered' });
+    assert.strictEqual(fixture.calls.voice, 4, 'initial request plus three retries must use the same endpoint contract');
+    assert.strictEqual(fixture.calls.stop, 0, 'HTTP 429 does not invalidate a healthy daemon/browser lifecycle');
   } finally {
     await fixture.close();
+  }
+}
+
+// DOM是HTTP/auth/response事实owner；CLI只能消费这些code，不能从错误文案重新猜recoverability。
+async function testVoiceRetryCodes() {
+  // fixture直接返回页面公开result shape，逐项观察adapter抛出的稳定code，不读取production source。
+  // auth/response/rejected与rate/server同表出现，防止未来为了简化映射再次合并确定性错误。
+  const { createChatGPTDom } = require('./chatgpt-dom');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-voice-codes-'));
+  const voice = path.join(dir, 'voice.wav');
+  writeTinyWav(voice);
+  try {
+    for (const [kind, code] of [['rate-limit', 'VOICE_RATE_LIMIT'], ['server', 'VOICE_SERVER'], ['auth', 'VOICE_AUTH_REQUIRED'], ['response', 'VOICE_RESPONSE_INVALID'], ['rejected', 'VOICE_REJECTED']]) {
+      const page = { evaluate: async () => ({ ok: false, kind, message: kind }) };
+      await assert.rejects(() => createChatGPTDom({ responseTimeout: 1_000 }).transcribeAudioFile(page, voice, 'https://chatgpt.com', () => {}, () => false, () => {}), error => error.code === code);
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// HTTP 500只是daemon承载业务错误的外壳；结构化auth code必须优先，不能被status fallback重新判可恢复。
+async function testVoiceDoesNotRetryDeterministicFailure() {
+  // fake daemon故意用HTTP 500承载auth code，复现route统一错误status；code必须压过status fallback。
+  // 单次调用断言同时保护登录介入时延和“不因自动重试重复同一WAV”的确定性边界。
+  const fixture = await withFakeDaemon({ browserConnected: true, voiceResponse: { status: 500, body: { ok: false, code: 'VOICE_AUTH_REQUIRED', error: 'Log in first' } } });
+  const voice = path.join(fixture.dir, 'auth.wav');
+  writeTinyWav(voice);
+  try {
+    const result = await runChatgptCLI(['transcribe-file', '--file', voice, '--json'], fixture.env);
+    assert.notStrictEqual(result.status, 0);
+    assert.match(result.stderr, /Log in first/);
+    assert.strictEqual(fixture.calls.voice, 1, 'structured deterministic failure must not inherit HTTP 500 retry behavior');
+  } finally {
+    await fixture.close();
+  }
+}
+
+// local 401只允许复用已经发布且身份变化的usable daemon；旧token不得stop或删除current discovery。
+async function testDaemonIdentityMismatchReconcilesCurrentDaemon() {
+  // replacement先独立监听并发布完整state；旧daemon只在业务401边界替换发现文件，复现真实并发生命周期。
+  const replacement = await withFakeDaemon({ browserConnected: true, voiceResponse: { status: 200, body: { ok: true, text: 'replacement daemon' } } });
+  const fixture = await withFakeDaemon({ browserConnected: true, voiceResponse: { status: 401, body: { ok: false, error: 'Unauthorized daemon request' } }, replacementState: replacement.state });
+  const voice = path.join(fixture.dir, 'identity.wav');
+  writeTinyWav(voice);
+  try {
+    const result = await runChatgptCLI(['transcribe-file', '--file', voice, '--json'], { ...fixture.env, CHATGPT_VOICE_FILE_ROOTS: fixture.dir }, 15_000);
+    assert.strictEqual(result.status, 0, result.stderr);
+    assert.deepStrictEqual(JSON.parse(result.stdout), { text: 'replacement daemon' });
+    // 两个stop计数均为0证明reconciliation没有拿旧token碰A/B shutdown，也没有把B索引当stale删除。
+    assert.deepStrictEqual({ firstVoice: fixture.calls.voice, firstStop: fixture.calls.stop, replacementVoice: replacement.calls.voice, replacementStop: replacement.calls.stop }, { firstVoice: 1, firstStop: 0, replacementVoice: 1, replacementStop: 0 });
+  } finally {
+    await fixture.close();
+    await replacement.close();
+  }
+}
+
+// current identity未变化、缺失或不可用时必须保留现场并返回原401，不能启动竞争daemon。
+async function testDaemonIdentityMismatchFailsClosedWithoutChangedUsableState() {
+  // 三个case分别证明“身份变化”和“usable”都是必要条件；任一缺失都不能删索引或启动新daemon。
+  for (const current of ['unchanged', 'missing', 'unusable']) {
+    const replacement = current === 'unusable' ? await withFakeDaemon({ browserConnected: false }) : null;
+    const fixture = await withFakeDaemon({ browserConnected: true, voiceResponse: { status: 401, body: { ok: false, error: 'Unauthorized daemon request' } }, ...(current === 'unchanged' ? {} : { replacementState: current === 'missing' ? null : replacement.state }) });
+    const voice = path.join(fixture.dir, `${current}.wav`);
+    writeTinyWav(voice);
+    try {
+      const result = await runChatgptCLI(['transcribe-file', '--file', voice, '--json'], { ...fixture.env, CHATGPT_VOICE_FILE_ROOTS: fixture.dir }, 10_000);
+      assert.notStrictEqual(result.status, 0);
+      assert.match(result.stderr, /Unauthorized daemon request/);
+      assert.strictEqual(fixture.calls.stop, 0);
+      assert.strictEqual(replacement?.calls.stop || 0, 0);
+    } finally {
+      await fixture.close();
+      if (replacement) await replacement.close();
+    }
   }
 }
 
@@ -2877,6 +2977,256 @@ function testOwnedBrowserDisconnectLifecycle() {
       assert.deepStrictEqual(calls[0].options, { closeBrowser: false });
     })().catch(error => { console.error(error.stack || error); process.exit(1); });
   `);
+}
+
+// fixed debug port由daemon启动后，ownership必须独立于daemon bearer索引跨越异常退出。
+// 当前CDP browser PID、规范化profile和port任一不匹配时只能按shared处理，避免误关用户Edge。
+function testDebugPortOwnershipSurvivesDaemonCrash() {
+  // 删除daemon.json模拟CLI stale清理；owner record仍可匹配，证明事实不依赖bearer发现索引。
+  // mismatch delete后仍匹配锁定compare-delete，避免旧daemon清掉后继browser的新ownership。
+  runCoreFixture('chatgpt-debug-owner-', dir => String.raw`
+    const assert = require('assert'), fs = require('fs'), path = require('path'), { testing } = require('./chatgpt-core');
+    const profile = path.join(${JSON.stringify(dir)}, 'profile');
+    fs.mkdirSync(profile, { recursive: true });
+    testing.writeBrowserOwner({ profile, debugPort: 9333, browserPid: 48123 });
+    fs.writeFileSync(path.join(${JSON.stringify(dir)}, 'daemon.json'), '{}');
+    fs.unlinkSync(path.join(${JSON.stringify(dir)}, 'daemon.json'));
+    assert.strictEqual(testing.browserOwnerMatches({ profile, debugPort: 9333, browserPid: 48123 }), true);
+    assert.strictEqual(testing.browserOwnerMatches({ profile, debugPort: 9334, browserPid: 48123 }), false);
+    assert.strictEqual(testing.browserOwnerMatches({ profile, debugPort: 9333, browserPid: 48124 }), false);
+    testing.deleteBrowserOwner({ profile, debugPort: 9334, browserPid: 48123 });
+    assert.strictEqual(testing.browserOwnerMatches({ profile, debugPort: 9333, browserPid: 48123 }), true);
+    testing.deleteBrowserOwner({ profile, debugPort: 9333, browserPid: 48123 });
+    assert.strictEqual(testing.browserOwnerMatches({ profile, debugPort: 9333, browserPid: 48123 }), false);
+  `);
+}
+
+// executable存在但不能执行时，spawn producer必须立即返回BROWSER_CONFIG，不能等marker再重试四轮。
+async function testBrowserSpawnFailureReturnsEarly() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-spawn-error-'));
+  const browser = path.join(dir, 'not-executable');
+  fs.writeFileSync(browser, 'fixture');
+  const voice = path.join(dir, 'voice.wav');
+  writeTinyWav(voice);
+  const started = Date.now();
+  try {
+    const result = await runChatgptCLI(['transcribe-file', '--file', voice, '--json'], { CHATGPT_STATE_DIR: dir, CHATGPT_SESSION_DIR: path.join(dir, 'sessions'), CHATGPT_VOICE_FILE_ROOTS: dir, CHATGPT_BROWSER_PATH: browser, CHATGPT_DAEMON_START_TIMEOUT_MS: '5000' }, 10_000);
+    assert.notStrictEqual(result.status, 0);
+    assert.ok(Date.now() - started < 3_000, `deterministic spawn failure must return early: ${Date.now() - started}ms`);
+    assert.match(result.stderr, /Browser executable|EACCES|EPERM|not-executable/i);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+// 真实private acquisition先cold spawn，再断开daemon连接；第二次必须通过同profile marker重连同一browser。
+async function testPrivateBrowserReconnectsMarker() {
+  const browserPath = findTestBrowserPath();
+  if (!browserPath) throw new SkipError('no local browser for private marker lifecycle');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-private-marker-'));
+  const script = `
+    const assert = require('assert'); const { testing } = require('./chatgpt-core');
+    (async () => {
+      const first = await testing.launchBrowser(() => {});
+      assert.strictEqual(first.ownedByDaemon, true);
+      const endpoint = first.browser.wsEndpoint();
+      first.browser.disconnect();
+      const second = await testing.launchBrowser(() => {});
+      assert.strictEqual(second.ownedByDaemon, true);
+      assert.strictEqual(second.browser.wsEndpoint(), endpoint);
+      assert.strictEqual(await testing.closeOwnedBrowser(second.browser), true);
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    })().catch(error => { console.error(error.stack || error); process.exit(1); });
+  `;
+  try {
+    const child = spawnSync(process.execPath, ['-e', script], { cwd: __dirname, encoding: 'utf8', timeout: 60_000, windowsHide: true, env: { ...BASE_ENV, CHATGPT_TEST_HOOKS: '1', CHATGPT_TEST_HEADLESS: '1', CHATGPT_BROWSER_PATH: browserPath, CHATGPT_STATE_DIR: dir, CHATGPT_SESSION_DIR: path.join(dir, 'sessions'), CHATGPT_BROWSER_DEBUG_PORT: '0' } });
+    assert.strictEqual(child.status, 0, child.error?.stack || child.stderr || child.stdout);
+  } finally { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); }
+}
+
+// 显式WS endpoint无论profile路径如何都属于用户shared browser；daemon disconnect不能关闭外部browser。
+async function testExplicitBrowserConnectionIsShared() {
+  const browserPath = findTestBrowserPath();
+  if (!browserPath) throw new SkipError('no local browser for shared lifecycle');
+  await withBrowserPage('shared acquisition', 'chatgpt-shared-acquisition-', async (_page, browser) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-shared-state-'));
+    const script = `
+      const assert = require('assert'); const { testing } = require('./chatgpt-core');
+      (async () => { const acquired = await testing.launchBrowser(() => {}); assert.strictEqual(acquired.ownedByDaemon, false); acquired.browser.disconnect(); })().catch(error => { console.error(error.stack || error); process.exit(1); });
+    `;
+    try {
+      const child = spawnSync(process.execPath, ['-e', script], { cwd: __dirname, encoding: 'utf8', timeout: 15_000, windowsHide: true, env: { ...BASE_ENV, CHATGPT_TEST_HOOKS: '1', CHATGPT_BROWSER_WS_ENDPOINT: browser.wsEndpoint(), CHATGPT_STATE_DIR: dir, CHATGPT_SESSION_DIR: path.join(dir, 'sessions') } });
+      assert.strictEqual(child.status, 0, child.error?.stack || child.stderr || child.stdout);
+      assert.strictEqual(browser.isConnected(), true, 'shared browser must remain alive after daemon connection disconnects');
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+}
+
+// fixed port初次不可达时production必须spawn owned；record删除后同一可达endpoint只能shared fail-safe。
+async function testDebugPortAcquisitionProvenance() {
+  const browserPath = findTestBrowserPath();
+  if (!browserPath) throw new SkipError('no local browser for debug-port lifecycle');
+  const port = await new Promise((resolve, reject) => {
+    const server = require('net').createServer();
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => { const value = server.address().port; server.close(() => resolve(value)); });
+  });
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-debug-acquisition-'));
+  const script = `
+    const assert = require('assert'); const puppeteer = require('puppeteer-core'); const { testing } = require('./chatgpt-core');
+    (async () => {
+      const first = await testing.launchBrowser(() => {});
+      assert.strictEqual(first.ownedByDaemon, true);
+      assert.ok(first.owner);
+      first.browser.disconnect();
+      const second = await testing.launchBrowser(() => {});
+      assert.strictEqual(second.ownedByDaemon, true);
+      testing.deleteBrowserOwner(second.owner);
+      second.browser.disconnect();
+      const third = await testing.launchBrowser(() => {});
+      assert.strictEqual(third.ownedByDaemon, false);
+      third.browser.disconnect();
+      const cleanup = await puppeteer.connect({ browserURL: 'http://127.0.0.1:${port}' });
+      assert.strictEqual(await testing.closeOwnedBrowser(cleanup), true);
+    })().catch(error => { console.error(error.stack || error); process.exit(1); });
+  `;
+  try {
+    const child = spawnSync(process.execPath, ['-e', script], { cwd: __dirname, encoding: 'utf8', timeout: 60_000, windowsHide: true, env: { ...BASE_ENV, CHATGPT_TEST_HOOKS: '1', CHATGPT_TEST_HEADLESS: '1', CHATGPT_BROWSER_PATH: browserPath, CHATGPT_STATE_DIR: dir, CHATGPT_SESSION_DIR: path.join(dir, 'sessions'), CHATGPT_BROWSER_DEBUG_PORT: String(port) } });
+    assert.strictEqual(child.status, 0, child.error?.stack || child.stderr || child.stdout);
+  } finally {
+    // Edge helper可能在Browser.close返回后短暂持有profile目录；有界重试只收敛隔离测试state。
+    for (let attempt = 0; fs.existsSync(dir) && attempt < 50; attempt++) {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+      if (fs.existsSync(dir)) await new Promise(resolve => setTimeout(resolve, 200));
+    }
+    assert.strictEqual(fs.existsSync(dir), false, `debug-port fixture profile remained locked: ${dir}`);
+  }
+}
+
+// 持续inconsistent owned bootstrap必须在daemon owner内graceful close并cold一次，不能消耗外层voice attempt。
+async function testPrivateBrowserRecoversBootstrapGracefully() {
+  const browserPath = findTestBrowserPath();
+  if (!browserPath) throw new SkipError('no local browser for bootstrap cold recovery');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-bootstrap-recovery-'));
+  const script = `
+    const assert = require('assert'); const { testing } = require('./chatgpt-core');
+    let firstEndpoint, reads = 0;
+    testing.dom.sessionPageFact = async page => {
+      const endpoint = page.browser().wsEndpoint();
+      firstEndpoint ||= endpoint;
+      reads++;
+      return { kind: endpoint === firstEndpoint ? 'inconsistent' : 'authenticated', origin: 'https://chatgpt.com', readyState: 'complete' };
+    };
+    (async () => {
+      const acquired = await testing.acquireBootstrapBrowser(() => {});
+      assert.strictEqual(acquired.ownedByDaemon, true);
+      assert.notStrictEqual(acquired.browser.wsEndpoint(), firstEndpoint);
+      assert.strictEqual(acquired.initialFact.kind, 'authenticated');
+      assert.ok(reads >= 3, 'first lifecycle must consume reload convergence before cold recovery');
+      assert.strictEqual(await testing.closeOwnedBrowser(acquired.browser), true);
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    })().catch(error => { console.error(error.stack || error); process.exit(1); });
+  `;
+  try {
+    const child = spawnSync(process.execPath, ['-e', script], { cwd: __dirname, encoding: 'utf8', timeout: 90_000, windowsHide: true, env: { ...BASE_ENV, CHATGPT_TEST_HOOKS: '1', CHATGPT_TEST_HEADLESS: '1', CHATGPT_BROWSER_PATH: browserPath, CHATGPT_STATE_DIR: dir, CHATGPT_SESSION_DIR: path.join(dir, 'sessions'), CHATGPT_BROWSER_DEBUG_PORT: '0', CHATGPT_SESSION_PAGE_READY_TIMEOUT_MS: '500' } });
+    assert.strictEqual(child.status, 0, child.error?.stack || child.stderr || child.stdout);
+  } finally { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); }
+}
+
+// 普通pre-ready异常也必须由acquisition owner收敛；不能只清理持续inconsistent这一种错误。
+async function testPreReadyFailureReleasesPrivateBrowser() {
+  const browserPath = findTestBrowserPath();
+  if (!browserPath) throw new SkipError('no local browser for pre-ready cleanup lifecycle');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-pre-ready-cleanup-'));
+  const script = `
+    const assert = require('assert'), fs = require('fs'), path = require('path'), puppeteer = require('puppeteer-core');
+    const { testing } = require('./chatgpt-core');
+    testing.dom.sessionPageFact = async () => { throw Object.assign(new Error('fixture pre-ready failure'), { code: 'VOICE_PAGE' }); };
+    (async () => {
+      await assert.rejects(() => testing.acquireBootstrapBrowser(() => {}), /fixture pre-ready failure/);
+      const marker = fs.readFileSync(path.join(process.env.CHATGPT_STATE_DIR, 'profile', 'DevToolsActivePort'), 'utf8').trim().split(/\\r?\\n/);
+      await assert.rejects(() => puppeteer.connect({ browserWSEndpoint: 'ws://127.0.0.1:' + marker[0] + marker[1] }), 'failed bootstrap must not leave its marker endpoint reachable');
+      testing.dom.sessionPageFact = async () => ({ kind: 'authenticated', origin: 'https://chatgpt.com', readyState: 'complete' });
+      const recovered = await testing.acquireBootstrapBrowser(() => {});
+      assert.strictEqual(recovered.ownedByDaemon, true);
+      assert.strictEqual(await testing.closeOwnedBrowser(recovered.browser), true);
+    })().catch(error => { console.error(error.stack || error); process.exit(1); });
+  `;
+  try {
+    const child = spawnSync(process.execPath, ['-e', script], { cwd: __dirname, encoding: 'utf8', timeout: 90_000, windowsHide: true, env: { ...BASE_ENV, CHATGPT_TEST_HOOKS: '1', CHATGPT_TEST_HEADLESS: '1', CHATGPT_BROWSER_PATH: browserPath, CHATGPT_STATE_DIR: dir, CHATGPT_SESSION_DIR: path.join(dir, 'sessions'), CHATGPT_BROWSER_DEBUG_PORT: '0' } });
+    assert.strictEqual(child.status, 0, child.error?.stack || child.stderr || child.stdout);
+  } finally {
+    // red阶段也可能留下真实Edge；测试owner通过marker执行CDP close，绝不强杀或触碰用户profile。
+    try {
+      const marker = fs.readFileSync(path.join(dir, 'profile', 'DevToolsActivePort'), 'utf8').trim().split(/\r?\n/);
+      const browser = await require('puppeteer-core').connect({ browserWSEndpoint: `ws://127.0.0.1:${marker[0]}${marker[1]}` });
+      await browser.close();
+    } catch {}
+    for (let attempt = 0; fs.existsSync(dir) && attempt < 50; attempt++) {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+      if (fs.existsSync(dir)) await new Promise(resolve => setTimeout(resolve, 200));
+    }
+    assert.strictEqual(fs.existsSync(dir), false, `pre-ready fixture profile remained locked: ${dir}`);
+  }
+}
+
+// production CLI/daemon闭环：fixed-port owned spawn→daemon崩溃→stale清理→owned reconnect→/stop关闭browser。
+async function testDebugPortDaemonCrashReconnectsAndStops() {
+  const browserPath = findTestBrowserPath();
+  if (!browserPath) throw new SkipError('no local browser for debug-port daemon lifecycle');
+  const port = await new Promise((resolve, reject) => {
+    const server = require('net').createServer(); server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => { const value = server.address().port; server.close(() => resolve(value)); });
+  });
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-debug-daemon-'));
+  const wrapper = path.join(dir, 'daemon-wrapper.cjs');
+  const voice = path.join(dir, 'voice.wav');
+  writeTinyWav(voice);
+  fs.writeFileSync(wrapper, `
+    process.env.CHATGPT_TEST_HOOKS = '1';
+    const core = require(${JSON.stringify(path.join(__dirname, 'chatgpt-core.js'))});
+    core.testing.dom.sessionPageFact = async () => ({ kind: 'authenticated', origin: 'https://chatgpt.com', readyState: 'complete' });
+    core.testing.dom.transcribeAudioFile = async () => 'daemon lifecycle';
+    core.startDaemonProcess();
+  `);
+  const env = { CHATGPT_STATE_DIR: dir, CHATGPT_SESSION_DIR: path.join(dir, 'sessions'), CHATGPT_VOICE_FILE_ROOTS: dir, CHATGPT_BROWSER_PATH: browserPath, CHATGPT_BROWSER_DEBUG_PORT: String(port), CHATGPT_DAEMON_INTERNAL_SCRIPT: wrapper, CHATGPT_DAEMON_START_TIMEOUT_MS: '30000', CHATGPT_TEST_HEADLESS: '1' };
+  try {
+    const first = await runChatgptCLI(['transcribe-file', '--file', voice, '--json'], env, 45_000);
+    assert.strictEqual(first.status, 0, first.stderr);
+    const firstPid = JSON.parse(fs.readFileSync(path.join(dir, 'daemon.json'), 'utf8')).pid;
+    process.kill(firstPid, 'SIGKILL');
+    for (let attempts = 0; attempts < 100 && isProcessRunning(firstPid); attempts++) await new Promise(resolve => setTimeout(resolve, 25));
+    assert.strictEqual(await fetch(`http://127.0.0.1:${port}/json/version`).then(response => response.ok).catch(() => false), true, 'daemon crash must leave its detached browser endpoint reachable');
+    const second = await runChatgptCLI(['transcribe-file', '--file', voice, '--json'], env, 45_000);
+    assert.strictEqual(second.status, 0, `${second.stderr}\n${fs.readFileSync(path.join(dir, 'daemon.log'), 'utf8')}`);
+    const secondPid = JSON.parse(fs.readFileSync(path.join(dir, 'daemon.json'), 'utf8')).pid;
+    assert.notStrictEqual(secondPid, firstPid);
+    const stopped = await runChatgptCLI(['--stop'], env, 15_000);
+    assert.strictEqual(stopped.status, 0, stopped.stderr);
+    for (let attempts = 0; attempts < 200 && isProcessRunning(secondPid); attempts++) await new Promise(resolve => setTimeout(resolve, 50));
+    assert.strictEqual(isProcessRunning(secondPid), false, 'production stop must finish daemon shutdown before lifecycle cleanup');
+    for (let attempts = 0; attempts < 100 && fs.existsSync(path.join(dir, 'browser-owner.json')); attempts++) await new Promise(resolve => setTimeout(resolve, 50));
+    assert.strictEqual(fs.existsSync(path.join(dir, 'browser-owner.json')), false, 'production stop must compare-delete the matching owner record');
+    await assert.rejects(() => new Promise((resolve, reject) => {
+      const socket = require('net').createConnection({ host: '127.0.0.1', port }, resolve);
+      socket.once('error', reject); setTimeout(() => { socket.destroy(); reject(new Error('debug port remained reachable')); }, 500);
+    }));
+  } catch (error) {
+    await new Promise(resolve => setTimeout(resolve, 500));
+    if (fs.existsSync(path.join(dir, 'daemon.log'))) error.message += `\n${fs.readFileSync(path.join(dir, 'daemon.log'), 'utf8')}`;
+    throw error;
+  } finally {
+    // 断言失败也先走daemon/CDP graceful close；不能先删发现文件再把隔离Edge遗留成可见的未登录窗口。
+    if (fs.existsSync(path.join(dir, 'daemon.json'))) await runChatgptCLI(['--stop'], env, 20_000).catch(() => {});
+    try { const browser = await require('puppeteer-core').connect({ browserURL: `http://127.0.0.1:${port}` }); await browser.close(); } catch {}
+    for (let attempt = 0; fs.existsSync(dir) && attempt < 50; attempt++) {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+      if (fs.existsSync(dir)) await new Promise(resolve => setTimeout(resolve, 200));
+    }
+    assert.strictEqual(fs.existsSync(dir), false, `isolated browser profile remained locked after graceful close: ${dir}`);
+  }
+}
+
+function isProcessRunning(pid) {
+  try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
 // ask和voice共享相同daemon身份验证；stale端口不能让prompt落入错误浏览器实例。
@@ -2959,6 +3309,16 @@ async function withFakeDaemon(options) {
     if (req.method === 'POST' && req.url === '/voice/transcribe-file') {
       // 如果这里被调用，说明 CLI 复用了 browser 已断开的旧 daemon，测试必须失败。
       calls.voice++;
+      // identity fixture在业务响应边界原子发布replacement state，复现并发daemon切换而不伪造CLI内部状态。
+      if ('replacementState' in options) {
+        // 写入发生在旧voice响应前，确保CLI观察的是A请求401与磁盘B身份并存的真实竞态窗口。
+        if (options.replacementState) fs.writeFileSync(path.join(dir, 'daemon.json'), JSON.stringify(options.replacementState), { encoding: 'utf8', mode: 0o600 });
+        else fs.unlinkSync(path.join(dir, 'daemon.json'));
+      }
+      if (options.voiceResponses) {
+        const response = options.voiceResponses[Math.min(calls.voice - 1, options.voiceResponses.length - 1)];
+        return send(response.status, response.body);
+      }
       if (options.voiceResponse) return send(options.voiceResponse.status, options.voiceResponse.body);
       return send(500, { ok: false, error: 'stale voice endpoint called' });
     }
@@ -2976,6 +3336,7 @@ async function withFakeDaemon(options) {
   return {
     dir,
     calls,
+    state,
     env: {
       // state/session/workspace 全部隔离到临时目录，避免测试触碰用户真实 browser-agent daemon。
       CHATGPT_STATE_DIR: dir,

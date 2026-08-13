@@ -60,9 +60,10 @@ const PROJECTS_FILE    = path.join(STATE_DIR, 'projects.json');
 const SESSION_INDEX_FILE = path.join(USER_DATA_DIR, 'sessions.json');
 const DAEMON_FILE      = path.join(STATE_DIR, 'daemon.json');
 const DAEMON_LOG       = path.join(STATE_DIR, 'daemon.log');
+const BROWSER_OWNER_FILE = path.join(STATE_DIR, 'browser-owner.json');
 const CHATGPT_URL      = 'https://chatgpt.com';
 const DEFAULT_PROJECT  = process.env.CHATGPT_PROJECT || process.env.CHATGPT_PROJECT_NAME || process.env.CHATGPT_PROJECT_URL || 'MCP';
-const DAEMON_VERSION   = 23;
+const DAEMON_VERSION   = 24;
 const RESPONSE_TIMEOUT = positiveIntEnv('CHATGPT_RESPONSE_TIMEOUT_MS', 540_000); // 大文件分析会很慢，默认给 9 分钟。
 const MAX_RETURN_CHARS = positiveIntEnv('CHATGPT_MAX_RETURN_CHARS', 6_000);
 const RESPONSE_PREVIEW_CHARS = positiveIntEnv('CHATGPT_RESPONSE_PREVIEW_CHARS', 4_000);
@@ -123,62 +124,71 @@ function normalizePathList(value) {
  * chatgpt.js --login 使用非 Puppeteer 浏览器完成。
  */
 async function launchBrowser(log = () => {}) {
-  // 优先复用已开远程调试端口的浏览器；普通 Chromium/Edge 进程不能事后被 Puppeteer 附加。
-  if (BROWSER_WS_ENDPOINT || BROWSER_CDP_URL) {
-    try {
-      log(`Connecting to existing browser: ${BROWSER_WS_ENDPOINT || BROWSER_CDP_URL}`);
-      // connect 模式才是真正“复用已打开浏览器”；它要求浏览器启动时就带 DevTools 端口。
-      // 普通 Edge 窗口没有这个协议入口，不能靠 Puppeteer 事后强行接管。
-      if (BROWSER_CDP_URL) await ensureDevtoolsEndpointReachable(BROWSER_CDP_URL);
-      return await withTimeout(puppeteer.connect({
-        ...(BROWSER_WS_ENDPOINT ? { browserWSEndpoint: BROWSER_WS_ENDPOINT } : { browserURL: BROWSER_CDP_URL }),
-        defaultViewport: null,
-        protocolTimeout: RESPONSE_TIMEOUT,
-      }), BROWSER_CONNECT_TIMEOUT_MS, `Timed out connecting to browser DevTools endpoint: ${BROWSER_WS_ENDPOINT || BROWSER_CDP_URL}`);
-    } catch (err) {
-      if (BROWSER_WS_ENDPOINT || BROWSER_CDP_URL_ENV || !Number.isFinite(BROWSER_DEBUG_PORT) || BROWSER_DEBUG_PORT <= 0) throw err;
-      log(`Existing debug browser is not reachable; launching Edge with --remote-debugging-port=${BROWSER_DEBUG_PORT}`);
-      // 用 spawn 启动 Edge（而非 puppeteer.launch），避免 chatgpt.com 检测到 Puppeteer 自动化标志
-      // 后拒绝保持登录态。spawn 启动的 Edge 和用户手动启动的一样，不带 navigator.webdriver。
-      const child = spawn(CHROME_PATH, [
-        `--user-data-dir=${BROWSER_USER_DATA_DIR}`,
-        // --profile-directory 必须和 --login / puppeteer.launch 保持一致，否则登录进 Profile A，
-        // daemon spawn 却用 Default，cookie 不互通导致登录态丢失。
-        BROWSER_PROFILE_DIRECTORY ? `--profile-directory=${BROWSER_PROFILE_DIRECTORY}` : null,
-        `--remote-debugging-port=${BROWSER_DEBUG_PORT}`,
-        '--no-first-run',
-        '--no-default-browser-check',
-        '--disable-extensions',
-        'https://chatgpt.com',
-      ].filter(Boolean), { detached: true, stdio: 'ignore' });
-      // spawn 的 error 事件不会通过 Promise 传播；监听后写日志，避免 ENOENT 时进程被 uncaughtException 杀掉。
-      child.on('error', err => log(`Edge spawn failed: ${err.message}`));
-      child.unref();
-      // 轮询等待 CDP 端口可用，再通过 puppeteer.connect 连接（而非 puppeteer.launch 直接控制）。
-      const cdpDeadline = Date.now() + 30_000;
-      let cdpReady = false;
-      while (Date.now() < cdpDeadline) {
-        try { await ensureDevtoolsEndpointReachable(BROWSER_CDP_URL); cdpReady = true; break; }
-        catch { await new Promise(r => setTimeout(r, 1_000)); }
+  if (BROWSER_WS_ENDPOINT || BROWSER_CDP_URL_ENV) {
+    // 显式endpoint代表用户提供的连接边界；profile路径相同也不能反推daemon拥有browser进程。
+    // shared连接只创建自己的bootstrap tab并disconnect，禁止关闭既有browser或清理用户tab。
+    const endpoint = BROWSER_WS_ENDPOINT || BROWSER_CDP_URL_ENV;
+    log(`Connecting to shared browser: ${endpoint}`);
+    return { browser: await connectBrowser(BROWSER_WS_ENDPOINT ? { browserWSEndpoint: endpoint } : { browserURL: endpoint }), ownedByDaemon: false, owner: null };
+  }
+  if (!usesExternalBrowserProfile() && !BROWSER_CDP_URL) {
+    // 默认profile本身就是private ownership事实；marker是跨daemon恢复入口，无需扫描Edge PID。
+    // 先重连再spawn修复“browser仍活着但daemon已死”造成的profile lock根因。
+    const marker = readPrivateDevtoolsMarker();
+    if (marker) {
+      try {
+        log('Reconnecting to daemon-owned browser from DevToolsActivePort');
+        return { browser: await connectBrowser({ browserWSEndpoint: marker }), ownedByDaemon: true, owner: null };
+      } catch (error) {
+        // profile仍锁定时第二次spawn只会重复即时失败；保留旧browser供下一attempt继续恢复。
+        // lock只阻止破坏性重复启动，不能替代marker连接这个健康事实。
+        if (browserProfileLooksLocked()) throw Object.assign(error, { code: 'BROWSER_STARTUP' });
       }
-      // CDP 端口始终不可达说明 Edge 启动失败（路径错误、profile 损坏等）；直接抛错，避免后续 8s 空等。
-      if (!cdpReady) throw new Error(`Edge did not open DevTools port ${BROWSER_DEBUG_PORT} within 30s. Check browser path: ${CHROME_PATH}`);
-      // 额外等待 Edge 完成 profile/cookie 加载；CDP 端口可用只代表进程启动，cookie 数据库可能尚未载入内存。
-      await new Promise(r => setTimeout(r, 8_000));
-      return await withTimeout(puppeteer.connect({
-        browserURL: BROWSER_CDP_URL,
-        defaultViewport: null,
-        protocolTimeout: RESPONSE_TIMEOUT,
-      }), BROWSER_CONNECT_TIMEOUT_MS, `Timed out connecting to browser DevTools endpoint: ${BROWSER_CDP_URL}`);
     }
+    assertBrowserExecutable();
+    // 仅在确认profile未锁定后移除stale marker；活动browser的marker绝不能被覆盖。
+    // cold spawn先进入blank等CDP，再由唯一bootstrap owner导航，避免直接URL启动竞态。
+    const markerFile = path.join(BROWSER_USER_DATA_DIR, 'DevToolsActivePort');
+    try { if (fs.existsSync(markerFile)) fs.unlinkSync(markerFile); } catch {}
+    const spawnError = spawnBrowser(0, log);
+    const browser = await Promise.race([connectPrivateMarker(), spawnError]);
+    return { browser, ownedByDaemon: true, owner: null };
+  }
+  if (BROWSER_CDP_URL) {
+    let connected;
+    try {
+      // fixed port可能是用户预启动，也可能是前一daemon启动；端口可达本身不授予close权限。
+      // 当前CDP PID/profile/port三元组不匹配时必须shared fail-safe。
+      connected = await connectBrowser({ browserURL: BROWSER_CDP_URL });
+    } catch (error) {
+      // debug-port-only保留既有“不可达后受控启动”合同；显式CDP URL已在shared分支返回。
+      // external profile被普通Edge锁定时禁止spawn，不能借固定端口接管用户browser。
+      if (!Number.isFinite(BROWSER_DEBUG_PORT) || BROWSER_DEBUG_PORT <= 0) throw error;
+      if (usesExternalBrowserProfile() && browserProfileLooksLocked()) throw Object.assign(new Error(`Configured browser profile is already open without reachable DevTools port ${BROWSER_DEBUG_PORT}`), { code: 'BROWSER_CONFIG' });
+      assertBrowserExecutable();
+      const spawnError = spawnBrowser(BROWSER_DEBUG_PORT, log);
+      await Promise.race([waitForDevtools(BROWSER_CDP_URL), spawnError]);
+      const browser = await connectBrowser({ browserURL: BROWSER_CDP_URL });
+      // PID来自当前endpoint自身而非系统枚举；只用于验证后继daemon的graceful-close权限。
+      // record必须晚于成功connect，失败启动不能留下未来误判owned的事实。
+      const owner = { profile: BROWSER_USER_DATA_DIR, debugPort: BROWSER_DEBUG_PORT, browserPid: await withTimeout(browserProcessID(browser), BROWSER_CONNECT_TIMEOUT_MS, 'Timed out reading spawned browser ownership') };
+      writeBrowserOwner(owner);
+      return { browser, ownedByDaemon: true, owner };
+    }
+    // 可达browser的provenance读取失败只能失去close权限，不能把健康连接误判成需重复spawn。
+    const pid = await withTimeout(browserProcessID(connected), BROWSER_CONNECT_TIMEOUT_MS, 'Timed out reading browser ownership').catch(() => null);
+    const owner = pid ? { profile: BROWSER_USER_DATA_DIR, debugPort: BROWSER_DEBUG_PORT, browserPid: pid } : null;
+    return { browser: connected, ownedByDaemon: !!owner && browserOwnerMatches(owner), owner };
   }
   if (usesExternalBrowserProfile() && browserProfileLooksLocked()) {
-    throw new Error(`Configured browser profile is already open without a reachable DevTools endpoint. Start Edge with --remote-debugging-port=${BROWSER_DEBUG_PORT || 9222}, set CHATGPT_BROWSER_CDP_URL/CHATGPT_BROWSER_WS_ENDPOINT, or close Edge before launching this daemon. Profile: ${BROWSER_USER_DATA_DIR}`);
+    // unlocked external profile是公开launch合同；只有“锁定且无endpoint”状态明确拒绝。
+    // 这是确定性配置错误，1/2/4秒退避不会改变普通Edge仍占用profile。
+    throw Object.assign(new Error(`Configured browser profile is already open without a reachable DevTools endpoint. Start Edge with a DevTools endpoint or close Edge before launching this daemon. Profile: ${BROWSER_USER_DATA_DIR}`), { code: 'BROWSER_CONFIG' });
   }
-  // 没有 CDP 端口时只能复用同一个 user data dir 的登录态；若该 profile 正被普通 Edge 锁住，Chromium 会拒绝启动。
-  // 这仍比插件私有空 profile 更符合用户预期：登录 cookie 来自指定 Edge profile，而不是重新登录。
-  // 30s 超时防止 profile lock 或其他原因导致 puppeteer.launch 永久挂起（无超时时 daemon 会卡死直到被用户强杀）。
-  return withTimeout(puppeteer.launch({
+  assertBrowserExecutable();
+  // external unlocked profile继续使用既有launch，保持登录兼容与真实process ownership。
+  // 它不进入default private marker算法，避免把用户选择目录误当daemon永久私有状态。
+  const browser = await withTimeout(puppeteer.launch({
     executablePath: CHROME_PATH,
     userDataDir: BROWSER_USER_DATA_DIR,
     headless: false,
@@ -186,21 +196,96 @@ async function launchBrowser(log = () => {}) {
     defaultViewport: null,
     protocolTimeout: RESPONSE_TIMEOUT,
   }), 30_000, 'Browser launch timed out');
+  return { browser, ownedByDaemon: true, owner: null };
+}
+
+async function connectBrowser(endpoint) {
+  // TCP preflight只缩短无监听错误；最终协议健康仍以Puppeteer connect为准。
+  // helper不决定shared/owned，ownership只能由acquisition分支和provenance赋值。
+  if (endpoint.browserURL) await ensureDevtoolsEndpointReachable(endpoint.browserURL);
+  return withTimeout(puppeteer.connect({ ...endpoint, defaultViewport: null, protocolTimeout: RESPONSE_TIMEOUT }), BROWSER_CONNECT_TIMEOUT_MS, 'Timed out connecting to browser DevTools endpoint');
+}
+
+function readPrivateDevtoolsMarker() {
+  try {
+    // marker的随机端口和WS route共同构成原browser endpoint；只读端口无法可靠回连。
+    // 解析失败按没有可用marker处理，不猜端口、不扫描Edge、不合成成功。
+    const [port, route] = fs.readFileSync(path.join(BROWSER_USER_DATA_DIR, 'DevToolsActivePort'), 'utf8').trim().split(/\r?\n/);
+    if (!/^\d+$/.test(port) || !route?.startsWith('/')) return null;
+    return `ws://127.0.0.1:${port}${route}`;
+  } catch { return null; }
+}
+
+function assertBrowserExecutable() {
+  // executable缺失是确定性部署错误；spawn前失败避免四轮相同无效cold start。
+  // Windows没有POSIX X_OK语义，只验证存在，实际拒绝仍由spawn producer给出。
+  try { fs.accessSync(CHROME_PATH, fs.constants.F_OK | (process.platform === 'win32' ? 0 : fs.constants.X_OK)); }
+  catch { throw Object.assign(new Error(`Browser executable is not available: ${CHROME_PATH}`), { code: 'BROWSER_CONFIG' }); }
+}
+
+function spawnBrowser(debugPort, log) {
+  // detached让browser寿命独立于daemon，但不授予强杀权限；正常关闭仍走CDP。
+  // profile参数与--login一致，避免生命周期修复切到没有登录态的另一profile。
+  const child = spawn(CHROME_PATH, [`--user-data-dir=${BROWSER_USER_DATA_DIR}`, BROWSER_PROFILE_DIRECTORY ? `--profile-directory=${BROWSER_PROFILE_DIRECTORY}` : null, `--remote-debugging-port=${debugPort}`, '--no-first-run', '--no-default-browser-check', '--disable-extensions', process.env.CHATGPT_TEST_HOOKS === '1' && process.env.CHATGPT_TEST_HEADLESS === '1' ? '--headless=new' : null, 'about:blank'].filter(Boolean), { detached: true, stdio: 'ignore' });
+  // error事件必须参与acquisition race；只写日志会把确定性ACL/路径错误拖成四轮startup timeout。
+  const failed = new Promise((_, reject) => child.once('error', error => {
+    log(`Edge spawn failed: ${error.message}`);
+    reject(Object.assign(error, { code: ['ENOENT', 'EACCES', 'EPERM'].includes(error.code) ? 'BROWSER_CONFIG' : 'BROWSER_STARTUP' }));
+  }));
+  child.unref();
+  return failed;
+}
+
+async function connectPrivateMarker() {
+  // 只轮询同一private profile写出的marker，不探测任意本地端口或普通用户Edge。
+  // 30秒是启动边界，具体producer错误仍由startup日志consumer提前返回。
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const endpoint = readPrivateDevtoolsMarker();
+    if (endpoint) {
+      try { return await connectBrowser({ browserWSEndpoint: endpoint }); } catch {}
+    }
+    await sleep(250);
+  }
+  throw Object.assign(new Error('Daemon-owned browser did not expose DevToolsActivePort within 30s'), { code: 'BROWSER_STARTUP' });
+}
+
+async function waitForDevtools(url) {
+  // fixed-port分支只探测批准的单一端口，禁止递增端口形成第二发现算法。
+  // timeout是可恢复runtime事实，下一attempt仍走同一port/profile合同。
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    try { await ensureDevtoolsEndpointReachable(url); return; } catch { await sleep(250); }
+  }
+  throw Object.assign(new Error(`Browser did not expose DevTools port ${BROWSER_DEBUG_PORT} within 30s`), { code: 'BROWSER_STARTUP' });
+}
+
+async function browserProcessID(browser) {
+  // SystemInfo读取当前CDP连接自身；选择type=browser避免renderer/helper PID污染ownership。
+  // PID只参与三元组相等验证，不用于系统扫描、kill或未知browser接管。
+  const session = await browser.target().createCDPSession();
+  try {
+    const result = await session.send('SystemInfo.getProcessInfo');
+    const pid = result.processInfo.find(item => item.type === 'browser')?.id;
+    if (!Number.isInteger(pid) || pid <= 0) throw new Error('Browser PID is unavailable from CDP');
+    return pid;
+  } finally { await session.detach().catch(() => {}); }
 }
 
 async function prepareBootstrapPage(browser, sharedBrowser) {
-  const initialPages = await browser.pages();
-  if (sharedBrowser) {
-    // CDP connect 可能指向用户日常浏览器；daemon 只新建自己的 tab，绝不接管或关闭已有页面。
-    // 新 tab 仍共享该 browser context 的 cookie，因此无需牺牲登录态来换取清晰的页面所有权。
-    return browser.newPage();
-  }
-  // 独占 profile 由 daemon 自己启动，恢复页和 about:blank 均属于本进程，可以安全收敛为一个 bootstrap。
-  // 优先保留官方页面减少一次导航，但这个优化只在“所有 tab 都归 daemon”前提下成立。
-  const bootstrap = initialPages.find(page => isOfficialChatGPTURL(page.url())) || initialPages[0] || await browser.newPage();
-  for (const page of initialPages) {
-    if (page !== bootstrap) await page.close().catch(() => {});
-  }
+  // 先创建daemon-owned tab而不枚举旧pages；异常退出后的孤儿target可能让browser.pages永久等待。
+  // shared连接到此为止，绝不能清理用户已有target；新tab仍共享cookie登录态。
+  const bootstrap = await browser.newPage();
+  if (sharedBrowser) return bootstrap;
+  // owned profile中的旧target全部属于前一daemon；用CDP target清单收敛，避免复用退化about:blank。
+  const session = await bootstrap.createCDPSession();
+  try {
+    const current = await session.send('Target.getTargetInfo');
+    const targets = await session.send('Target.getTargets');
+    await Promise.all(targets.targetInfos
+      .filter(target => target.type === 'page' && target.targetId !== current.targetInfo.targetId)
+      .map(target => session.send('Target.closeTarget', { targetId: target.targetId }).catch(() => {})));
+  } finally { await session.detach().catch(() => {}); }
   return bootstrap;
 }
 
@@ -214,6 +299,7 @@ function browserLaunchArgs() {
     // 阻止 Edge 弹出"恢复上次会话"对话框；多余标签页在启动后由 closeStalePages 统一清理。
     '--disable-session-crashed-bubble',
     '--restore-last-session=false',
+    process.env.CHATGPT_TEST_HOOKS === '1' && process.env.CHATGPT_TEST_HEADLESS === '1' ? '--headless=new' : null,
     BROWSER_PROFILE_DIRECTORY ? `--profile-directory=${BROWSER_PROFILE_DIRECTORY}` : null,
     Number.isFinite(BROWSER_DEBUG_PORT) && BROWSER_DEBUG_PORT > 0 ? `--remote-debugging-port=${BROWSER_DEBUG_PORT}` : null,
   ].filter(Boolean);
@@ -230,6 +316,35 @@ function browserProfileLooksLocked() {
   return ['lockfile', 'SingletonLock'].some(name => fs.existsSync(path.join(BROWSER_USER_DATA_DIR, name)));
 }
 
+function browserOwnerValue(value) {
+  if (!value || !Number.isInteger(value.debugPort) || value.debugPort <= 0 || !Number.isInteger(value.browserPid) || value.browserPid <= 0) return null;
+  // profile可能尚未创建；规范化绝对路径即可稳定比较，不能为验证ownership扫描任意browser进程。
+  return { profile: path.resolve(value.profile), debugPort: value.debugPort, browserPid: value.browserPid };
+}
+
+function browserOwnerMatches(value) {
+  // profile/port不足以排除端口被后来browser复用，PID单独又不足以排除PID重用。
+  // record缺失或损坏只失去close权限，不阻断shared连接，优先保护用户browser。
+  const expected = browserOwnerValue(value);
+  const actual = browserOwnerValue(readJSON(BROWSER_OWNER_FILE, null));
+  return !!expected && !!actual && expected.profile === actual.profile && expected.debugPort === actual.debugPort && expected.browserPid === actual.browserPid;
+}
+
+function writeBrowserOwner(value) {
+  const owner = browserOwnerValue(value);
+  if (!owner) throw new Error('Browser owner record is invalid');
+  // 此记录不含CDP地址或凭据，并独立于daemon.json，确保daemon崩溃后仍能验证同一browser所有权。
+  // 原子writeJSON防止异常退出留下半截三元组，损坏记录绝不能授予close权限。
+  writeJSON(BROWSER_OWNER_FILE, owner);
+}
+
+function deleteBrowserOwner(value) {
+  // compare-delete防止旧daemon关闭时删除后继browser刚写入的新ownership事实。
+  // mismatch保留记录供真实owner处理，不能把“删除失败”伪装成安全清理成功。
+  if (!browserOwnerMatches(value)) return;
+  try { fs.unlinkSync(BROWSER_OWNER_FILE); } catch {}
+}
+
 async function ensureDevtoolsEndpointReachable(browserURL) {
   // browserURL 模式下先做 TCP 探测；Puppeteer.connect 在 Windows 防火墙/无监听端口时可能拖到外层超时。
   const url = new URL(browserURL);
@@ -244,11 +359,31 @@ function withTimeout(promise, timeout, message) {
   ]).finally(() => clearTimeout(timer));
 }
 
-async function closeOwnedBrowser(browser, grace = 5_000) {
-  const child = browser.process?.(); // close可能挂住，必须在调用前保留唯一可安全kill的自有句柄。
+async function closeOwnedBrowser(browser, grace = 15_000) {
+  // graceful close保护profile持久状态；超时只断开，禁止child.kill破坏cookie写盘。
+  // close超时后保留browser供下一daemon重连，比强制结束后猜cookie是否落盘更安全。
+  // disconnect不是成功关闭；只有已验证owned的调用者才可compare-delete owner record。
+  const pid = await browserProcessID(browser).catch(() => null);
   try { await withTimeout(browser.close(), grace, 'Browser close timed out'); }
-  // 只使用launch返回的process handle；connect/spawn浏览器永远不会进入此helper。
-  catch { try { child?.kill(); } catch {} }
+  catch { browser.disconnect(); return false; }
+  // PID缺失时无法证明主进程已退出；即使协议close成功也保留owner record并禁止cold respawn。
+  if (!pid) return false;
+  // Browser.close响应只表示CDP接受命令；必须等主进程和profile lock都释放，才能删除ownership或cold start。
+  const deadline = Date.now() + grace;
+  let released = 0;
+  while (Date.now() < deadline) {
+    // Windows会在PID退出后短暂保留profile目录句柄；连续两次可写probe避免过早删除owner record。
+    released = !isProcessAlive(pid) && !browserProfileLooksLocked() && browserProfileWritable() ? released + 1 : 0;
+    if (released >= 2) return true;
+    await sleep(100);
+  }
+  return false;
+}
+
+function browserProfileWritable() {
+  const probe = path.join(BROWSER_USER_DATA_DIR, `.opencode-close-${process.pid}`);
+  try { fs.writeFileSync(probe, ''); fs.unlinkSync(probe); return true; }
+  catch { try { if (fs.existsSync(probe)) fs.unlinkSync(probe); } catch {} return false; }
 }
 
 // voice 转写的客户端断开检测:轮询 shouldCancel,断开时 reject 让 Promise.race 中止转写。
@@ -2114,6 +2249,36 @@ async function convergeBootstrapPage(page, timeoutMs = SESSION_PAGE_READY_TIMEOU
   throw Object.assign(new Error(`ChatGPT session page did not converge after one reload: ${second.kind}`), { code: 'SESSION_PAGE_DID_NOT_CONVERGE' });
 }
 
+async function acquireBootstrapBrowser(log) {
+  for (let coldRecovery = 0; coldRecovery < 2; coldRecovery++) {
+    log(`Acquiring browser lifecycle${coldRecovery ? ' after cold recovery' : ''}.`);
+    const acquired = await launchBrowser(log);
+    try {
+      log(`Browser acquired as ${acquired.ownedByDaemon ? 'owned' : 'shared'}; preparing bootstrap page.`);
+      const bootstrapPage = await withTimeout(prepareBootstrapPage(acquired.browser, !acquired.ownedByDaemon), SESSION_PAGE_READY_TIMEOUT_MS, 'Browser bootstrap page preparation timed out');
+      // cold spawn的blank在CDP ready后才进入网页bootstrap，避免直接URL启动的订阅首屏竞态。
+      if (!isOfficialChatGPTURL(bootstrapPage.url())) await bootstrapPage.goto(CHATGPT_URL, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+      log('Bootstrap page reached ChatGPT; checking session state.');
+      const startupReload = { remaining: 1 };
+      const initialFact = await convergeBootstrapPage(bootstrapPage, SESSION_PAGE_READY_TIMEOUT_MS, startupReload);
+      return { ...acquired, bootstrapPage, startupReload, initialFact };
+    } catch (error) {
+      const canRecoverCold = error.code === 'SESSION_PAGE_DID_NOT_CONVERGE' && acquired.ownedByDaemon && coldRecovery === 0;
+      // helper仍持有完整provenance；任意pre-ready失败都必须在这里收敛，不能等外层拿到成功结果后补偿。
+      if (!acquired.ownedByDaemon) acquired.browser.disconnect();
+      else {
+        const closed = await closeOwnedBrowser(acquired.browser);
+        // close未证明PID/profile释放时保留marker供后继daemon恢复；同进程cold会重新争用仍锁定profile。
+        if (!closed) throw error;
+        if (acquired.owner) deleteBrowserOwner(acquired.owner);
+      }
+      // 同一owner内只允许持续不收敛触发一次cold；其它错误关闭资源后仍原样失败。
+      if (!canRecoverCold) throw error;
+      log('Owned browser bootstrap did not converge; starting one cold recovery lifecycle.');
+    }
+  }
+}
+
 /**
  * 启动长期运行的 daemon 进程。
  *
@@ -2131,19 +2296,16 @@ async function startDaemonProcess() {
 
   log('Daemon starting...');
 
-  let browser, bootstrapPage;
-  // 任意 connect 路径都视为共享浏览器；即使端口由本配置指定，也不能证明其它 tab 归 daemon 所有。
-  const sharedBrowser = !!(BROWSER_WS_ENDPOINT || BROWSER_CDP_URL);
+  let browser, bootstrapPage, browserOwner;
+  let ownedByDaemon = false;
   try {
-    browser = await launchBrowser(log);
-    bootstrapPage = await prepareBootstrapPage(browser, sharedBrowser);
-    // 只导航到 chatgpt.com 首页（不导航到 project URL），避免未登录时触发 /auth/login 清除 cookie。
-    if (!isOfficialChatGPTURL(bootstrapPage.url())) {
-      await bootstrapPage.goto(CHATGPT_URL, { waitUntil: 'domcontentloaded', timeout: 45_000 });
-    }
-    // DOM adapter归一bootstrap与React事实；core只持有全startup唯一一次reload预算。
-    const startupReload = { remaining: 1 };
-    const initialFact = await convergeBootstrapPage(bootstrapPage, SESSION_PAGE_READY_TIMEOUT_MS, startupReload);
+    const acquired = await acquireBootstrapBrowser(log);
+    browser = acquired.browser;
+    browserOwner = acquired.owner;
+    ownedByDaemon = acquired.ownedByDaemon;
+    bootstrapPage = acquired.bootstrapPage;
+    const initialFact = acquired.initialFact;
+    const startupReload = acquired.startupReload;
     if (initialFact.kind === 'logged-out') {
       // 保持浏览器窗口打开让用户手动登录；Puppeteer 控制的浏览器可能被 Google OAuth 拒绝，
       // 邮箱/密码登录通常可用。Google 账户用户可关闭此窗口后运行 node chatgpt.js --login。
@@ -2155,7 +2317,7 @@ async function startDaemonProcess() {
         // browser.on('disconnected') 尚未注册（在 startup try 块之后才挂载），
         // 这里手动检测断连，避免用户关闭窗口后空转至超时。
         if (!browser.isConnected()) {
-          log('Startup error: Browser closed during login wait. Run: node chatgpt.js --login');
+          log('Startup error [LOGIN_REQUIRED]: Browser closed during login wait. Run: node chatgpt.js --login');
           return flushAndExit(1);
         }
         try {
@@ -2176,7 +2338,7 @@ async function startDaemonProcess() {
           // 页面导航中 evaluate 失败是正常的（OAuth 重定向会销毁 execution context）；
           // 只有 browser 真正断开才退出，其余异常继续等待下一轮检测。
           if (!browser.isConnected()) {
-            log('Startup error: Browser closed during login wait. Run: node chatgpt.js --login');
+            log('Startup error [LOGIN_REQUIRED]: Browser closed during login wait. Run: node chatgpt.js --login');
             return flushAndExit(1);
           }
           // 有界恢复已经证明页面持续不一致；继续循环只会违反一次reload不变量。
@@ -2184,10 +2346,12 @@ async function startDaemonProcess() {
         }
       }
       if (!loginConfirmed) {
-        log('Startup error: Login wait timed out after ' + LOGIN_WAIT_TIMEOUT_MS + 'ms. Log in to chatgpt.com in the browser window, or run: node chatgpt.js --login');
-        // CDP 连接模式下 disconnect 而非 close，避免杀掉用户已登录的浏览器窗口。
-        if (BROWSER_WS_ENDPOINT || BROWSER_CDP_URL) browser.disconnect();
-        else await closeOwnedBrowser(browser);
+        log('Startup error [LOGIN_REQUIRED]: Login wait timed out after ' + LOGIN_WAIT_TIMEOUT_MS + 'ms. Log in to chatgpt.com in the browser window, or run: node chatgpt.js --login');
+        if (!ownedByDaemon) browser.disconnect();
+        else {
+          const closed = await closeOwnedBrowser(browser);
+          if (closed && browserOwner) deleteBrowserOwner(browserOwner);
+        }
         return flushAndExit(1);
       }
       log('Login detected; continuing startup.');
@@ -2195,11 +2359,13 @@ async function startDaemonProcess() {
 
     log('Browser ready and logged in.');
   } catch (err) {
-    log(`Startup error: ${err.message}`);
+    log(`Startup error [${err.code === 'BROWSER_CONFIG' ? 'BROWSER_CONFIG' : 'BROWSER_STARTUP'}]: ${err.message}`);
     if (browser) {
-      // CDP 连接模式下 disconnect 而非 close，避免杀掉用户已登录的浏览器。
-      if (BROWSER_WS_ENDPOINT || BROWSER_CDP_URL) browser.disconnect();
-      else await closeOwnedBrowser(browser);
+      if (!ownedByDaemon) browser.disconnect();
+      else {
+        const closed = await closeOwnedBrowser(browser);
+        if (closed && browserOwner) deleteBrowserOwner(browserOwner);
+      }
     }
     // 外层 catch 同样需要刷盘后退出，否则启动期异常的日志可能丢失。
     return flushAndExit(1);
@@ -2213,7 +2379,7 @@ async function startDaemonProcess() {
 
   // 只有独占 launch profile 才能把未登记 tab 判为游离页；共享 CDP 下未登记恰恰代表用户所有。
   const STALE_PAGE_CLEANUP_INTERVAL_MS = 60_000;
-  const stalePageTimer = sharedBrowser ? null : setInterval(async () => {
+  const stalePageTimer = !ownedByDaemon ? null : setInterval(async () => {
     if (shuttingDown) return;
     try {
       const managedPages = new Set([bootstrapPage, ...runtime.managedPages()].filter(Boolean));
@@ -2240,10 +2406,12 @@ async function startDaemonProcess() {
     if (stalePageTimer) clearInterval(stalePageTimer);
     // browser disconnected 回调里不再 close browser：连接已断开，重复 close 只会制造无意义的协议错误。
     if (options.closeBrowser !== false) {
-      // CDP 连接模式下 disconnect 而非 close，避免 daemon 退出时杀掉用户已登录的浏览器，
-      // 导致 session cookie 丢失、下次启动需要重新登录。
-      if (BROWSER_WS_ENDPOINT || BROWSER_CDP_URL) browser.disconnect();
-      else await closeOwnedBrowser(browser);
+      // 关闭语义消费本次acquisition provenance，不能按配置URL猜测debug-port browser归属。
+      if (!ownedByDaemon) browser.disconnect();
+      else {
+        const closed = await closeOwnedBrowser(browser);
+        if (closed && browserOwner) deleteBrowserOwner(browserOwner);
+      }
     }
     process.exit(options.exitCode ?? 0);
   };
@@ -2422,7 +2590,7 @@ async function startDaemonProcess() {
 
 // 正常运行只暴露 daemon 入口；离线测试显式 opt-in 后才能访问无网络状态机 seam。
 module.exports = process.env.CHATGPT_TEST_HOOKS === '1'
-  ? { startDaemonProcess, testing: Object.freeze({ createDaemonRuntime, prepareBootstrapPage, convergeBootstrapPage, closeOwnedBrowser, installBrowserDisconnectHandler, resolveProject, ensureProjectHome, restoreSessionPage, rememberCurrentSessionUrl, readSessionEntry, markSessionPending, markSessionCompleted, markSessionLost, validateAskInput, validateVoiceInput, sendJSON, assistantTextAdvanced, runAsk, runVoiceRequest, requestHash, dom: CHATGPT_DOM }) }
+  ? { startDaemonProcess, testing: Object.freeze({ launchBrowser, acquireBootstrapBrowser, createDaemonRuntime, prepareBootstrapPage, convergeBootstrapPage, closeOwnedBrowser, installBrowserDisconnectHandler, browserOwnerMatches, writeBrowserOwner, deleteBrowserOwner, resolveProject, ensureProjectHome, restoreSessionPage, rememberCurrentSessionUrl, readSessionEntry, markSessionPending, markSessionCompleted, markSessionLost, validateAskInput, validateVoiceInput, sendJSON, assistantTextAdvanced, runAsk, runVoiceRequest, requestHash, dom: CHATGPT_DOM }) }
   : { startDaemonProcess };
 
 if (require.main === module) {

@@ -40,6 +40,71 @@ function stopDaemon() {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+function processAlive(pid) {
+  // 测试只探测自己记录的daemon PID；EPERM也视为存活，不能借故扩大到进程名扫描。
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+function privateMarkerEndpoint() {
+  // marker只含本机随机端口和CDP route，不含daemon bearer、cookie或页面bootstrap token。
+  const [port, route] = fs.readFileSync(path.join(stateDir(), 'profile', 'DevToolsActivePort'), 'utf8').trim().split(/\r?\n/);
+  return `ws://127.0.0.1:${port}${route}`;
+}
+
+async function markerReachable(endpoint) {
+  try { const browser = await puppeteer.connect({ browserWSEndpoint: endpoint, defaultViewport: null }); browser.disconnect(); return true; }
+  catch { return false; }
+}
+
+function configureIsolatedLifecycle(mode) {
+  // 随机state让production自然推导自己的default-private profile，避免显式profile覆盖误触用户登录目录。
+  // wrapper只替换DOM事实和已知文本，不替换daemon HTTP、browser acquisition、marker或shutdown路径。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `chatgpt-${mode}-`));
+  const wrapper = path.join(dir, 'daemon-wrapper.cjs');
+  process.env.CHATGPT_STATE_DIR = dir;
+  process.env.CHATGPT_SESSION_DIR = path.join(dir, 'sessions');
+  process.env.CHATGPT_VOICE_FILE_ROOTS = VOICE_ROOT;
+  process.env.CHATGPT_BROWSER_DEBUG_PORT = '0';
+  delete process.env.CHATGPT_BROWSER_CDP_URL;
+  delete process.env.CHATGPT_BROWSER_WS_ENDPOINT;
+  delete process.env.CHATGPT_BROWSER_USER_DATA_DIR;
+  // headless仅在既有test hooks双门禁下生效；真实daemon仍保持用户可接管的可见窗口。
+  process.env.CHATGPT_TEST_HOOKS = '1';
+  process.env.CHATGPT_TEST_HEADLESS = '1';
+  process.env.CHATGPT_DAEMON_INTERNAL_SCRIPT = wrapper;
+  // session目录与daemon state同属随机fixture；任何registry写入都不能进入用户级opencode数据目录。
+  fs.mkdirSync(process.env.CHATGPT_SESSION_DIR, { recursive: true });
+  fs.writeFileSync(wrapper, `
+    process.env.CHATGPT_TEST_HOOKS = '1';
+    const core = require(${JSON.stringify(path.join(SCRIPT_DIR, 'chatgpt-core.js'))});
+    ${mode === 'bootstrap-cold-recovery' ? `const fs = require('fs'), path = require('path'); let firstEndpoint;
+    core.testing.dom.sessionPageFact = async page => {
+      const endpoint = page.browser().wsEndpoint(); firstEndpoint ||= endpoint;
+      fs.writeFileSync(path.join(process.env.CHATGPT_STATE_DIR, endpoint === firstEndpoint ? 'first-endpoint.txt' : 'second-endpoint.txt'), endpoint);
+      return { kind: endpoint === firstEndpoint ? 'inconsistent' : 'authenticated', origin: 'https://chatgpt.com', readyState: 'complete' };
+    };` : `core.testing.dom.sessionPageFact = async () => ({ kind: 'authenticated', origin: 'https://chatgpt.com', readyState: 'complete' });`}
+    core.testing.dom.transcribeAudioFile = async () => 'isolated lifecycle';
+    core.startDaemonProcess();
+  `);
+  return dir;
+}
+
+async function cleanupIsolatedLifecycle(dir) {
+  // 先请求production stop；只有发现索引已消失时才用同一private marker补做CDP graceful close。
+  stopDaemon();
+  try {
+    // marker连接目标受随机state限定；读取失败时宁可保留目录报错，也不能探测其它本地DevTools端口。
+    const browser = await puppeteer.connect({ browserWSEndpoint: privateMarkerEndpoint(), defaultViewport: null });
+    await browser.close();
+  } catch {}
+  // Windows browser helper会在主进程退出后短暂持有profile文件；有界等待后再删除隔离state。
+  for (let attempt = 0; fs.existsSync(dir) && attempt < 50; attempt++) {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+    if (fs.existsSync(dir)) await sleep(200);
+  }
+  if (fs.existsSync(dir)) throw new Error(`isolated lifecycle state remained locked: ${dir}`);
+}
+
 // 压力参数保留命令行可调性，但非法值必须在启动浏览器前失败，避免无意义远端请求。
 // 省略参数沿用固定验收矩阵，保证本地和审计命令比较的是同一负载。
 function option(name, fallback) {
@@ -376,6 +441,51 @@ async function runProfileRestart() {
   stopDaemon();
 }
 
+// 只结束daemon进程并保留其default-private browser；下一CLI必须通过同一marker恢复而不是spawn另一profile。
+async function runDaemonCrashReconnect() {
+  const dir = configureIsolatedLifecycle('daemon-crash-reconnect');
+  try {
+    requireSuccess(await runCLI(['transcribe-file', '--file', TEST_WAV, '--json']), 'daemon-crash first voice', 'voice');
+    const first = daemonState();
+    const endpoint = privateMarkerEndpoint();
+    // 故障注入只结束daemon PID，Edge必须保持；这正是原始孤儿browser需要被后继owner重连的状态。
+    process.kill(first.pid, 'SIGKILL');
+    // SIGKILL只模拟daemon异常退出；browser进程从未接收信号，cookie/profile落盘仍由后续production stop负责。
+    for (let attempt = 0; attempt < 100 && processAlive(first.pid); attempt++) await sleep(50);
+    if (processAlive(first.pid)) throw new Error(`daemon ${first.pid} did not exit after crash injection`);
+    if (!await markerReachable(endpoint)) throw new Error('daemon crash unexpectedly closed its private browser');
+    requireSuccess(await runCLI(['transcribe-file', '--file', TEST_WAV, '--json']), 'daemon-crash recovered voice', 'voice');
+    // 第二次CLI输出文本证明完整daemon HTTP/voice route可用，单独marker connect不足以证明业务恢复。
+    const second = daemonState();
+    if (second.pid === first.pid) throw new Error('daemon crash recovery reused the exited daemon PID');
+    // endpoint相等直接证明后继daemon消费旧marker，没有用同profile另起第二browser。
+    if (privateMarkerEndpoint() !== endpoint) throw new Error('daemon crash recovery spawned a different private browser endpoint');
+    stopDaemon();
+    for (let attempt = 0; attempt < 100 && await markerReachable(endpoint); attempt++) await sleep(50);
+    if (await markerReachable(endpoint)) throw new Error('production stop left the reconnected private browser reachable');
+    console.log(`PASS daemon-crash-reconnect: firstDaemon=${first.pid} secondDaemon=${second.pid}`);
+  } finally { await cleanupIsolatedLifecycle(dir); }
+}
+
+// 首个private bootstrap持续不一致时，production owner必须graceful close并cold第二browser后完成同一voice调用。
+async function runBootstrapColdRecovery() {
+  const dir = configureIsolatedLifecycle('bootstrap-cold-recovery');
+  try {
+    requireSuccess(await runCLI(['transcribe-file', '--file', TEST_WAV, '--json']), 'bootstrap cold recovered voice', 'voice');
+    const first = fs.readFileSync(path.join(dir, 'first-endpoint.txt'), 'utf8');
+    const second = fs.readFileSync(path.join(dir, 'second-endpoint.txt'), 'utf8');
+    // 两个endpoint由DOM fact seam在真实browser lifecycle中发布；不同值证明graceful close后执行了同route cold。
+    if (first === second) throw new Error('bootstrap cold recovery reused the failed browser endpoint');
+    if (await markerReachable(first)) throw new Error('failed bootstrap browser remained reachable after cold recovery');
+    if (!await markerReachable(second)) throw new Error('replacement bootstrap browser is not reachable before stop');
+    // voice成功和两个endpoint事实共同排除“错误被吞后继续使用首browser”的catch-and-success实现。
+    stopDaemon();
+    for (let attempt = 0; attempt < 100 && await markerReachable(second); attempt++) await sleep(50);
+    if (await markerReachable(second)) throw new Error('production stop left the replacement browser reachable');
+    console.log('PASS bootstrap-cold-recovery: failed browser released and replacement voice succeeded');
+  } finally { await cleanupIsolatedLifecycle(dir); }
+}
+
 async function main() {
   fs.mkdirSync(VOICE_ROOT, { recursive: true });
   // 确保测试 WAV 存在
@@ -387,6 +497,8 @@ async function main() {
   if (process.argv.includes('--idle')) return runIdle();
   if (process.argv.includes('--browser-close')) return runBrowserClose();
   if (process.argv.includes('--profile-restart')) return runProfileRestart();
+  if (process.argv.includes('--daemon-crash-reconnect')) return runDaemonCrashReconnect();
+  if (process.argv.includes('--bootstrap-cold-recovery')) return runBootstrapColdRecovery();
 
   console.log('=== 定向鲁棒性测试 ===\n');
 

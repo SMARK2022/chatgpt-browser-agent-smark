@@ -778,7 +778,11 @@ function createChatGPTDom({ responseTimeout }) {
       const accessToken = bootstrap?.session?.accessToken;
       // 与网页SendIfAvailable的已登录分支保持一致；stable probe后凭据消失时必须在POST前停止。
       if (bootstrap?.authStatus !== 'logged_in' || typeof accessToken !== 'string' || !accessToken) {
-        throw new Error('Voice page does not expose an authenticated session');
+        // stable probe后token仍可能消失；这是确定性登录介入，不得借HTTP 500外壳进入四次重试。
+        // kind在页面owner原位产生，Node不接触token也无需从message猜认证状态。
+        const error = new Error('Voice page does not expose an authenticated session');
+        error.kind = 'auth';
+        throw error;
       }
       // base64 是从 Node 传入的音频字节；页面只看到 bytes/File，不知道本地绝对路径。
       const bytes = Uint8Array.from(atob(config.audioBase64), char => char.charCodeAt(0));
@@ -807,14 +811,27 @@ function createChatGPTDom({ responseTimeout }) {
       try { json = JSON.parse(body); }
       catch {}
       // HTTP失败多半是接口或鉴权漂移；抛错交给core诊断，不把错误转换成UI成功尝试。
-      if (!response.ok) throw new Error(`ChatGPT direct transcribe returned HTTP ${response.status}`);
+      if (!response.ok) {
+        const error = new Error(`ChatGPT direct transcribe returned HTTP ${response.status}`);
+        // HTTP status只在页面owner可见；在这里稳定分类，CLI无需解析可本地化的错误文案。
+        error.kind = response.status === 429 ? 'rate-limit' : response.status >= 500 ? 'server' : 'rejected';
+        throw error;
+      }
       // direct API 返回 200 但 text 为空字符串时，代表音频确实没有可识别的语音内容（例如纯静音或纯噪声）。
       // 空字符串是API对静音的合法结果；只有非JSON或缺text字段才是结构失败。
-      if (!json || typeof json.text !== 'string') throw new Error('ChatGPT direct transcribe returned invalid response');
+      if (!json || typeof json.text !== 'string') {
+        // 200但缺text是响应合同错误，不是瞬时transport；重复同一WAV不会修复确定性schema漂移。
+        // 独立kind保证CLI立即返回原错误，同时仍禁止第二parser或alternate endpoint。
+        const error = new Error('ChatGPT direct transcribe returned invalid response');
+        error.kind = 'response';
+        throw error;
+      }
       // elapsedMs 只用于本地诊断日志；不参与业务判断，避免慢网下误判为失败。
       return { ok: true, text: json.text, elapsedMs: Math.round(performance.now() - startedAt) }; // 页面只返回非敏感业务结果。
       } catch (error) {
-        return { ok: false, kind: request.cancelled ? 'cancelled' : error.name === 'AbortError' || error.name === 'TypeError' ? 'transport' : /origin/i.test(error.message) ? 'origin' : 'endpoint', message: error.message };
+        // producer kind优先于通用异常名；只有没有业务分类时才按transport/origin/unknown收敛。
+        // unknown endpoint故障fail closed，不因文案包含HTTP字样扩大retry集合。
+        return { ok: false, kind: request.cancelled ? 'cancelled' : error.kind || (error.name === 'AbortError' || error.name === 'TypeError' ? 'transport' : /origin/i.test(error.message) ? 'origin' : 'endpoint'), message: error.message };
       } finally {
         if (requests[config.requestID] === request) delete requests[config.requestID]; // compare-delete不能清掉同ID后继引用。
       }
@@ -831,7 +848,9 @@ function createChatGPTDom({ responseTimeout }) {
       requiredOrigin: 'https://chatgpt.com',
       requestID,
     });
-    if (!result.ok) throw Object.assign(new Error(result.message), { code: { cancelled: 'VOICE_CANCELLED', transport: 'VOICE_TRANSPORT', origin: 'VOICE_PAGE' }[result.kind] || 'VOICE_ENDPOINT' });
+    // code是Node/CLI唯一recoverability合同；错误正文只展示给用户，不参与重试决策。
+    // 映射保持一个direct adapter，不创建第二请求、第二鉴权或成功fallback。
+    if (!result.ok) throw Object.assign(new Error(result.message), { code: { cancelled: 'VOICE_CANCELLED', transport: 'VOICE_TRANSPORT', origin: 'VOICE_PAGE', 'rate-limit': 'VOICE_RATE_LIMIT', server: 'VOICE_SERVER', rejected: 'VOICE_REJECTED', auth: 'VOICE_AUTH_REQUIRED', response: 'VOICE_RESPONSE_INVALID' }[result.kind] || 'VOICE_ENDPOINT' });
     return result;
   }
 

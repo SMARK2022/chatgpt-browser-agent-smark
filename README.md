@@ -130,6 +130,15 @@ Connect mode treats the browser as shared: it creates a dedicated bootstrap tab 
 never adopts or closes pre-existing/untracked tabs. Launch mode owns its profile and
 may reclaim only pages created inside that dedicated browser process.
 
+The default state profile is daemon-private. Its `DevToolsActivePort` marker lets a
+new daemon reconnect after the previous daemon exits without closing the browser;
+only a missing browser triggers a cold start. Cold start opens an internal blank
+page until CDP is ready, then the single bootstrap owner navigates to ChatGPT.
+Normal owned shutdown uses CDP `Browser.close` and never force-kills Edge. A fixed
+`CHATGPT_BROWSER_DEBUG_PORT` preserves ownership across daemon crashes only when
+the current CDP browser PID, port, and profile match the daemon's private owner
+record; unknown endpoints remain shared and are never closed.
+
 `CHATGPT_SESSION_DIR` stores the internal global session registry keyed by short
 handles such as `#4fa92c9d10`. Entries include the ChatGPT conversation URL, Project
 metadata, timestamps, and pending recovery state. If omitted, the default
@@ -157,6 +166,7 @@ The state directory contains:
 ```text
 profile\       Dedicated browser profile
 projects.json  Resolved Project name/id/url cache
+browser-owner.json  PID/profile/port ownership for fixed-debug-port recovery
 daemon.json    Current daemon pid, port, and local bearer token
 daemon.log     Daemon startup/request logs
 ```
@@ -469,13 +479,14 @@ sends the web client's `SendIfAvailable` Bearer header together with same-origin
 cookies. The token is never returned to Node, status, or logs.
 
 The same-origin direct endpoint is the only transcription success path. HTTP,
-transport, origin, and response-shape failures return a diagnostic error instead of
+transport, origin, and response-shape failures never switch to another algorithm or
 opening the composer, installing a fake microphone, navigating, or bringing Edge to
-the foreground. An unstable borrowed or dedicated page may be replaced once before
-audio upload; audio is never resent after the direct POST may have started. If the
-browser disconnects, the current call is not retried; its
-daemon index is retired and the next independent invocation starts a fresh lifecycle.
-Shared-CDP shutdown only disconnects, while an owned launch may close its own browser.
+the foreground. One CLI transaction retries the same authenticated direct path up
+to three times after the initial attempt for rate-limit, server, transport, page,
+browser, or daemon runtime failures, with 1/2/4 second delays. Login, token,
+deterministic 4xx, invalid response, local input, and cancellation errors return
+immediately. Each daemon request settles or isolates its page before the next
+attempt. Shared-CDP shutdown only disconnects; owned browsers close gracefully.
 
 ## Concurrency
 
@@ -496,8 +507,9 @@ to recover the final response later.
 Voice direct uploads and ask composer acceptance also share one short submission
 queue. An ask releases it after the accepted user turn has a trusted `/c/...` URL,
 before assistant generation and artifact collection, so those longer waits remain
-concurrent. Cancellation before queue ownership performs no upload, and a failed
-submission still advances the queue without retrying audio or a prompt.
+concurrent. Cancellation before queue ownership performs no upload, and a failed submission
+still advances the queue before the CLI may start the next approved voice attempt.
+Ask prompts are never retried.
 
 Artifact downloads are serialized because Chrome's download directory is a
 browser-context side effect. This prevents sandbox files from different pages
