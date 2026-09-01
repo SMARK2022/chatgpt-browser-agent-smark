@@ -134,7 +134,16 @@ The default state profile is daemon-private. Its `DevToolsActivePort` marker let
 new daemon reconnect after the previous daemon exits without closing the browser;
 only a missing browser triggers a cold start. Cold start opens an internal blank
 page until CDP is ready, then the single bootstrap owner navigates to ChatGPT.
-Normal owned shutdown uses CDP `Browser.close` and never force-kills Edge. A fixed
+A marker whose endpoint is no longer reachable never aborts startup: the daemon
+records the private browser's main PID in `browser-pid.json` after every successful
+acquisition, and on reconnect failure it terminates a hung recorded browser only
+after verifying that the process command line still carries the daemon's own
+`--user-data-dir` (a reused PID is never touched), then clears stale
+`DevToolsActivePort`/`lockfile` leftovers and completes the cold spawn. Without a
+PID record the leftovers are treated as stale the same way.
+Normal owned shutdown uses CDP `Browser.close` and never force-kills Edge; the
+termination path above is reserved for browsers whose DevTools endpoint is already
+unreachable. A fixed
 `CHATGPT_BROWSER_DEBUG_PORT` preserves ownership across daemon crashes only when
 the current CDP browser PID, port, and profile match the daemon's private owner
 record; unknown endpoints remain shared and are never closed.

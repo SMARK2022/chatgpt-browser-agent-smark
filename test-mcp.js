@@ -47,8 +47,8 @@ let e2eSessionID = null; // E2E 测试间共享的 sessionID，避免每次都�
 async function main() {
   const PER_TEST_TIMEOUT = 60_000;
   const suiteStartedAt = Date.now();
-  // 真实private/shared/debug-port acquisition新增三次本地Edge启停；总预算只容纳测试进程，不改变单项60秒门禁。
-  const suiteDeadline = Date.now() + 240_000;
+  // 真实private/shared/debug-port acquisition与stale锁恢复新增五次本地Edge启停；总预算只容纳测试进程，不改变单项60秒门禁。
+  const suiteDeadline = Date.now() + 300_000;
   // 支持按名称运行单个测试：node test-mcp.js testE2EAskWithFileUpload
   const filter = process.argv.slice(2);
   const allTests = [
@@ -75,6 +75,8 @@ async function main() {
     ['testDebugPortOwnershipSurvivesDaemonCrash', () => testDebugPortOwnershipSurvivesDaemonCrash(), false],
     ['testBrowserSpawnFailureReturnsEarly', () => testBrowserSpawnFailureReturnsEarly(), false],
     ['testPrivateBrowserReconnectsMarker', () => testPrivateBrowserReconnectsMarker(), false],
+    ['testStalePrivateLockRecoversColdSpawn', () => testStalePrivateLockRecoversColdSpawn(), false],
+    ['testLegacyStaleMarkerWithoutPidRecord', () => testLegacyStaleMarkerWithoutPidRecord(), false],
     ['testExplicitBrowserConnectionIsShared', () => testExplicitBrowserConnectionIsShared(), false],
     ['testDebugPortAcquisitionProvenance', () => testDebugPortAcquisitionProvenance(), false],
     ['testPrivateBrowserRecoversBootstrapGracefully', () => testPrivateBrowserRecoversBootstrapGracefully(), false],
@@ -3040,6 +3042,97 @@ async function testPrivateBrowserReconnectsMarker() {
     const child = spawnSync(process.execPath, ['-e', script], { cwd: __dirname, encoding: 'utf8', timeout: 60_000, windowsHide: true, env: { ...BASE_ENV, CHATGPT_TEST_HOOKS: '1', CHATGPT_TEST_HEADLESS: '1', CHATGPT_BROWSER_PATH: browserPath, CHATGPT_STATE_DIR: dir, CHATGPT_SESSION_DIR: path.join(dir, 'sessions'), CHATGPT_BROWSER_DEBUG_PORT: '0' } });
     assert.strictEqual(child.status, 0, child.error?.stack || child.stderr || child.stdout);
   } finally { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); }
+}
+
+// 异常退出的private browser会残留DevToolsActivePort+lockfile；启动必须收敛stale现场后cold spawn新browser，而不是永久失败。
+async function testStalePrivateLockRecoversColdSpawn() {
+  const browserPath = findTestBrowserPath();
+  if (!browserPath) throw new SkipError('no local browser for stale private lock lifecycle');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-stale-private-lock-'));
+  const script = `
+    const assert = require('assert'); const fs = require('fs'); const path = require('path'); const { testing } = require('./chatgpt-core');
+    (async () => {
+      const first = await testing.launchBrowser(() => {});
+      assert.strictEqual(first.ownedByDaemon, true);
+      const endpoint = first.browser.wsEndpoint();
+      const pidFile = path.join(process.env.CHATGPT_STATE_DIR, 'browser-pid.json');
+      const pid = JSON.parse(fs.readFileSync(pidFile, 'utf8')).pid;
+      assert.ok(Number.isInteger(pid) && pid > 0, 'private acquisition must record the browser PID');
+      first.browser.disconnect();
+      // 模拟browser异常退出：强杀主进程，marker+lockfile残留，CDP端点随进程死亡。
+      process.kill(pid);
+      for (let i = 0; i < 100; i++) { try { process.kill(pid, 0); await new Promise(r => setTimeout(r, 100)); } catch { break; } }
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      assert.ok(fs.existsSync(path.join(process.env.CHATGPT_STATE_DIR, 'profile', 'DevToolsActivePort')), 'hard kill must leave the stale marker behind');
+      const second = await testing.launchBrowser(() => {});
+      assert.strictEqual(second.ownedByDaemon, true);
+      assert.notStrictEqual(second.browser.wsEndpoint(), endpoint, 'stale lock must trigger a fresh cold spawn, not a failed reconnect');
+      assert.strictEqual(await testing.closeOwnedBrowser(second.browser), true);
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    })().catch(error => { console.error(error.stack || error); process.exit(1); });
+  `;
+  try {
+    const child = spawnSync(process.execPath, ['-e', script], { cwd: __dirname, encoding: 'utf8', timeout: 90_000, windowsHide: true, env: { ...BASE_ENV, CHATGPT_TEST_HOOKS: '1', CHATGPT_TEST_HEADLESS: '1', CHATGPT_BROWSER_PATH: browserPath, CHATGPT_STATE_DIR: dir, CHATGPT_SESSION_DIR: path.join(dir, 'sessions'), CHATGPT_BROWSER_DEBUG_PORT: '0' } });
+    assert.strictEqual(child.status, 0, child.error?.stack || child.stderr || child.stdout);
+  } finally {
+    // red阶段也可能留下真实Edge；测试owner通过marker执行CDP close，绝不强杀或触碰用户profile。
+    try {
+      const markerPath = path.join(dir, 'profile', 'DevToolsActivePort');
+      if (fs.existsSync(markerPath)) {
+        const marker = fs.readFileSync(markerPath, 'utf8').trim().split(/\r?\n/);
+        const browser = await require('puppeteer-core').connect({ browserWSEndpoint: `ws://127.0.0.1:${marker[0]}${marker[1]}` });
+        await browser.close();
+      }
+    } catch {}
+    for (let attempt = 0; fs.existsSync(dir) && attempt < 50; attempt++) {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+      if (fs.existsSync(dir)) await new Promise(resolve => setTimeout(resolve, 200));
+    }
+    assert.strictEqual(fs.existsSync(dir), false, `stale private lock fixture profile remained locked: ${dir}`);
+  }
+}
+
+// 无PID记录的旧状态同样不能被stale锁短路：伪造指向死端口的marker+空lockfile后必须完成cold spawn。
+async function testLegacyStaleMarkerWithoutPidRecord() {
+  const browserPath = findTestBrowserPath();
+  if (!browserPath) throw new SkipError('no local browser for legacy stale marker lifecycle');
+  const port = await new Promise((resolve, reject) => {
+    const server = require('net').createServer();
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => { const value = server.address().port; server.close(() => resolve(value)); });
+  });
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-legacy-stale-marker-'));
+  const profile = path.join(dir, 'profile');
+  fs.mkdirSync(profile, { recursive: true });
+  // 伪造升级前的遗留状态：marker指向已无监听的端口、lockfile残留、没有browser-pid.json。
+  fs.writeFileSync(path.join(profile, 'DevToolsActivePort'), `${port}\n/devtools/browser/legacy-stale\n`);
+  fs.writeFileSync(path.join(profile, 'lockfile'), '');
+  const script = `
+    const assert = require('assert'); const { testing } = require('./chatgpt-core');
+    (async () => {
+      const acquired = await testing.launchBrowser(() => {});
+      assert.strictEqual(acquired.ownedByDaemon, true);
+      assert.strictEqual(await testing.closeOwnedBrowser(acquired.browser), true);
+    })().catch(error => { console.error(error.stack || error); process.exit(1); });
+  `;
+  try {
+    const child = spawnSync(process.execPath, ['-e', script], { cwd: __dirname, encoding: 'utf8', timeout: 90_000, windowsHide: true, env: { ...BASE_ENV, CHATGPT_TEST_HOOKS: '1', CHATGPT_TEST_HEADLESS: '1', CHATGPT_BROWSER_PATH: browserPath, CHATGPT_STATE_DIR: dir, CHATGPT_SESSION_DIR: path.join(dir, 'sessions'), CHATGPT_BROWSER_DEBUG_PORT: '0' } });
+    assert.strictEqual(child.status, 0, child.error?.stack || child.stderr || child.stdout);
+  } finally {
+    try {
+      const markerPath = path.join(dir, 'profile', 'DevToolsActivePort');
+      if (fs.existsSync(markerPath)) {
+        const marker = fs.readFileSync(markerPath, 'utf8').trim().split(/\r?\n/);
+        const browser = await require('puppeteer-core').connect({ browserWSEndpoint: `ws://127.0.0.1:${marker[0]}${marker[1]}` });
+        await browser.close();
+      }
+    } catch {}
+    for (let attempt = 0; fs.existsSync(dir) && attempt < 50; attempt++) {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+      if (fs.existsSync(dir)) await new Promise(resolve => setTimeout(resolve, 200));
+    }
+    assert.strictEqual(fs.existsSync(dir), false, `legacy stale marker fixture profile remained locked: ${dir}`);
+  }
 }
 
 // 显式WS endpoint无论profile路径如何都属于用户shared browser；daemon disconnect不能关闭外部browser。

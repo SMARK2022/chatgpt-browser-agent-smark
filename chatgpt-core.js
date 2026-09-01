@@ -61,6 +61,8 @@ const SESSION_INDEX_FILE = path.join(USER_DATA_DIR, 'sessions.json');
 const DAEMON_FILE      = path.join(STATE_DIR, 'daemon.json');
 const DAEMON_LOG       = path.join(STATE_DIR, 'daemon.log');
 const BROWSER_OWNER_FILE = path.join(STATE_DIR, 'browser-owner.json');
+// private-marker browser的定点恢复记录：只存CDP读到的主进程PID，marker失效时据此验证/清理残留锁。
+const PRIVATE_BROWSER_PID_FILE = path.join(STATE_DIR, 'browser-pid.json');
 const CHATGPT_URL      = 'https://chatgpt.com';
 const DEFAULT_PROJECT  = process.env.CHATGPT_PROJECT || process.env.CHATGPT_PROJECT_NAME || process.env.CHATGPT_PROJECT_URL || 'MCP';
 const DAEMON_VERSION   = 24;
@@ -138,11 +140,13 @@ async function launchBrowser(log = () => {}) {
     if (marker) {
       try {
         log('Reconnecting to daemon-owned browser from DevToolsActivePort');
-        return { browser: await connectBrowser({ browserWSEndpoint: marker }), ownedByDaemon: true, owner: null };
+        const browser = await connectBrowser({ browserWSEndpoint: marker });
+        await rememberPrivateBrowserPid(browser);
+        return { browser, ownedByDaemon: true, owner: null };
       } catch (error) {
-        // profile仍锁定时第二次spawn只会重复即时失败；保留旧browser供下一attempt继续恢复。
-        // lock只阻止破坏性重复启动，不能替代marker连接这个健康事实。
-        if (browserProfileLooksLocked()) throw Object.assign(error, { code: 'BROWSER_STARTUP' });
+        // marker端点不可达已证明该browser无法再被CDP接管；stale lockfile绝不能在此直接报错短路，
+        // 否则异常退出browser的残留锁会让所有后续启动永久失败。必须收敛现场后完整走cold spawn。
+        await recoverStalePrivateBrowser(error, log);
       }
     }
     assertBrowserExecutable();
@@ -152,6 +156,7 @@ async function launchBrowser(log = () => {}) {
     try { if (fs.existsSync(markerFile)) fs.unlinkSync(markerFile); } catch {}
     const spawnError = spawnBrowser(0, log);
     const browser = await Promise.race([connectPrivateMarker(), spawnError]);
+    await rememberPrivateBrowserPid(browser);
     return { browser, ownedByDaemon: true, owner: null };
   }
   if (BROWSER_CDP_URL) {
@@ -214,6 +219,77 @@ function readPrivateDevtoolsMarker() {
     if (!/^\d+$/.test(port) || !route?.startsWith('/')) return null;
     return `ws://127.0.0.1:${port}${route}`;
   } catch { return null; }
+}
+
+function readPrivateBrowserPid() {
+  // 只回读自己记录的PID事实；损坏/缺失按无记录处理，不猜端口也不做系统级进程扫描。
+  const value = readJSON(PRIVATE_BROWSER_PID_FILE, null);
+  return Number.isInteger(value?.pid) && value.pid > 0 ? value.pid : null;
+}
+
+async function rememberPrivateBrowserPid(browser) {
+  // CDP SystemInfo是browser自身报告的主进程PID；记录失败只损失下次挂起时的定点清理能力，
+  // 绝不能让一次成功的acquisition因为sidecar写盘问题而回滚。
+  try {
+    const pid = await browserProcessID(browser).catch(() => null);
+    if (pid) writeJSON(PRIVATE_BROWSER_PID_FILE, { pid });
+  } catch {}
+}
+
+function forgetPrivateBrowserPid() {
+  // verified close后记录已失效；删除失败无害，下次启动按PID不存活路径收敛。
+  try { fs.unlinkSync(PRIVATE_BROWSER_PID_FILE); } catch {}
+}
+
+function browserProcessCommandLine(pid) {
+  // 定点读取单个PID的命令行用于身份验证；读取失败返回null并按“无法证明”fail-safe。
+  try {
+    if (process.platform === 'win32') {
+      const output = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CommandLine`], { encoding: 'utf8', timeout: 5_000, windowsHide: true }).trim();
+      return output || null;
+    }
+    if (process.platform === 'darwin') return execFileSync('ps', ['-p', String(pid), '-o', 'command='], { encoding: 'utf8' }).trim() || null;
+    return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' ').trim() || null;
+  } catch { return null; }
+}
+
+function terminateProcessTree(pid) {
+  // 该browser的CDP已不可达，graceful close不再存在；结束整棵进程树防止renderer/helper残留占用profile。
+  try {
+    if (process.platform === 'win32') execFileSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', timeout: 15_000, windowsHide: true });
+    else process.kill(pid, 'SIGKILL');
+  } catch {}
+}
+
+async function waitForProcessExit(pid, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline && isProcessAlive(pid)) await sleep(100);
+}
+
+async function recoverStalePrivateBrowser(connectError, log) {
+  // marker连接失败只说明原browser不可达（ECONNREFUSED=已死，timeout=挂起）；调用方必须继续cold spawn。
+  // 用记录的PID做三态收敛：挂起的自有browser→结束进程树；PID被复用或已退出→锁必为残留；无记录→按stale清理。
+  log(`Private browser marker unreachable: ${connectError.message}`);
+  const pid = readPrivateBrowserPid();
+  if (pid && isProcessAlive(pid)) {
+    const commandLine = browserProcessCommandLine(pid);
+    // 命令行仍带本daemon的--user-data-dir才认定是自有browser；只看进程名无法排除PID复用撞上用户日常Edge。
+    if (commandLine && commandLine.toLowerCase().includes(`--user-data-dir=${BROWSER_USER_DATA_DIR}`.toLowerCase())) {
+      log(`Terminating hung private browser PID ${pid} before cold restart.`);
+      terminateProcessTree(pid);
+      await waitForProcessExit(pid, 15_000);
+    } else {
+      log(`Recorded PID ${pid} does not run this private profile; treating leftover locks as stale.`);
+    }
+  } else {
+    log(pid ? `Recorded private browser PID ${pid} has exited; clearing stale locks.` : 'No private browser PID record; clearing stale locks.');
+  }
+  // 三种收敛结果都无法证明仍有活browser持有profile；singleton锁与marker残留若不清除，
+  // 下一次spawn仍会被误判为profile占用而永久失败。
+  for (const name of ['DevToolsActivePort', 'lockfile', 'SingletonLock']) {
+    try { const file = path.join(BROWSER_USER_DATA_DIR, name); if (fs.existsSync(file)) fs.unlinkSync(file); } catch {}
+  }
+  forgetPrivateBrowserPid();
 }
 
 function assertBrowserExecutable() {
@@ -374,7 +450,7 @@ async function closeOwnedBrowser(browser, grace = 15_000) {
   while (Date.now() < deadline) {
     // Windows会在PID退出后短暂保留profile目录句柄；连续两次可写probe避免过早删除owner record。
     released = !isProcessAlive(pid) && !browserProfileLooksLocked() && browserProfileWritable() ? released + 1 : 0;
-    if (released >= 2) return true;
+    if (released >= 2) { forgetPrivateBrowserPid(); return true; }
     await sleep(100);
   }
   return false;
