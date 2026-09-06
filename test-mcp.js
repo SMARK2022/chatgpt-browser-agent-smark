@@ -69,6 +69,8 @@ async function main() {
     ['testVoiceRetriesRecoverableFailure', () => testVoiceRetriesRecoverableFailure(), false],
     ['testVoiceRetryCodes', () => testVoiceRetryCodes(), false],
     ['testVoiceDoesNotRetryDeterministicFailure', () => testVoiceDoesNotRetryDeterministicFailure(), false],
+    ['testAuthExportExportsLoggedInSession', () => testAuthExportExportsLoggedInSession(), false],
+    ['testAuthExportCliAgainstFakeDaemon', () => testAuthExportCliAgainstFakeDaemon(), false],
     ['testDaemonIdentityMismatchReconcilesCurrentDaemon', () => testDaemonIdentityMismatchReconcilesCurrentDaemon(), false],
     ['testDaemonIdentityMismatchFailsClosedWithoutChangedUsableState', () => testDaemonIdentityMismatchFailsClosedWithoutChangedUsableState(), false],
     ['testOwnedBrowserDisconnectLifecycle', () => testOwnedBrowserDisconnectLifecycle(), false],
@@ -3379,7 +3381,7 @@ async function withFakeDaemon(options) {
   // 每个用例独占 state dir 和 HTTP 端口，避免真实用户 daemon 或其它测试进程影响 browser health 判断。
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-daemon-health-'));
   fs.mkdirSync(path.join(dir, 'sessions'), { recursive: true });
-  const calls = { stop: 0, voice: 0, ask: 0 };
+  const calls = { stop: 0, voice: 0, ask: 0, authExport: 0 };
   // token/daemonID 是本地 daemon 协议的两个不同边界：ping 只看 daemonID，其它请求必须带 bearer token。
   const token = 'test-token';
   const daemonID = 'test-daemon';
@@ -3414,6 +3416,12 @@ async function withFakeDaemon(options) {
       }
       if (options.voiceResponse) return send(options.voiceResponse.status, options.voiceResponse.body);
       return send(500, { ok: false, error: 'stale voice endpoint called' });
+    }
+    if (req.method === 'POST' && req.url === '/auth/export') {
+      // authExport 计数兼做重试断言：确定性 400 只允许一次调用。
+      calls.authExport++;
+      if (options.authExportResponse) return send(options.authExportResponse.status, options.authExportResponse.body);
+      return send(500, { ok: false, error: 'stale auth export endpoint called' });
     }
     if (req.method === 'POST' && req.url === '/ask') {
       // ask 计数固定防回归：stale browser 不允许拿到用户 prompt，即使 fake daemon 还能 HTTP 响应。
@@ -3640,3 +3648,119 @@ main().catch(err => {
   console.error(err);
   process.exit(1);
 });
+
+// auth-export 是 TUI 私有 side-channel：导出必须复用 voice 页面所有权（与进行中的转写经 voice 锁串行），
+// 登录会话产出 slim cookie + bootstrap token；未登录返回确定性错误码而非重试。
+function testAuthExportExportsLoggedInSession() {
+  // 本机 Windows 宿主对 `node -e <本 fixture 脚本>` 的 argv 传输确定性失败（spawn 阶段 EPERM/
+  // 0xC0000142，与脚本逻辑无关：同内容落盘后以文件模式执行可跑通；更小/更大脚本 -e 均正常）。
+  // 因此这里沿用 runCoreFixture 的 env 语义，改为把 fixture 落盘后按文件 spawn；
+  // 子进程仍驱动真实 runAuthExport + 假 runtime/page，保持黑盒语义一致。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-auth-export-'));
+  try {
+    fs.mkdirSync(path.join(dir, 'sessions'), { recursive: true });
+    const voice = path.join(dir, 'voice.wav'); writeTinyWav(voice);
+    const fixture = path.join(dir, 'fixture.cjs');
+    fs.writeFileSync(fixture, String.raw`
+      const assert = require('assert');
+      const policy = require(${JSON.stringify(path.join(__dirname, 'chatgpt-project'))});
+      const { testing } = require(${JSON.stringify(path.join(__dirname, 'chatgpt-core'))});
+      const project = policy.parse('g-p-authexp1-mcp', 'MCP');
+      let evaluated = 0, detached = 0;
+      const page = {
+        current: 'about:blank', closed: false,
+        url() { return this.current; }, isClosed() { return this.closed; },
+        async goto(url) { this.current = url; }, async close() { this.closed = true; },
+        async evaluate() {
+          evaluated++;
+          // 生产代码在页面任务内读取 #client-bootstrap；fixture 直接返回登录会话事实。
+          if (this.current !== 'https://chatgpt.com') throw new Error('Voice page left the official ChatGPT origin');
+          return { origin: 'https://chatgpt.com', authStatus: 'logged_in', accessToken: 'tok-1' };
+        },
+        async createCDPSession() {
+          return {
+            async send(method, params) {
+              assert.strictEqual(method, 'Network.getCookies');
+              assert.deepStrictEqual(params, { urls: ['https://chatgpt.com'] });
+              // CDP 协议真实形态是 { cookies: [...] }；stub 必须镜像协议，否则会掩盖生产解构错误。
+              return { cookies: [
+                { name: '__Secure-next-auth.session-token', value: 'sess', domain: '.chatgpt.com', path: '/', expires: 1_900_000, httpOnly: true, secure: true, sameSite: 'Lax' },
+                { name: 'oai-did', value: 'did', domain: '.chatgpt.com', path: '/', expires: -1, httpOnly: false, secure: true },
+              ] };
+            },
+            async detach() { detached++; },
+          };
+        },
+      };
+      const runtime = testing.createDaemonRuntime({ browser: { isConnected: () => true, newPage: async () => page }, bootstrapPage: null, project });
+      testing.dom.sessionPageFact = async () => ({ kind: 'authenticated', origin: 'https://chatgpt.com', readyState: 'complete' });
+      let releaseVoice;
+      const voiceGate = new Promise(resolve => { releaseVoice = resolve; });
+      let voiceStartedResolve;
+      const voiceStarted = new Promise(resolve => { voiceStartedResolve = resolve; });
+      (async () => {
+        testing.dom.transcribeAudioFile = async () => { voiceStartedResolve(); await voiceGate; return 'voice text'; };
+        const voicePromise = testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, () => false);
+        await voiceStarted;
+        const exportPromise = testing.runAuthExport(runtime);
+        await new Promise(resolve => setImmediate(resolve));
+        // evaluated 计数锁定导出在 voice 释放前零页面动作，不能与转写并发操作同一页面域。
+        assert.strictEqual(evaluated, 0, 'auth export must wait behind the active voice lease');
+        releaseVoice();
+        await voicePromise;
+        const exported = await exportPromise;
+        assert.strictEqual(exported.ok, true);
+        assert.strictEqual(exported.authStatus, 'logged_in');
+        assert.strictEqual(exported.accessToken, 'tok-1');
+        assert.deepStrictEqual(exported.cookies, [
+          { name: '__Secure-next-auth.session-token', value: 'sess', domain: '.chatgpt.com', path: '/', expires: 1_900_000, httpOnly: true, secure: true, sameSite: 'Lax' },
+          { name: 'oai-did', value: 'did', domain: '.chatgpt.com', path: '/', expires: -1, httpOnly: false, secure: true, sameSite: undefined },
+        ]);
+        assert.ok(exported.fetchedAt, 'export must carry a fetchedAt timestamp');
+        assert.strictEqual(detached, 1, 'CDP session must be detached after the export');
+        // 未登录是确定性介入：换页 evaluate 直接返回 logged_out，锁定结构化错误码而非 5xx 外壳。
+        page.evaluate = async () => ({ origin: 'https://chatgpt.com', authStatus: 'logged_out', accessToken: null });
+        await assert.rejects(() => testing.runAuthExport(runtime), err => err.code === 'AUTH_EXPORT_LOGIN_REQUIRED');
+      })().catch(error => { console.error(error.stack || error); process.exit(1); });
+    `);
+    const child = spawnSync(process.execPath, [fixture], { cwd: __dirname, encoding: 'utf8', timeout: 8_000, windowsHide: true, env: { ...BASE_ENV, CHATGPT_TEST_HOOKS: '1', CHATGPT_VOICE_FILE_ROOTS: dir, CHATGPT_STATE_DIR: dir, CHATGPT_SESSION_DIR: path.join(dir, 'sessions') } });
+    assert.strictEqual(child.status, 0, child.error?.stack || child.stderr || child.stdout);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+// CLI 黑盒：auth-export --json 输出完整凭据（opencode 收割入口），默认摘要不泄漏 token；
+// 登录介入错误（400 + AUTH_EXPORT_LOGIN_REQUIRED）单次失败退出，不重试。
+async function testAuthExportCliAgainstFakeDaemon() {
+  const daemon = await withFakeDaemon({
+    browserConnected: true,
+    authExportResponse: { status: 200, body: { ok: true, authStatus: 'logged_in', accessToken: 'secret-access-token-9f', cookies: [{ name: 'a', value: '1', expires: -1 }], fetchedAt: '2026-09-06T00:00:00.000Z' } },
+  });
+  // 独立 daemon 实例隔离 400 响应，避免与 200 用例共享调用计数。
+  const loggedOut = await withFakeDaemon({
+    browserConnected: true,
+    authExportResponse: { status: 400, body: { ok: false, code: 'AUTH_EXPORT_LOGIN_REQUIRED', error: 'ChatGPT page is not logged in' } },
+  });
+  try {
+    const harvested = await runChatgptCLI(['auth-export', '--json'], daemon.env, 15_000);
+    assert.strictEqual(harvested.status, 0, harvested.stderr);
+    const parsed = JSON.parse(harvested.stdout.trim());
+    assert.strictEqual(parsed.accessToken, 'secret-access-token-9f');
+    assert.strictEqual(parsed.authStatus, 'logged_in');
+    assert.strictEqual(parsed.cookies.length, 1);
+    assert.strictEqual(daemon.calls.authExport, 1);
+
+    // 摘要包含 token_expires 字段但不包含 token 本体：'secret-access-token-9f' 是唯一指纹。
+    const summary = await runChatgptCLI(['auth-export'], daemon.env, 15_000);
+    assert.strictEqual(summary.status, 0, summary.stderr);
+    assert.ok(!summary.stdout.includes('secret-access-token-9f'), 'human summary must not leak the access token');
+    assert.match(summary.stdout, /status=logged_in cookies=1/);
+
+    const rejected = await runChatgptCLI(['auth-export', '--json'], loggedOut.env, 15_000);
+    assert.strictEqual(rejected.status, 1);
+    assert.match(rejected.stderr, /not logged in/);
+    assert.strictEqual(loggedOut.calls.authExport, 1, 'AUTH_EXPORT_LOGIN_REQUIRED must not be retried');
+  } finally {
+    await daemon.close();
+    await loggedOut.close();
+  }
+}

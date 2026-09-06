@@ -1954,6 +1954,58 @@ async function runVoiceRequest(runtime, input, log, isClientClosed) {
   }
 }
 
+// 凭据导出是 TUI 私有 side-channel（同 /voice/transcribe-file 语义）：
+// 复用 voice 页面所有权模型，把 bootstrap token 与 HttpOnly cookie 导出给本机调用方。
+// token/cookie 值只进入 HTTP 响应体，永不写入 daemon 日志。
+async function runAuthExport(runtime) {
+  let lease;
+  const operation = runtime.withVoice(async () => {
+    // 导出与转写共享 voice 锁和提交队列：不能与 voice/ask 的页面事务并发操作同一页面域。
+    return runtime.withSubmission(async () => {
+      lease = await runtime.voiceLease();
+      const page = lease.page;
+      // 页面任务内部检查 origin：Node 侧 url() 与 evaluate 之间存在导航竞态。
+      const fact = await page.evaluate(() => {
+        const node = document.querySelector('#client-bootstrap');
+        const bootstrap = node ? JSON.parse(node.textContent || 'null') : null;
+        return {
+          origin: location.origin,
+          authStatus: bootstrap ? bootstrap.authStatus : null,
+          accessToken: (bootstrap && bootstrap.session && bootstrap.session.accessToken) || null,
+        };
+      });
+      if (fact.origin !== CHATGPT_URL || fact.authStatus !== 'logged_in' || typeof fact.accessToken !== 'string' || !fact.accessToken) {
+        // 登录介入是确定性错误：不能借 HTTP 500 外壳进入 CLI 的可重试集合（同 VOICE_AUTH 语义）。
+        throw Object.assign(new Error('ChatGPT page is not logged in'), { code: 'AUTH_EXPORT_LOGIN_REQUIRED' });
+      }
+      const cdp = await page.createCDPSession();
+      // CDP 可读 HttpOnly 会话 cookie；这是导出存在的唯一理由（页面 JS 拿不到它们）。
+      const result = await cdp.send('Network.getCookies', { urls: [CHATGPT_URL] });
+      await cdp.detach();
+      // CDP 协议返回 { cookies: [...] }；形状漂移 fail-closed，不猜第二种结构。
+      if (!result || typeof result !== 'object' || !Array.isArray(result.cookies)) {
+        throw Object.assign(new Error('CDP cookie export returned an unexpected shape'), { code: 'AUTH_EXPORT_CDP_SHAPE' });
+      }
+      // slim 形状与 opencode 侧 authFromHarvest 一一对应；expires 保留 CDP 原值（-1 会话 cookie 由 opencode 归零）。
+      const slim = result.cookies.map(c => ({
+        name: c.name, value: c.value, domain: c.domain, path: c.path,
+        expires: typeof c.expires === 'number' ? c.expires : 0,
+        httpOnly: !!c.httpOnly, secure: !!c.secure, sameSite: c.sameSite || undefined,
+      }));
+      return { ok: true, authStatus: fact.authStatus, accessToken: fact.accessToken, cookies: slim, fetchedAt: new Date().toISOString() };
+    });
+  });
+  try {
+    const result = await operation;
+    lease.release();
+    return result;
+  } catch (err) {
+    // 读取类失败后页面健康度未知：退役页面，下次导出/转写只认领新页；导出绝不重试第二算法。
+    if (lease) await lease.discard().catch(() => {});
+    throw err;
+  }
+}
+
 // ─── Ask Flow ────────────────────────────────────────────────────────────────
 
 /**
@@ -2542,6 +2594,19 @@ async function startDaemonProcess() {
       return;
     }
 
+    if (req.method === 'POST' && req.url === '/auth/export') {
+      // 无请求体：导出只读取当前登录会话，不接受任何调用方提供的路径或凭据。
+      try {
+        const result = await runAuthExport(runtime);
+        send(200, result);
+      } catch (err) {
+        log(`Error: ${err.message}`);
+        // 400 登录介入不进 CLI 重试集合；browser 生命周期错误走 503 让 CLI 淘汰 stale daemon。
+        send(err.code === 'AUTH_EXPORT_LOGIN_REQUIRED' ? 400 : err.code === 'BROWSER_DISCONNECTED' ? 503 : 500, { ok: false, ...(err.code ? { code: err.code } : {}), error: err.message });
+      }
+      return;
+    }
+
     if (req.method === 'POST' && req.url === '/ask') {
       const chunks = [];
       let bytes = 0;
@@ -2666,7 +2731,7 @@ async function startDaemonProcess() {
 
 // 正常运行只暴露 daemon 入口；离线测试显式 opt-in 后才能访问无网络状态机 seam。
 module.exports = process.env.CHATGPT_TEST_HOOKS === '1'
-  ? { startDaemonProcess, testing: Object.freeze({ launchBrowser, acquireBootstrapBrowser, createDaemonRuntime, prepareBootstrapPage, convergeBootstrapPage, closeOwnedBrowser, installBrowserDisconnectHandler, browserOwnerMatches, writeBrowserOwner, deleteBrowserOwner, resolveProject, ensureProjectHome, restoreSessionPage, rememberCurrentSessionUrl, readSessionEntry, markSessionPending, markSessionCompleted, markSessionLost, validateAskInput, validateVoiceInput, sendJSON, assistantTextAdvanced, runAsk, runVoiceRequest, requestHash, dom: CHATGPT_DOM }) }
+  ? { startDaemonProcess, testing: Object.freeze({ launchBrowser, acquireBootstrapBrowser, createDaemonRuntime, prepareBootstrapPage, convergeBootstrapPage, closeOwnedBrowser, installBrowserDisconnectHandler, browserOwnerMatches, writeBrowserOwner, deleteBrowserOwner, resolveProject, ensureProjectHome, restoreSessionPage, rememberCurrentSessionUrl, readSessionEntry, markSessionPending, markSessionCompleted, markSessionLost, validateAskInput, validateVoiceInput, sendJSON, assistantTextAdvanced, runAsk, runVoiceRequest, runAuthExport, requestHash, dom: CHATGPT_DOM }) }
   : { startDaemonProcess };
 
 if (require.main === module) {

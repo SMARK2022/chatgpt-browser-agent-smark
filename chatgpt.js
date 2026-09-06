@@ -657,10 +657,14 @@ function projectURL(value) {
 function parseArgs(argv) {
   // 参数解析只做机械映射，不做业务校验；真正的会话、上传和保存策略由 daemon 统一判断。
   const args = argv.slice(2);
-  const opts = { login: false, file: null, upload: [], git: false, context: null, stop: false, status: false, raw: false, json: false, saveToFile: false, sessionID: null, newSession: false, daemonInternal: false, transcribeFile: false, cwd: null, workspace: null, requestJSON: null, mode: null, imageAspectRatio: null, prompt: [] };
+  const opts = { login: false, file: null, upload: [], git: false, context: null, stop: false, status: false, raw: false, json: false, saveToFile: false, sessionID: null, newSession: false, daemonInternal: false, transcribeFile: false, authExport: false, cwd: null, workspace: null, requestJSON: null, mode: null, imageAspectRatio: null, prompt: [] };
   let i = 0;
   if (args[0] === 'transcribe-file') {
     opts.transcribeFile = true;
+    i = 1;
+  }
+  if (args[0] === 'auth-export') {
+    opts.authExport = true;
     i = 1;
   }
   const value = flag => {
@@ -777,6 +781,7 @@ Usage:
   node chatgpt.js --context "we use Effect v4" "prompt" # inline context
   node chatgpt.js --mode image --image-aspect-ratio wide "prompt"
   node chatgpt.js transcribe-file --file <wav> --json # private TUI voice transcription
+  node chatgpt.js auth-export --json                  # private TUI voice credential harvest
   node chatgpt.js --request-json -                       # internal MCP payload mode over stdin
   cat error.log | node chatgpt.js "what is wrong"       # pipe input
   node chatgpt.js --status                              # check if daemon is running
@@ -787,8 +792,8 @@ Usage:
 /**
  * CLI 的唯一入口。
  *
- * 这里故意保持线性分支：daemon internal、login、stop、status、transcribe、ask。
- * stop/status 是生命周期诊断，transcribe 是 TUI 私有 side-channel；只有 ask 才发送 prompt。
+ * 这里故意保持线性分支：daemon internal、login、stop、status、transcribe、auth-export、ask。
+ * stop/status 是生命周期诊断，transcribe 和 auth-export 是 TUI 私有 side-channel；只有 ask 才发送 prompt。
  */
 async function main(argv = process.argv) {
   const opts = parseArgs(argv);
@@ -858,6 +863,47 @@ async function main(argv = process.argv) {
       if (!result) throw lastError;
       if (opts.json) console.log(JSON.stringify({ text: result.text || '' }));
       else console.log(result.text || '');
+    } catch (err) {
+      console.error('[ERROR]', err.message);
+      process.exit(1);
+    }
+    return;
+  }
+
+  if (opts.authExport) {
+    try {
+      let result, lastError;
+      // 导出复用 transcribe-file 同款 daemon 生命周期重试：browser/daemon 失效自恢复，确定性错误立即失败。
+      // VOICE_HTTP_TIMEOUT 覆盖页面收敛+导出；daemon 冷启动总预算由 opencode 侧收割 spawn 的 240s 承担。
+      for (let attempt = 0; attempt < 4; attempt++) {
+        let daemon;
+        try {
+          daemon = await ensureDaemon();
+          result = await httpJSON(daemon, 'POST', '/auth/export', {}, VOICE_HTTP_TIMEOUT);
+          if (!result.ok) throw Object.assign(new Error(result.error || 'Daemon returned an error'), { code: result.code });
+          break;
+        } catch (error) {
+          lastError = error;
+          if (daemon && ['BROWSER_DISCONNECTED', 'BROWSER_STARTUP', 'VOICE_RUNTIME_FATAL'].includes(error.code)) await retireDaemon(daemon);
+          if (error.code === 'DAEMON_IDENTITY_MISMATCH' && (!daemon || !await daemonIdentityChangedToUsable(daemon))) throw error;
+          // AUTH_EXPORT_LOGIN_REQUIRED 带结构化 code，不进 voiceErrorIsRetryable 封闭集合，立即上抛。
+          if (attempt === 3 || (error.code !== 'DAEMON_IDENTITY_MISMATCH' && !voiceErrorIsRetryable(error))) throw error;
+          await sleep([1_000, 2_000, 4_000][attempt]);
+        }
+      }
+      if (!result) throw lastError;
+      if (opts.json) {
+        // --json 供 opencode 收割消费：完整凭据只经 stdout 返回，不落日志或 argv。
+        console.log(JSON.stringify({ authStatus: result.authStatus, accessToken: result.accessToken, cookies: result.cookies, fetchedAt: result.fetchedAt }));
+      } else {
+        // 人类可读摘要永不包含凭据本体；token 过期时间从 JWT exp 本地解出。
+        const payload = String(result.accessToken || '').split('.')[1];
+        let expiresText = 'unknown';
+        if (payload) {
+          try { const exp = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')).exp; if (exp) expiresText = new Date(exp * 1000).toISOString(); } catch {}
+        }
+        console.log(`auth: status=${result.authStatus} cookies=${(result.cookies || []).length} token_expires=${expiresText}`);
+      }
     } catch (err) {
       console.error('[ERROR]', err.message);
       process.exit(1);
