@@ -36,8 +36,8 @@ const STATE_DIR = path.resolve(process.env.CHATGPT_STATE_DIR || defaultStateDir(
 const PROFILE_DIR = path.join(STATE_DIR, 'profile');
 const BROWSER_USER_DATA_DIR = path.resolve(process.env.CHATGPT_BROWSER_USER_DATA_DIR || PROFILE_DIR);
 const BROWSER_PROFILE_DIRECTORY = process.env.CHATGPT_BROWSER_PROFILE_DIRECTORY || '';
-// 默认 0（禁用）：不走 spawn+connect 路径，直接用 puppeteer.launch 启动浏览器。
-// 和 chatgpt-core.js 保持一致；默认 9222 会导致每次启动走脆弱的 spawn+poll+connect 路径。
+// 默认 0（不固定）：core会为私有冷启动申请随机非零回环CDP端口；这里只保留显式固定端口配置。
+// 非零端口避免Chromium把 --remote-debugging-port=0 暴露为 navigator.webdriver=true。
 const BROWSER_DEBUG_PORT = Number.parseInt(process.env.CHATGPT_BROWSER_DEBUG_PORT || '0', 10);
 const BROWSER_CDP_URL = process.env.CHATGPT_BROWSER_CDP_URL || (Number.isFinite(BROWSER_DEBUG_PORT) && BROWSER_DEBUG_PORT > 0 ? `http://127.0.0.1:${BROWSER_DEBUG_PORT}` : '');
 const BROWSER_WS_ENDPOINT = process.env.CHATGPT_BROWSER_WS_ENDPOINT || '';

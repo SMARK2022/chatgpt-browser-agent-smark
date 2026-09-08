@@ -64,7 +64,7 @@ Runtime behavior is controlled by environment variables:
 CHATGPT_BROWSER_PATH              Browser executable path
 CHATGPT_BROWSER_USER_DATA_DIR     Browser user-data dir to reuse an existing logged-in profile
 CHATGPT_BROWSER_PROFILE_DIRECTORY Browser profile name inside the user-data dir, for example Default
-CHATGPT_BROWSER_DEBUG_PORT        Optional DevTools port for reusing/launching a debuggable browser
+CHATGPT_BROWSER_DEBUG_PORT        Optional fixed DevTools port; omit or set 0 for a random local port
 CHATGPT_BROWSER_CDP_URL           Optional http://127.0.0.1:<port> DevTools endpoint to connect
 CHATGPT_BROWSER_WS_ENDPOINT       Optional websocket DevTools endpoint to connect
 CHATGPT_BROWSER_CONNECT_TIMEOUT_MS DevTools connect preflight timeout, default 3000
@@ -122,25 +122,33 @@ be repaired by name, because its URL slug is not treated as a verified display n
 Browser reuse has two modes. If an existing Edge/Chrome was started with a DevTools
 port, set `CHATGPT_BROWSER_CDP_URL`, `CHATGPT_BROWSER_WS_ENDPOINT`, or
 `CHATGPT_BROWSER_DEBUG_PORT` and the daemon connects to that browser. A normal
-already-running Edge window cannot be attached after the fact by Puppeteer. To reuse
-the normal Edge login state without a DevTools port, set `CHATGPT_BROWSER_USER_DATA_DIR`
-and `CHATGPT_BROWSER_PROFILE_DIRECTORY`; Chromium may require closing the regular
-Edge process using that profile before the daemon can launch a controlled window.
+already-running Edge window cannot be attached after the fact by Puppeteer. For a
+daemon-managed profile, omit `CHATGPT_BROWSER_DEBUG_PORT` (or set it to `0`): the
+daemon starts a normal visible Edge process with a random nonzero loopback port, saves
+that port in its private state sidecar, then attaches through CDP. This avoids
+Chromium's special `--remote-debugging-port=0` automation marker while retaining
+persistent cookies across daemon restarts and computer reboots. To reuse a normal
+Edge login state without a fixed DevTools port,
+set `CHATGPT_BROWSER_USER_DATA_DIR` and `CHATGPT_BROWSER_PROFILE_DIRECTORY`; Chromium
+may require closing the regular Edge process using that profile before the daemon can
+launch a controlled window.
 Connect mode treats the browser as shared: it creates a dedicated bootstrap tab and
 never adopts or closes pre-existing/untracked tabs. Launch mode owns its profile and
-may reclaim only pages created inside that dedicated browser process.
+may reclaim only pages created inside that dedicated browser process. In both private
+and externally configured profile modes, the browser is started by the normal Edge or
+Chrome executable and then attached through CDP; Puppeteer does not launch the login
+browser.
 
-The default state profile is daemon-private. Its `DevToolsActivePort` marker lets a
+The default state profile is daemon-private. Its `browser-port.json` sidecar lets a
 new daemon reconnect after the previous daemon exits without closing the browser;
-only a missing browser triggers a cold start. Cold start opens an internal blank
-page until CDP is ready, then the single bootstrap owner navigates to ChatGPT.
-A marker whose endpoint is no longer reachable never aborts startup: the daemon
-records the private browser's main PID in `browser-pid.json` after every successful
-acquisition, and on reconnect failure it terminates a hung recorded browser only
-after verifying that the process command line still carries the daemon's own
-`--user-data-dir` (a reused PID is never touched), then clears stale
-`DevToolsActivePort`/`lockfile` leftovers and completes the cold spawn. Without a
-PID record the leftovers are treated as stale the same way.
+older profiles can still reconnect through `DevToolsActivePort`. Only a missing
+browser triggers a cold start. Cold start opens an internal blank page until CDP is
+ready, then the single bootstrap owner navigates to ChatGPT. An endpoint whose
+browser is no longer reachable never aborts startup: the daemon records the private
+browser's main PID in `browser-pid.json` after every successful acquisition, verifies
+the PID command line still carries the daemon's own `--user-data-dir` (a reused PID
+is never touched), clears stale sidecars/lock leftovers, and completes the cold spawn.
+Without a PID record the leftovers are treated as stale the same way.
 Normal owned shutdown uses CDP `Browser.close` and never force-kills Edge; the
 termination path above is reserved for browsers whose DevTools endpoint is already
 unreachable. A fixed

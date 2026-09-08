@@ -13,7 +13,7 @@
 
 const assert = require('assert');
 const crypto = require('crypto');
-const { spawn, spawnSync } = require('child_process');
+const { execFileSync, spawn, spawnSync } = require('child_process');
 const fs = require('fs');
 const http = require('http');
 const os = require('os');
@@ -26,7 +26,7 @@ const BASE_ENV = {
   CHATGPT_WORKSPACE_DIR: process.cwd(),
   CHATGPT_ASK_HTTP_TIMEOUT_MS: '5000',
   CHATGPT_CLI_TIMEOUT_MS: '6000',
-  // 测试不连接真实浏览器；显式禁用 CDP 端口，与生产默认值 0 保持一致。
+  // 测试不连接用户浏览器；值0表示不使用固定端口，生产代码会为每次私有冷启动分配随机非零端口。
   CHATGPT_BROWSER_DEBUG_PORT: '0',
 };
 
@@ -76,6 +76,8 @@ async function main() {
     ['testOwnedBrowserDisconnectLifecycle', () => testOwnedBrowserDisconnectLifecycle(), false],
     ['testDebugPortOwnershipSurvivesDaemonCrash', () => testDebugPortOwnershipSurvivesDaemonCrash(), false],
     ['testBrowserSpawnFailureReturnsEarly', () => testBrowserSpawnFailureReturnsEarly(), false],
+    ['testPrivateBrowserDoesNotExposeAutomationFlag', () => testPrivateBrowserDoesNotExposeAutomationFlag(), false],
+    ['testViewportResyncClearsStaleLayoutSize', () => testViewportResyncClearsStaleLayoutSize(), false],
     ['testPrivateBrowserReconnectsMarker', () => testPrivateBrowserReconnectsMarker(), false],
     ['testStalePrivateLockRecoversColdSpawn', () => testStalePrivateLockRecoversColdSpawn(), false],
     ['testLegacyStaleMarkerWithoutPidRecord', () => testLegacyStaleMarkerWithoutPidRecord(), false],
@@ -3021,6 +3023,89 @@ async function testBrowserSpawnFailureReturnsEarly() {
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 }
 
+// 真实可见Edge必须使用非零CDP端口；端口0会让Chromium把navigator.webdriver暴露为true。
+async function testPrivateBrowserDoesNotExposeAutomationFlag() {
+  const browserPath = findTestBrowserPath();
+  if (!browserPath) throw new SkipError('no local browser for automation marker lifecycle');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-automation-marker-'));
+  const script = `
+    const assert = require('assert'); const fs = require('fs'); const path = require('path');
+    const { testing } = require('./chatgpt-core');
+    (async () => {
+      const acquired = await testing.launchBrowser(() => {});
+      const port = JSON.parse(fs.readFileSync(path.join(process.env.CHATGPT_STATE_DIR, 'browser-port.json'), 'utf8')).port;
+      assert.ok(Number.isInteger(port) && port > 0, 'private browser must never launch with remote-debugging-port=0');
+      const page = await acquired.browser.newPage();
+      assert.strictEqual(await page.evaluate(() => navigator.webdriver), false, 'visible private Edge must not expose webdriver automation flag');
+      const closed = await testing.closeOwnedBrowser(acquired.browser);
+      assert.strictEqual(closed, true, 'private browser should close gracefully after marker assertion');
+    })().catch(error => { console.error(error.stack || error); process.exit(1); });
+  `;
+  try {
+    const child = spawnSync(process.execPath, ['-e', script], {
+      cwd: __dirname,
+      encoding: 'utf8',
+      timeout: 60_000,
+      windowsHide: true,
+      env: { ...BASE_ENV, CHATGPT_TEST_HOOKS: '1', CHATGPT_TEST_HEADLESS: '', CHATGPT_BROWSER_PATH: browserPath, CHATGPT_STATE_DIR: dir, CHATGPT_SESSION_DIR: path.join(dir, 'sessions'), CHATGPT_BROWSER_DEBUG_PORT: '0' },
+    });
+    assert.strictEqual(child.status, 0, child.error?.stack || child.stderr || child.stdout);
+  } finally {
+    cleanupIsolatedEdge(dir);
+    for (let attempt = 0; fs.existsSync(dir) && attempt < 50; attempt++) {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+      if (fs.existsSync(dir)) await new Promise(resolve => setTimeout(resolve, 200));
+    }
+    assert.strictEqual(fs.existsSync(dir), false, `automation marker fixture profile remained locked: ${dir}`);
+  }
+}
+
+// renderer卡在旧布局尺寸时（窗口已最大化但innerWidth仍小），viewport同步必须强制其重新跟随真实窗口。
+async function testViewportResyncClearsStaleLayoutSize() {
+  const browserPath = findTestBrowserPath();
+  if (!browserPath) throw new SkipError('no local browser for viewport resync lifecycle');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-viewport-resync-'));
+  const script = `
+    const assert = require('assert');
+    const { testing } = require('./chatgpt-core');
+    (async () => {
+      const acquired = await testing.launchBrowser(() => {});
+      const page = await acquired.browser.newPage();
+      const session = await page.createCDPSession();
+      // 用CDP metrics override模拟renderer卡在小尺寸：innerWidth不再跟随窗口。
+      await session.send('Emulation.setDeviceMetricsOverride', { width: 500, height: 400, deviceScaleFactor: 1, mobile: false });
+      assert.strictEqual(await page.evaluate(() => window.innerWidth), 500, 'fixture must pin the stale layout size');
+      await session.detach();
+      await testing.syncPageViewportWithWindow(page);
+      const synced = await page.evaluate(() => ({ w: window.innerWidth, h: window.innerHeight }));
+      assert.ok(synced.w > 700 && synced.h > 500, 'viewport resync must restore window-following layout size: ' + JSON.stringify(synced));
+      assert.strictEqual(await testing.closeOwnedBrowser(acquired.browser), true);
+    })().catch(error => { console.error(error.stack || error); process.exit(1); });
+  `;
+  try {
+    const child = spawnSync(process.execPath, ['-e', script], { cwd: __dirname, encoding: 'utf8', timeout: 60_000, windowsHide: true, env: { ...BASE_ENV, CHATGPT_TEST_HOOKS: '1', CHATGPT_TEST_HEADLESS: '', CHATGPT_BROWSER_PATH: browserPath, CHATGPT_STATE_DIR: dir, CHATGPT_SESSION_DIR: path.join(dir, 'sessions'), CHATGPT_BROWSER_DEBUG_PORT: '0' } });
+    assert.strictEqual(child.status, 0, child.error?.stack || child.stderr || child.stdout);
+  } finally {
+    cleanupIsolatedEdge(dir);
+    for (let attempt = 0; fs.existsSync(dir) && attempt < 50; attempt++) {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+      if (fs.existsSync(dir)) await new Promise(resolve => setTimeout(resolve, 200));
+    }
+    assert.strictEqual(fs.existsSync(dir), false, `viewport resync fixture profile remained locked: ${dir}`);
+  }
+}
+
+function cleanupIsolatedEdge(dir) {
+  const profile = path.join(dir, 'profile');
+  const escaped = profile.replace(/'/g, "''");
+  const command = `$needle = '${escaped}'; Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine.IndexOf($needle, [StringComparison]::OrdinalIgnoreCase) -ge 0 } | Select-Object -ExpandProperty ProcessId`;
+  let output = '';
+  try { output = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command], { encoding: 'utf8', windowsHide: true }); } catch {}
+  for (const pid of output.split(/\r?\n/).map(value => Number(value.trim())).filter(value => Number.isInteger(value) && value > 0)) {
+    try { execFileSync('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true }); } catch {}
+  }
+}
+
 // 真实private acquisition先cold spawn，再断开daemon连接；第二次必须通过同profile marker重连同一browser。
 async function testPrivateBrowserReconnectsMarker() {
   const browserPath = findTestBrowserPath();
@@ -3041,12 +3126,19 @@ async function testPrivateBrowserReconnectsMarker() {
     })().catch(error => { console.error(error.stack || error); process.exit(1); });
   `;
   try {
-    const child = spawnSync(process.execPath, ['-e', script], { cwd: __dirname, encoding: 'utf8', timeout: 60_000, windowsHide: true, env: { ...BASE_ENV, CHATGPT_TEST_HOOKS: '1', CHATGPT_TEST_HEADLESS: '1', CHATGPT_BROWSER_PATH: browserPath, CHATGPT_STATE_DIR: dir, CHATGPT_SESSION_DIR: path.join(dir, 'sessions'), CHATGPT_BROWSER_DEBUG_PORT: '0' } });
+    const child = spawnSync(process.execPath, ['-e', script], { cwd: __dirname, encoding: 'utf8', timeout: 60_000, windowsHide: true, env: { ...BASE_ENV, CHATGPT_TEST_HOOKS: '1', CHATGPT_TEST_HEADLESS: '', CHATGPT_BROWSER_PATH: browserPath, CHATGPT_STATE_DIR: dir, CHATGPT_SESSION_DIR: path.join(dir, 'sessions'), CHATGPT_BROWSER_DEBUG_PORT: '0' } });
     assert.strictEqual(child.status, 0, child.error?.stack || child.stderr || child.stdout);
-  } finally { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); }
+  } finally {
+    cleanupIsolatedEdge(dir);
+    for (let attempt = 0; fs.existsSync(dir) && attempt < 50; attempt++) {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+      if (fs.existsSync(dir)) await new Promise(resolve => setTimeout(resolve, 200));
+    }
+    assert.strictEqual(fs.existsSync(dir), false, `private marker fixture profile remained locked: ${dir}`);
+  }
 }
 
-// 异常退出的private browser会残留DevToolsActivePort+lockfile；启动必须收敛stale现场后cold spawn新browser，而不是永久失败。
+// 异常退出的private browser会残留browser-port.json+lockfile；启动必须收敛stale现场后cold spawn新browser，而不是永久失败。
 async function testStalePrivateLockRecoversColdSpawn() {
   const browserPath = findTestBrowserPath();
   if (!browserPath) throw new SkipError('no local browser for stale private lock lifecycle');
@@ -3055,37 +3147,25 @@ async function testStalePrivateLockRecoversColdSpawn() {
     const assert = require('assert'); const fs = require('fs'); const path = require('path'); const { testing } = require('./chatgpt-core');
     (async () => {
       const first = await testing.launchBrowser(() => {});
-      assert.strictEqual(first.ownedByDaemon, true);
       const endpoint = first.browser.wsEndpoint();
-      const pidFile = path.join(process.env.CHATGPT_STATE_DIR, 'browser-pid.json');
-      const pid = JSON.parse(fs.readFileSync(pidFile, 'utf8')).pid;
+      const pid = JSON.parse(fs.readFileSync(path.join(process.env.CHATGPT_STATE_DIR, 'browser-pid.json'), 'utf8')).pid;
       assert.ok(Number.isInteger(pid) && pid > 0, 'private acquisition must record the browser PID');
       first.browser.disconnect();
-      // 模拟browser异常退出：强杀主进程，marker+lockfile残留，CDP端点随进程死亡。
       process.kill(pid);
       for (let i = 0; i < 100; i++) { try { process.kill(pid, 0); await new Promise(r => setTimeout(r, 100)); } catch { break; } }
       await new Promise(resolve => setTimeout(resolve, 1500));
-      assert.ok(fs.existsSync(path.join(process.env.CHATGPT_STATE_DIR, 'profile', 'DevToolsActivePort')), 'hard kill must leave the stale marker behind');
+      assert.ok(fs.existsSync(path.join(process.env.CHATGPT_STATE_DIR, 'browser-port.json')), 'hard kill must leave the stale port sidecar behind');
       const second = await testing.launchBrowser(() => {});
       assert.strictEqual(second.ownedByDaemon, true);
       assert.notStrictEqual(second.browser.wsEndpoint(), endpoint, 'stale lock must trigger a fresh cold spawn, not a failed reconnect');
       assert.strictEqual(await testing.closeOwnedBrowser(second.browser), true);
-      await new Promise(resolve => setTimeout(resolve, 1000));
     })().catch(error => { console.error(error.stack || error); process.exit(1); });
   `;
   try {
-    const child = spawnSync(process.execPath, ['-e', script], { cwd: __dirname, encoding: 'utf8', timeout: 90_000, windowsHide: true, env: { ...BASE_ENV, CHATGPT_TEST_HOOKS: '1', CHATGPT_TEST_HEADLESS: '1', CHATGPT_BROWSER_PATH: browserPath, CHATGPT_STATE_DIR: dir, CHATGPT_SESSION_DIR: path.join(dir, 'sessions'), CHATGPT_BROWSER_DEBUG_PORT: '0' } });
+    const child = spawnSync(process.execPath, ['-e', script], { cwd: __dirname, encoding: 'utf8', timeout: 90_000, windowsHide: true, env: { ...BASE_ENV, CHATGPT_TEST_HOOKS: '1', CHATGPT_TEST_HEADLESS: '', CHATGPT_BROWSER_PATH: browserPath, CHATGPT_STATE_DIR: dir, CHATGPT_SESSION_DIR: path.join(dir, 'sessions'), CHATGPT_BROWSER_DEBUG_PORT: '0' } });
     assert.strictEqual(child.status, 0, child.error?.stack || child.stderr || child.stdout);
   } finally {
-    // red阶段也可能留下真实Edge；测试owner通过marker执行CDP close，绝不强杀或触碰用户profile。
-    try {
-      const markerPath = path.join(dir, 'profile', 'DevToolsActivePort');
-      if (fs.existsSync(markerPath)) {
-        const marker = fs.readFileSync(markerPath, 'utf8').trim().split(/\r?\n/);
-        const browser = await require('puppeteer-core').connect({ browserWSEndpoint: `ws://127.0.0.1:${marker[0]}${marker[1]}` });
-        await browser.close();
-      }
-    } catch {}
+    cleanupIsolatedEdge(dir);
     for (let attempt = 0; fs.existsSync(dir) && attempt < 50; attempt++) {
       try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
       if (fs.existsSync(dir)) await new Promise(resolve => setTimeout(resolve, 200));
@@ -3121,14 +3201,7 @@ async function testLegacyStaleMarkerWithoutPidRecord() {
     const child = spawnSync(process.execPath, ['-e', script], { cwd: __dirname, encoding: 'utf8', timeout: 90_000, windowsHide: true, env: { ...BASE_ENV, CHATGPT_TEST_HOOKS: '1', CHATGPT_TEST_HEADLESS: '1', CHATGPT_BROWSER_PATH: browserPath, CHATGPT_STATE_DIR: dir, CHATGPT_SESSION_DIR: path.join(dir, 'sessions'), CHATGPT_BROWSER_DEBUG_PORT: '0' } });
     assert.strictEqual(child.status, 0, child.error?.stack || child.stderr || child.stdout);
   } finally {
-    try {
-      const markerPath = path.join(dir, 'profile', 'DevToolsActivePort');
-      if (fs.existsSync(markerPath)) {
-        const marker = fs.readFileSync(markerPath, 'utf8').trim().split(/\r?\n/);
-        const browser = await require('puppeteer-core').connect({ browserWSEndpoint: `ws://127.0.0.1:${marker[0]}${marker[1]}` });
-        await browser.close();
-      }
-    } catch {}
+    cleanupIsolatedEdge(dir);
     for (let attempt = 0; fs.existsSync(dir) && attempt < 50; attempt++) {
       try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
       if (fs.existsSync(dir)) await new Promise(resolve => setTimeout(resolve, 200));
@@ -3237,8 +3310,11 @@ async function testPreReadyFailureReleasesPrivateBrowser() {
     testing.dom.sessionPageFact = async () => { throw Object.assign(new Error('fixture pre-ready failure'), { code: 'VOICE_PAGE' }); };
     (async () => {
       await assert.rejects(() => testing.acquireBootstrapBrowser(() => {}), /fixture pre-ready failure/);
-      const marker = fs.readFileSync(path.join(process.env.CHATGPT_STATE_DIR, 'profile', 'DevToolsActivePort'), 'utf8').trim().split(/\\r?\\n/);
-      await assert.rejects(() => puppeteer.connect({ browserWSEndpoint: 'ws://127.0.0.1:' + marker[0] + marker[1] }), 'failed bootstrap must not leave its marker endpoint reachable');
+      const portFile = path.join(process.env.CHATGPT_STATE_DIR, 'browser-port.json');
+      if (fs.existsSync(portFile)) {
+        const port = JSON.parse(fs.readFileSync(portFile, 'utf8')).port;
+        await assert.rejects(() => fetch('http://127.0.0.1:' + port + '/json/version'), 'failed bootstrap must not leave its port endpoint reachable');
+      }
       testing.dom.sessionPageFact = async () => ({ kind: 'authenticated', origin: 'https://chatgpt.com', readyState: 'complete' });
       const recovered = await testing.acquireBootstrapBrowser(() => {});
       assert.strictEqual(recovered.ownedByDaemon, true);
@@ -3249,12 +3325,7 @@ async function testPreReadyFailureReleasesPrivateBrowser() {
     const child = spawnSync(process.execPath, ['-e', script], { cwd: __dirname, encoding: 'utf8', timeout: 90_000, windowsHide: true, env: { ...BASE_ENV, CHATGPT_TEST_HOOKS: '1', CHATGPT_TEST_HEADLESS: '1', CHATGPT_BROWSER_PATH: browserPath, CHATGPT_STATE_DIR: dir, CHATGPT_SESSION_DIR: path.join(dir, 'sessions'), CHATGPT_BROWSER_DEBUG_PORT: '0' } });
     assert.strictEqual(child.status, 0, child.error?.stack || child.stderr || child.stdout);
   } finally {
-    // red阶段也可能留下真实Edge；测试owner通过marker执行CDP close，绝不强杀或触碰用户profile。
-    try {
-      const marker = fs.readFileSync(path.join(dir, 'profile', 'DevToolsActivePort'), 'utf8').trim().split(/\r?\n/);
-      const browser = await require('puppeteer-core').connect({ browserWSEndpoint: `ws://127.0.0.1:${marker[0]}${marker[1]}` });
-      await browser.close();
-    } catch {}
+    cleanupIsolatedEdge(dir);
     for (let attempt = 0; fs.existsSync(dir) && attempt < 50; attempt++) {
       try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
       if (fs.existsSync(dir)) await new Promise(resolve => setTimeout(resolve, 200));
