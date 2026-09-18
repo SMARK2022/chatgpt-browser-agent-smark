@@ -45,7 +45,8 @@ const DAEMON_FILE = path.join(STATE_DIR, 'daemon.json');
 const DAEMON_LOCK_FILE = path.join(STATE_DIR, 'daemon.lock');
 const DAEMON_LOG = path.join(STATE_DIR, 'daemon.log');
 const DEFAULT_PROJECT = process.env.CHATGPT_PROJECT || process.env.CHATGPT_PROJECT_NAME || process.env.CHATGPT_PROJECT_URL || 'MCP';
-const DAEMON_VERSION = 24;
+// 语音响应附带本次POST的Bearer与Cookie；沿原版本选主避免复用缺少账户凭据的旧producer。
+const DAEMON_VERSION = 26;
 // 登录等待超时必须和 core 一致；client 用它推导 DAEMON_START_TIMEOUT，保证登录等待期间不提前放弃。
 const LOGIN_WAIT_TIMEOUT_MS = positiveIntEnv('CHATGPT_LOGIN_WAIT_TIMEOUT_MS', 120_000);
 // daemon 启动超时必须覆盖登录等待窗口；登录等待期间 daemon 活着但未写 daemon.json，
@@ -54,9 +55,8 @@ const DAEMON_START_TIMEOUT = positiveIntEnv('CHATGPT_DAEMON_START_TIMEOUT_MS', L
 const BROWSER_CONNECT_TIMEOUT_MS = positiveIntEnv('CHATGPT_BROWSER_CONNECT_TIMEOUT_MS', 3_000);
 const HTTP_TIMEOUT = positiveIntEnv('CHATGPT_HTTP_TIMEOUT_MS', 30_000);
 const ASK_HTTP_TIMEOUT = positiveIntEnv('CHATGPT_ASK_HTTP_TIMEOUT_MS', 620_000);
-// voice 转写是短音频（通常 <30s 录音），direct API 正常路径几秒内返回。
-// 包含冷启动和大音频的唯一direct路径也应在120s内完成；复用620s的ASK超时会让网络故障hang近10分钟。
-const VOICE_HTTP_TIMEOUT = positiveIntEnv('CHATGPT_VOICE_HTTP_TIMEOUT_MS', 120_000);
+// 浏览器转录是一次固定40秒尝试；到点关闭 HTTP，使 daemon 收到取消并收尾。
+const VOICE_HTTP_TIMEOUT = 40_000;
 const HTTP_RESPONSE_MAX_BYTES = positiveIntEnv('CHATGPT_HTTP_RESPONSE_MAX_BYTES', 10 * 1024 * 1024);
 const MAX_TEXT_FILE_BYTES = positiveIntEnv('CHATGPT_TEXT_FILE_MAX_BYTES', 2 * 1024 * 1024);
 const MAX_GIT_DIFF_CHARS = positiveIntEnv('CHATGPT_GIT_DIFF_MAX_CHARS', 100_000);
@@ -68,14 +68,6 @@ const MAX_TOTAL_UPLOAD_BYTES = positiveIntEnv('CHATGPT_MAX_TOTAL_UPLOAD_BYTES', 
 const MAX_VOICE_FILE_BYTES = positiveIntEnv('CHATGPT_VOICE_FILE_MAX_BYTES', 50 * 1024 * 1024);
 const EXPLICIT_UPLOAD_ROOTS = uploadRoots();
 let activeStartLock = null;
-
-for (const signal of ['SIGINT', 'SIGTERM']) {
-  process.once(signal, () => {
-    // 外层 MCP/终端超时会直接杀 CLI；这里尽力释放自己持有的启动锁，避免下一次 ask 被旧锁拖满超时。
-    if (activeStartLock) releaseDaemonStartLock(activeStartLock.fd, activeStartLock.token);
-    process.exit(signal === 'SIGINT' ? 130 : 143);
-  });
-}
 
 // CLI 层只负责给 ChatGPT 拼“外部助手”身份，不在这里写浏览器状态机规则；
 // 状态机规则必须留在 core，避免 prompt 文案和本地 pending/retry 行为互相污染。
@@ -747,24 +739,6 @@ function formatResponse(result) {
   ].filter(Boolean).join('\n\n');
 }
 
-function voiceErrorIsRetryable(error) {
-  // 封闭集合只含可通过重新取得runtime恢复的事实；unknown、认证、4xx与响应合同错误fail closed。
-  // structured code必须优先于HTTP 500外壳，否则VOICE_AUTH_REQUIRED会被通用status再次误判可恢复。
-  // 无code的本地5xx只兼容旧daemon；协议version bump确保正常部署优先使用新producer code。
-  if (error.code) return ['VOICE_RATE_LIMIT', 'VOICE_SERVER', 'VOICE_TRANSPORT', 'VOICE_PAGE', 'BROWSER_DISCONNECTED', 'BROWSER_STARTUP', 'VOICE_TIMEOUT', 'VOICE_RUNTIME_FATAL', 'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT'].includes(error.code);
-  if (error.statusCode >= 500) return true;
-  return /Daemon HTTP request timed out/.test(error.message);
-}
-
-async function daemonIdentityChangedToUsable(previous) {
-  const current = readDaemonState();
-  // 旧token无法stop当前daemon；只有发现文件已发布不同且健康的身份，才允许既有loop继续。
-  // daemonID/token识别协议身份，PID/port识别进程与socket；四项全同才仍是原state，不能误判切换。
-  if (!current || ['daemonID', 'token', 'pid', 'port'].every(key => current[key] === previous[key])) return false;
-  // usable同时验证无token ping identity和带current token的status，避免只凭磁盘JSON接受尚未ready的替代daemon。
-  return isDaemonUsable(current);
-}
-
 // ─── CLI Dispatch ─────────────────────────────────────────────────────────────
 
 function printHelp() {
@@ -797,6 +771,16 @@ Usage:
  */
 async function main(argv = process.argv) {
   const opts = parseArgs(argv);
+  const controller = new AbortController();
+  // core 导入 profile reader 时不注册进程信号；离线导出取消后等待子进程 close 和密钥清理。
+  for (const signal of ['SIGINT', 'SIGTERM']) {
+    process.once(signal, () => {
+      // 外层 MCP/终端超时会直接杀 CLI；这里尽力释放自己持有的启动锁，避免下一次 ask 被旧锁拖满超时。
+      if (activeStartLock) releaseDaemonStartLock(activeStartLock.fd, activeStartLock.token);
+      if (opts.authExport) { process.exitCode = signal === 'SIGINT' ? 130 : 143; controller.abort(); return; }
+      process.exit(signal === 'SIGINT' ? 130 : 143);
+    });
+  }
   if (opts.daemonInternal) return require('./chatgpt-core').startDaemonProcess(); // daemon 模式才加载 core，避免 status/stop 触发 registry 迁移副作用。
   if (opts.login) return (async () => { ensureStateDirForDaemon(); await login(); })().catch(err => { console.error('[ERROR]', err.message); process.exit(1); });
 
@@ -837,31 +821,11 @@ async function main(argv = process.argv) {
   if (opts.transcribeFile) {
     try {
       const file = validateVoiceFile(opts.file);
-      let result, lastError;
-      for (let attempt = 0; attempt < 4; attempt++) {
-        // 每个attempt重新取得daemon，browser断连和stale索引才能在同一CLI事务内自维护。
-        // 文件校验留在循环外，确定性输入错误不会重复启动browser或发送HTTP。
-        let daemon;
-        try {
-          daemon = await ensureDaemon();
-          result = await httpJSON(daemon, 'POST', '/voice/transcribe-file', { file }, VOICE_HTTP_TIMEOUT);
-          if (!result.ok) throw new Error(result.error || 'Daemon returned an error');
-          break;
-        } catch (error) {
-          lastError = error;
-          if (daemon && ['BROWSER_DISCONNECTED', 'BROWSER_STARTUP', 'VOICE_RUNTIME_FATAL'].includes(error.code)) await retireDaemon(daemon);
-          // identity切换不调用retire/unlink；下一attempt只能复用已发布且通过ping/status的新daemon。
-          // 失败条件保留current discovery现场；这里禁止retire/unlink，否则会把健康替代daemon变成无索引owner。
-          if (error.code === 'DAEMON_IDENTITY_MISMATCH' && (!daemon || !await daemonIdentityChangedToUsable(daemon))) throw error;
-          // 只有browser/daemon生命周期失效才retire；429/5xx保留健康daemon避免制造无关cold start。
-          // retire不kill PID，只通过认证HTTP stop和索引清理准备下一次相同主路径。
-          if (attempt === 3 || (error.code !== 'DAEMON_IDENTITY_MISMATCH' && !voiceErrorIsRetryable(error))) throw error;
-          // 前一HTTP响应代表core已完成settle/隔离；退避只调节下一次同wire attempt，不覆盖旧页面任务。
-          await sleep([1_000, 2_000, 4_000][attempt]);
-        }
-      }
-      if (!result) throw lastError;
-      if (opts.json) console.log(JSON.stringify({ text: result.text || '' }));
+      // 末级浏览器只提交一次，失败交回后端；同次 Cookie 必须随文字完整返回。
+      const daemon = await ensureDaemon();
+      const result = await httpJSON(daemon, 'POST', '/voice/transcribe-file', { file }, VOICE_HTTP_TIMEOUT);
+      if (!result.ok) throw new Error(result.error || 'Daemon returned an error');
+      if (opts.json) console.log(JSON.stringify({ text: result.text || '', auth: result.auth }));
       else console.log(result.text || '');
     } catch (err) {
       console.error('[ERROR]', err.message);
@@ -872,41 +836,17 @@ async function main(argv = process.argv) {
 
   if (opts.authExport) {
     try {
-      let result, lastError;
-      // 导出复用 transcribe-file 同款 daemon 生命周期重试：browser/daemon 失效自恢复，确定性错误立即失败。
-      // VOICE_HTTP_TIMEOUT 覆盖页面收敛+导出；daemon 冷启动总预算由 opencode 侧收割 spawn 的 240s 承担。
-      for (let attempt = 0; attempt < 4; attempt++) {
-        let daemon;
-        try {
-          daemon = await ensureDaemon();
-          result = await httpJSON(daemon, 'POST', '/auth/export', {}, VOICE_HTTP_TIMEOUT);
-          if (!result.ok) throw Object.assign(new Error(result.error || 'Daemon returned an error'), { code: result.code });
-          break;
-        } catch (error) {
-          lastError = error;
-          if (daemon && ['BROWSER_DISCONNECTED', 'BROWSER_STARTUP', 'VOICE_RUNTIME_FATAL'].includes(error.code)) await retireDaemon(daemon);
-          if (error.code === 'DAEMON_IDENTITY_MISMATCH' && (!daemon || !await daemonIdentityChangedToUsable(daemon))) throw error;
-          // AUTH_EXPORT_LOGIN_REQUIRED 带结构化 code，不进 voiceErrorIsRetryable 封闭集合，立即上抛。
-          if (attempt === 3 || (error.code !== 'DAEMON_IDENTITY_MISMATCH' && !voiceErrorIsRetryable(error))) throw error;
-          await sleep([1_000, 2_000, 4_000][attempt]);
-        }
-      }
-      if (!result) throw lastError;
+      const result = await exportProfileAuth(AbortSignal.any([controller.signal, AbortSignal.timeout(40_000)]));
       if (opts.json) {
         // --json 供 opencode 收割消费：完整凭据只经 stdout 返回，不落日志或 argv。
-        console.log(JSON.stringify({ authStatus: result.authStatus, accessToken: result.accessToken, cookies: result.cookies, fetchedAt: result.fetchedAt }));
+        console.log(JSON.stringify({ ok: true, ...result }));
       } else {
-        // 人类可读摘要永不包含凭据本体；token 过期时间从 JWT exp 本地解出。
-        const payload = String(result.accessToken || '').split('.')[1];
-        let expiresText = 'unknown';
-        if (payload) {
-          try { const exp = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')).exp; if (exp) expiresText = new Date(exp * 1000).toISOString(); } catch {}
-        }
-        console.log(`auth: status=${result.authStatus} cookies=${(result.cookies || []).length} token_expires=${expiresText}`);
+        // 摘要仅提供数量，不回显 Cookie 或解密材料。
+        console.log(`auth: cookies=${result.cookies.length}`);
       }
     } catch (err) {
       console.error('[ERROR]', err.message);
-      process.exit(1);
+      process.exitCode ||= 1;
     }
     return;
   }
@@ -955,4 +895,65 @@ async function main(argv = process.argv) {
   }
 }
 
+async function exportProfileAuth(signal) {
+  // profile 根目录沿用 MCP 自有配置，读取只导出快照，登录与刷新仍由浏览器维护。
+  signal.throwIfAborted();
+  // 仅此入口要求 Node24；ask/image 和纯导入不加载实验性 SQLite 模块。
+  const { DatabaseSync } = require('node:sqlite');
+  if (process.platform !== 'win32') throw new Error('Profile cookie decryption requires Windows DPAPI');
+  const encrypted = Buffer.from(JSON.parse(fs.readFileSync(path.join(BROWSER_USER_DATA_DIR, 'Local State'), 'utf8')).os_crypt.encrypted_key, 'base64');
+  if (encrypted.subarray(0, 5).toString() !== 'DPAPI') throw new Error('Unsupported profile key encryption');
+  let db, key;
+  const chunks = [];
+  try {
+    // 密钥仅经当前用户 PowerShell 管道传递；stderr 不转发，防止系统错误回显输入。
+    const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Add-Type -AssemblyName System.Security; $key = [Security.Cryptography.ProtectedData]::Unprotect([Convert]::FromBase64String([Console]::In.ReadToEnd()), $null, [Security.Cryptography.DataProtectionScope]::CurrentUser); try { [Console]::OpenStandardOutput().Write($key, 0, $key.Length) } finally { [Array]::Clear($key, 0, $key.Length) }'], { signal, windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'] });
+    await new Promise((resolve, reject) => {
+      let failed = false;
+      // error 可能早于 close；必须等管道关闭后才能结束持有密钥的操作。
+      child.on('error', () => { failed = true; });
+      child.stdin.on('error', () => { failed = true; child.kill(); });
+      child.stdout.on('error', () => { failed = true; child.kill(); });
+      child.stdout.on('data', chunk => chunks.push(chunk));
+      child.once('close', code => code === 0 && !failed ? resolve() : reject(signal.aborted ? signal.reason : new Error('Profile key decryption failed')));
+      child.stdin.end(encrypted.subarray(5).toString('base64'));
+    });
+    signal.throwIfAborted();
+    key = Buffer.concat(chunks);
+    // SQLite 只读打开原库；文件占用错误原样交给转录编排决定浏览器步骤。
+    db = new DatabaseSync(path.join(BROWSER_USER_DATA_DIR, BROWSER_PROFILE_DIRECTORY || 'Default', 'Network', 'Cookies'), { readOnly: true });
+    const version = Number(db.prepare("SELECT value FROM meta WHERE key = 'version'").get()?.value);
+    const query = db.prepare("SELECT host_key, name, value, encrypted_value, path, expires_utc FROM cookies WHERE host_key IN ('chatgpt.com', '.chatgpt.com') AND path = '/'");
+    // Chromium 的微秒时间超出 JS 安全整数；先以 BigInt 读取再换算 Unix 秒。
+    query.setReadBigInts(true);
+    const cookies = [];
+    for (const row of query.all()) {
+      signal.throwIfAborted();
+      // Chromium 时间从1601年起算；0保留会话语义，其余换算到 Cookie 接口的 Unix 秒。
+      const expires = row.expires_utc === 0n ? 0 : Number(row.expires_utc) / 1_000_000 - 11644473600;
+      if (expires && expires <= Date.now() / 1000) continue;
+      const bytes = Buffer.from(row.encrypted_value);
+      let value = row.value;
+      if (bytes.length) {
+        if (bytes.subarray(0, 3).toString() !== 'v10') throw new Error('Unsupported profile cookie encryption');
+        const cipher = crypto.createDecipheriv('aes-256-gcm', key, bytes.subarray(3, 15));
+        cipher.setAuthTag(bytes.subarray(-16));
+        const plain = Buffer.concat([cipher.update(bytes.subarray(15, -16)), cipher.final()]);
+        try {
+          // v24 明文前缀绑定域；校验后剥离，不能把摘要作为 Cookie 字符串发送。
+          if (version >= 24 && !plain.subarray(0, 32).equals(crypto.createHash('sha256').update(row.host_key).digest())) throw new Error('Profile cookie domain digest mismatch');
+          value = plain.subarray(version >= 24 ? 32 : 0).toString('utf8');
+        } finally { plain.fill(0); }
+      }
+      cookies.push({ name: row.name, value, domain: row.host_key, path: row.path, expires });
+    }
+    signal.throwIfAborted();
+    return { cookies, fetchedAt: new Date().toISOString() };
+  } finally {
+    // 读取失败与取消共用完成点；即使关闭数据库抛错也必须清除密钥副本。
+    try { db?.close(); } finally { key?.fill(0); chunks.forEach(chunk => chunk.fill(0)); encrypted.fill(0); }
+  }
+}
+
+module.exports = { exportProfileAuth };
 if (require.main === module) main().catch(err => { console.error('[ERROR]', err.message); process.exit(1); });

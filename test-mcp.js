@@ -1132,7 +1132,8 @@ function testCoreProjectStateMachine() {
 function runCoreFixture(prefix, build) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   try {
-    const child = spawnSync(process.execPath, ['-e', build(dir)], { cwd: __dirname, encoding: 'utf8', timeout: 5_000, windowsHide: true, env: { ...BASE_ENV, CHATGPT_TEST_HOOKS: '1', CHATGPT_VOICE_FILE_ROOTS: dir, CHATGPT_STATE_DIR: dir, CHATGPT_SESSION_DIR: path.join(dir, 'sessions'), ...(prefix === 'chatgpt-voice-foreground-' ? { CHATGPT_VOICE_TRANSCRIBE_TIMEOUT_MS: '700' } : {}) } });
+    // Windows 对部分长 -e argv 返回 EPERM；stdin 执行同一脚本，保持隔离且不新增文件。
+    const child = spawnSync(process.execPath, ['-'], { input: build(dir), cwd: __dirname, encoding: 'utf8', timeout: 5_000, windowsHide: true, env: { ...BASE_ENV, CHATGPT_TEST_HOOKS: '1', CHATGPT_VOICE_FILE_ROOTS: dir, CHATGPT_STATE_DIR: dir, CHATGPT_SESSION_DIR: path.join(dir, 'sessions') } });
     assert.strictEqual(child.status, 0, child.error?.stack || child.stderr || child.stdout);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 }
@@ -1146,6 +1147,8 @@ function testVoiceLeaseWaitsForProjectSubmission() {
       const assert = require('assert'), policy = require('./chatgpt-project'), { testing } = require('./chatgpt-core');
       const project = policy.parse('g-p-queue123-mcp', 'MCP');
       const voicePage = { current: 'about:blank', url() { return this.current; }, isClosed: () => false, goto: async url => { voicePage.current = url; }, close: async () => {} };
+      // 本用例只隔离提交队列；Cookie 解密与原生 CDP 结果另由真实 fixture 验证。
+      voicePage.createCDPSession = async () => ({ send: async () => ({ cookies: [] }), detach: async () => {} });
       let projectStartedResolve, releaseProject;
       const projectStarted = new Promise(resolve => { projectStartedResolve = resolve; });
       const projectRelease = new Promise(resolve => { releaseProject = resolve; });
@@ -1157,11 +1160,11 @@ function testVoiceLeaseWaitsForProjectSubmission() {
         initializeProject: async () => { projectStartedResolve(); await projectRelease; return project; },
       });
       testing.dom.sessionPageFact = async () => { preflightStarted = true; return { kind: 'authenticated', origin: 'https://chatgpt.com', readyState: 'complete' }; };
-      testing.dom.transcribeAudioFile = async () => 'queued voice';
+      testing.dom.transcribeAudioFile = async () => ({ text: 'queued voice', accessToken: 'fixture-token' });
       (async () => {
         const projectPromise = runtime.ensureProject({}, () => {});
         await projectStarted;
-        const voicePromise = testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, () => false);
+        const voicePromise = testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, new AbortController().signal);
         await new Promise(resolve => setImmediate(resolve));
         assert.strictEqual(preflightStarted, false, 'voice lease must wait behind Project browser side effects');
         releaseProject();
@@ -1267,16 +1270,18 @@ function testVoiceStartupSkipsProject() {
       // voice只依赖browser/page transport；default Project不可用时不能进入ask专属初始化。
       let projectCalls = 0;
       const page = { url: () => 'https://chatgpt.com/', isClosed: () => false, evaluate: async () => ({ kind: 'authenticated', origin: 'https://chatgpt.com', readyState: 'complete' }), close: async () => {} };
+      page.createCDPSession = async () => ({ send: async () => ({ cookies: [] }), detach: async () => {} });
       const runtime = testing.createDaemonRuntime({
         browser: { isConnected: () => true, newPage: async () => page },
         bootstrapPage: page,
         project: null,
         initializeProject: async () => { projectCalls++; throw new Error('default Project unavailable'); },
       });
-      testing.dom.transcribeAudioFile = async () => 'voice without Project';
+      testing.dom.transcribeAudioFile = async () => ({ text: 'voice without Project', accessToken: 'fixture-token' });
       (async () => {
-        const result = await testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, () => false);
-        assert.deepStrictEqual(result, { ok: true, text: 'voice without Project' });
+        const result = await testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, new AbortController().signal);
+        assert.strictEqual(result.text, 'voice without Project');
+        assert.deepStrictEqual(result.auth.cookies, []);
         assert.strictEqual(projectCalls, 0, 'voice must not initialize the default Project');
       })().catch(error => { console.error(error.stack || error); process.exit(1); });
     `;
@@ -1386,7 +1391,7 @@ function testExistingSessionSkipsDefaultProjectInitialization() {
 }
 
 // 第一段锁定voiceLock排队取消在文件读取和页面检查前生效，临时WAV删除后不能再被访问。
-// 第二段锁定submission排队取消：即使外部closed状态稍后恢复，旧closure也永远不得POST。
+// 第二段锁定submission排队取消：signal 单调终止，迟到 closure 永远不得 POST。
 // 两次取消后下一合法voice必须成功，直接证明daemon队列没有被拒绝Promise毒化。
 function testQueuedVoiceCancelHasZeroSideEffects() {
   runCoreFixture('chatgpt-queued-voice-', dir => {
@@ -1395,35 +1400,36 @@ function testQueuedVoiceCancelHasZeroSideEffects() {
     return String.raw`
       const assert = require('assert'), fs = require('fs'), policy = require('./chatgpt-project'), { testing } = require('./chatgpt-core');
       let healthCalls = 0; const page = { url: () => 'https://chatgpt.com/', isClosed: () => false, evaluate: async () => { healthCalls++; return { kind: 'authenticated', origin: 'https://chatgpt.com', readyState: 'complete' }; }, close: async () => {} };
+      page.createCDPSession = async () => ({ send: async () => ({ cookies: [] }), detach: async () => {} });
       const runtime = testing.createDaemonRuntime({ browser: { isConnected: () => true, newPage: async () => { throw new Error('cancelled queued voice allocated a page'); } }, bootstrapPage: page, project: policy.parse('g-p-voice123-mcp', 'MCP') });
       let directCalls = 0;
-      testing.dom.transcribeAudioFile = async () => { directCalls++; return 'third voice'; }; let release;
-      const first = runtime.withVoice(() => new Promise(resolve => { release = resolve; })); let closed = false;
+      testing.dom.transcribeAudioFile = async () => { directCalls++; return { text: 'third voice', accessToken: 'fixture-token' }; }; let release;
+      const first = runtime.withVoice(() => new Promise(resolve => { release = resolve; })); let controller = new AbortController();
       (async () => {
         await new Promise(resolve => setImmediate(resolve));
-        const second = testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, () => closed);
-        closed = true; fs.unlinkSync(${JSON.stringify(voice)}); release(); await first;
+        const second = testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, controller.signal);
+        controller.abort(); fs.unlinkSync(${JSON.stringify(voice)}); release(); await first;
+        // WAV 已删除时仍应返回取消码，不能让迟到文件校验覆盖请求终态。
         await assert.rejects(second, error => error.code === 'VOICE_CANCELLED'); assert.strictEqual(healthCalls, 0, 'cancelled queued voice must not validate a page');
         // 前一项取消不能毒化voice queue；下一条合法录音必须正常进入同一生产入口。
         fs.writeFileSync(${JSON.stringify(voice)}, Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WAVE'), Buffer.alloc(32)]));
-        assert.deepStrictEqual(await testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, () => false), { ok: true, text: 'third voice' });
+        assert.strictEqual((await testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, new AbortController().signal)).text, 'third voice');
         assert.strictEqual(directCalls, 1);
 
         let releaseSubmission;
         const blocker = runtime.withSubmission(() => new Promise(resolve => { releaseSubmission = resolve; }));
         await new Promise(resolve => setImmediate(resolve));
-        closed = false;
+        controller = new AbortController();
         const probesBeforeCancel = healthCalls;
-        const cancelledSubmission = testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, () => closed);
+        const cancelledSubmission = testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, controller.signal);
         await new Promise(resolve => setImmediate(resolve));
         assert.strictEqual(healthCalls, probesBeforeCancel, 'a voice cancelled behind submission queue must not create or probe a page');
-        closed = true;
+        controller.abort();
         // 尚未取得queue所有权时，取消仍必须零POST且不能卡住voiceLock。
         await assert.rejects(cancelledSubmission, error => error.code === 'VOICE_CANCELLED');
         assert.strictEqual(directCalls, 1);
         releaseSubmission(); await blocker;
-        closed = false;
-        assert.deepStrictEqual(await testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, () => false), { ok: true, text: 'third voice' });
+        assert.strictEqual((await testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, new AbortController().signal)).text, 'third voice');
         assert.strictEqual(directCalls, 2, 'submission cancellation must leave the daemon usable for the next voice');
       })().catch(error => { console.error(error.stack || error); process.exit(1); });
     `;
@@ -1439,18 +1445,19 @@ function testVoiceTaskLifecycle() {
       const assert = require('assert'), policy = require('./chatgpt-project'), { testing } = require('./chatgpt-core');
       let healthCalls = 0;
       const session = { id: 'session', url: () => 'https://chatgpt.com/c/idle', isClosed: () => false, evaluate: async () => { healthCalls++; return { kind: 'authenticated', origin: 'https://chatgpt.com', readyState: 'complete' }; }, close: async () => {} }, dedicated = { id: 'dedicated', url: () => 'https://chatgpt.com/', isClosed: () => false, evaluate: async () => ({ kind: 'authenticated', origin: 'https://chatgpt.com', readyState: 'complete' }), close: async () => {} };
+      session.createCDPSession = dedicated.createCDPSession = async () => ({ send: async () => ({ cookies: [] }), detach: async () => {} });
       let newPages = 0; const runtime = testing.createDaemonRuntime({ browser: { isConnected: () => true, newPage: async () => { newPages++; return dedicated; } }, bootstrapPage: session, project: policy.parse('g-p-life123-mcp', 'MCP') });
       (async () => {
         await runtime.pageFor('#idle'); const calls = []; let endpointFails = false;
         testing.dom.transcribeAudioFile = async page => {
           calls.push(page.id);
           if (endpointFails) throw Object.assign(new Error('endpoint changed'), { code: 'VOICE_ENDPOINT' });
-          return 'direct text';
+          return { text: 'direct text', accessToken: 'fixture-token' };
         };
-        assert.strictEqual((await testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, () => false)).text, 'direct text');
+        assert.strictEqual((await testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, new AbortController().signal)).text, 'direct text');
         assert.deepStrictEqual(calls, ['session']); assert.strictEqual(healthCalls, 2, 'borrowed pages must pass two stable probes'); assert.strictEqual(newPages, 0, 'stable idle session direct must not create a voice tab');
         endpointFails = true;
-        await assert.rejects(() => testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, () => false), /endpoint changed/);
+        await assert.rejects(() => testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, new AbortController().signal), /endpoint changed/);
         assert.deepStrictEqual(calls, ['session', 'session'], 'direct failure must not start a second transcription path');
         assert.strictEqual(newPages, 0, 'endpoint errors must not open a fallback page');
         // direct错误释放borrowed reservation；后续ask锁无需等待UI听写或页面导航。
@@ -1472,13 +1479,14 @@ function testBorrowedVoiceStablePreflightRenewsOnce() {
       const fact = { kind: 'authenticated', origin: 'https://chatgpt.com', readyState: 'complete' };
       const borrowed = { id: 'borrowed', url: () => 'https://chatgpt.com/c/idle', isClosed: () => false, close: async () => { borrowedCloses++; }, evaluate: async () => { borrowedProbes++; if (borrowedProbes === 2) throw new Error('network context degraded'); return fact; } };
       const dedicated = { id: 'dedicated', url: () => 'https://chatgpt.com/', isClosed: () => false, close: async () => {}, evaluate: async () => { dedicatedProbes++; return fact; } };
+      dedicated.createCDPSession = async () => ({ send: async () => ({ cookies: [] }), detach: async () => {} });
       const runtime = testing.createDaemonRuntime({ browser: { isConnected: () => true, newPage: async () => { newPages++; return dedicated; } }, bootstrapPage: borrowed, project: policy.parse('g-p-stable123-mcp', 'MCP') });
       testing.dom.sessionPageFact = page => page.evaluate();
       const submitted = [];
-      testing.dom.transcribeAudioFile = async page => { submitted.push(page.id); return 'renewed transcript'; };
+      testing.dom.transcribeAudioFile = async page => { submitted.push(page.id); return { text: 'renewed transcript', accessToken: 'fixture-token' }; };
       (async () => {
         await runtime.pageFor('#idle');
-        const result = await testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, () => false);
+        const result = await testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, new AbortController().signal);
         assert.strictEqual(result.text, 'renewed transcript');
         // borrowed页第二次事实失败发生在POST前；同一lease acquisition只续租一次专属页。
         assert.deepStrictEqual(submitted, ['dedicated']);
@@ -1506,6 +1514,7 @@ function testFreshVoicePageWaitsForConvergence() {
           url() { return this.current; }, isClosed() { return this.closed; },
           async goto(url) { gotoCalls++; this.current = url; },
           async close() { closeCalls++; this.closed = true; },
+          async createCDPSession() { return { send: async () => ({ cookies: [] }), detach: async () => {} }; },
         };
         pages.push(page);
         return page;
@@ -1522,11 +1531,11 @@ function testFreshVoicePageWaitsForConvergence() {
         return page.hydrated ? authenticated : { kind: 'loading', origin: 'https://chatgpt.com', readyState: 'interactive' };
       };
       const submitted = [];
-      testing.dom.transcribeAudioFile = async page => { submitted.push(page.id); return 'fresh transcript'; };
+      testing.dom.transcribeAudioFile = async page => { submitted.push(page.id); return { text: 'fresh transcript', accessToken: 'fixture-token' }; };
       (async () => {
-        assert.strictEqual((await testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, () => false)).text, 'fresh transcript');
+        assert.strictEqual((await testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, new AbortController().signal)).text, 'fresh transcript');
         // 第二次voice复用已经收敛的页；不得再次导航或为了等待正常hydrate新建页面。
-        assert.strictEqual((await testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, () => false)).text, 'fresh transcript');
+        assert.strictEqual((await testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, new AbortController().signal)).text, 'fresh transcript');
         assert.deepStrictEqual(submitted, ['fresh-1', 'fresh-1']);
         assert.strictEqual(newPages, 1);
         assert.strictEqual(gotoCalls, 1);
@@ -1551,11 +1560,14 @@ function testVoiceAndAskSerializeRemoteSubmission() {
         current: 'about:blank', closed: false,
         url() { return this.current; }, isClosed() { return this.closed; },
         async goto(url) { this.current = url; }, async close() { this.closed = true; },
+        async createCDPSession() { return { send: async () => ({ cookies: [] }), detach: async () => {} }; },
       };
       const askPage = {
         current: project.url, closed: false,
         url() { return this.current; }, isClosed() { return this.closed; },
         async goto(url) { this.current = url; }, async close() { this.closed = true; },
+        // 第二次 voice 可借用空闲 ask 页；该页也必须满足同一 CDP 导出合同。
+        async createCDPSession() { return { send: async () => ({ cookies: [] }), detach: async () => {} }; },
       };
       let pages = 0;
       const runtime = testing.createDaemonRuntime({
@@ -1588,10 +1600,10 @@ function testVoiceAndAskSerializeRemoteSubmission() {
           directStartedResolve();
           await new Promise(resolve => { releaseFirstVoice = resolve; });
           directActive = false;
-          return 'voice one';
+          return { text: 'voice one', accessToken: 'fixture-token' };
         }
         secondVoiceStartedResolve();
-        return 'voice two';
+        return { text: 'voice two', accessToken: 'fixture-token' };
       };
 
       const before = { count: 0, userCount: 0, turnCount: 0, nativeImageCount: 0, nativeImageURLs: [], lastText: '', generating: false, placeholder: false, emptyAssistantTurn: false };
@@ -1614,9 +1626,9 @@ function testVoiceAndAskSerializeRemoteSubmission() {
       // 纯Promise barrier不会保持child进程存活；有界计时器保证成功和失败断言都会真正执行。
       const testTimeout = setTimeout(() => { console.error('voice/ask submission fixture timed out'); process.exit(1); }, 4_000);
       (async () => {
-        const firstVoice = testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, () => false);
+        const firstVoice = testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, new AbortController().signal);
         await directStarted;
-        const secondVoice = testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, () => false);
+        const secondVoice = testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, new AbortController().signal);
         const ask = testing.runAsk(runtime, askInput, '#submit1234', () => {});
         ask.catch(() => {});
 
@@ -1651,15 +1663,16 @@ function testVoiceStablePreflightRejectsLoggedOutPage() {
       let borrowedCloses = 0, dedicatedFacts = 0, newPages = 0;
       const borrowed = { id: 'guest', url: () => 'https://chatgpt.com/c/idle', isClosed: () => false, close: async () => { borrowedCloses++; }, evaluate: async () => ({ origin: 'https://chatgpt.com', readyState: 'complete' }) };
       const dedicated = { id: 'logged-in', url: () => 'https://chatgpt.com/', isClosed: () => false, close: async () => {}, evaluate: async () => ({ origin: 'https://chatgpt.com', readyState: 'complete' }) };
+      dedicated.createCDPSession = async () => ({ send: async () => ({ cookies: [] }), detach: async () => {} });
       const runtime = testing.createDaemonRuntime({ browser: { isConnected: () => true, newPage: async () => { newPages++; return dedicated; } }, bootstrapPage: borrowed, project: policy.parse('g-p-auth123-mcp', 'MCP') });
       testing.dom.sessionPageFact = async page => page.id === 'guest'
         ? { kind: 'logged-out', origin: 'https://chatgpt.com', readyState: 'complete' }
         : (dedicatedFacts++, { kind: 'authenticated', origin: 'https://chatgpt.com', readyState: 'complete' });
       const submitted = [];
-      testing.dom.transcribeAudioFile = async page => { submitted.push(page.id); return 'authenticated transcript'; };
+      testing.dom.transcribeAudioFile = async page => { submitted.push(page.id); return { text: 'authenticated transcript', accessToken: 'fixture-token' }; };
       (async () => {
         await runtime.pageFor('#idle');
-        const result = await testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, () => false);
+        const result = await testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, new AbortController().signal);
         assert.strictEqual(result.text, 'authenticated transcript');
         // guest/login页必须在POST前退役；只有连续稳定的登录页能进入唯一direct调用。
         assert.deepStrictEqual(submitted, ['logged-in']);
@@ -1700,27 +1713,29 @@ function testVoiceStatusCounts() {
   `);
 }
 
-// deadline从进入voice队列前起算，排队时间不能在拿到锁后重新获得一整份预算。
+// 请求 signal 在排队前建立，取消和超时都必须中止同一页面任务。
 // direct期间不持有foreground；取消必须先settle或隔离页面任务再释放voiceLock。
 function testVoiceDeadlineAndForeground() {
   runCoreFixture('chatgpt-voice-foreground-', dir => {
     const voice = path.join(dir, 'voice.wav'); writeTinyWav(voice);
     return String.raw`
       const assert = require('assert'); const policy = require('./chatgpt-project'); const { testing } = require('./chatgpt-core');
-      let closed = false, closeCalls = 0, rejectDirect, directStarted = false;
+      const controller = new AbortController(); let closeCalls = 0, rejectDirect, directStarted = false;
       const page = { url: () => 'https://chatgpt.com/', isClosed: () => false, evaluate: async () => ({ kind: 'authenticated', origin: 'https://chatgpt.com', readyState: 'complete' }), close: async () => { closeCalls++; rejectDirect?.(new Error('target closed')); } };
+      page.createCDPSession = async () => ({ send: async () => ({ cookies: [] }), detach: async () => {} });
       const runtime = testing.createDaemonRuntime({ browser: { isConnected: () => true, newPage: async () => page }, bootstrapPage: page, project: policy.parse('g-p-fg123-mcp', 'MCP') });
       testing.dom.transcribeAudioFile = async () => { directStarted = true; return new Promise((_, reject) => { rejectDirect = reject; }); };
       testing.dom.cancelDirectVoice = async () => { rejectDirect(Object.assign(new Error('Voice transcription cancelled'), { code: 'VOICE_CANCELLED' })); };
       (async () => {
-        const task = testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, () => closed);
+        const task = testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, controller.signal);
         while (!directStarted) await new Promise(resolve => setImmediate(resolve));
-        closed = true;
+        controller.abort();
         const bounded = Promise.race([task, new Promise((_, reject) => setTimeout(() => reject(new Error('direct cancellation stayed pending')), 1_500))]);
         await assert.rejects(bounded, error => error.code === 'VOICE_CANCELLED');
         assert.strictEqual(closeCalls, 0, 'a direct request that settles after abort may release its stable page');
-        testing.dom.transcribeAudioFile = async () => 'after cancel';
-        assert.strictEqual((await testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, () => false)).text, 'after cancel', 'cancelled direct work must release voice queue for the next request');
+        // 已正常响应 abort 的页面继续可借用，避免一次取消破坏整个共享浏览器生命周期。
+        testing.dom.transcribeAudioFile = async () => ({ text: 'after cancel', accessToken: 'fixture-token' });
+        assert.strictEqual((await testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, new AbortController().signal)).text, 'after cancel', 'cancelled direct work must release voice queue for the next request');
         let release, lateCalls = 0, cancelled = false;
         const first = runtime.withForeground(() => new Promise(resolve => { release = resolve; }), { assertUsable() {} });
         const late = runtime.withForeground(() => { lateCalls++; }, { assertUsable() { if (cancelled) throw Object.assign(new Error('cancelled'), { code: 'VOICE_CANCELLED' }); } });
@@ -1734,7 +1749,23 @@ function testVoiceDeadlineAndForeground() {
         // close超时保留browser/profile供后继daemon重连；禁止child kill，owner record也不能被当作已关闭删除。
         assert.deepStrictEqual({ closeResult, disconnected, killed }, { closeResult: false, disconnected: 1, killed: 0 });
         const stalled = testing.createDaemonRuntime({ browser: { isConnected: () => true, newPage: () => new Promise(() => {}) }, bootstrapPage: null, project: policy.parse('g-p-stall123-mcp', 'MCP') });
-        await assert.rejects(Promise.race([testing.runVoiceRequest(stalled, { file: ${JSON.stringify(voice)} }, () => {}, () => false), new Promise((_, reject) => setTimeout(() => reject(new Error('page preparation stayed pending')), 3_000))]), error => error.code === 'VOICE_RUNTIME_FATAL');
+        // 测试 signal 加速业务到期，清理仍使用生产1000ms；fatal 必须原样通知 daemon。
+        let fatal; stalled.onFatal = error => { fatal = error; };
+        await assert.rejects(Promise.race([testing.runVoiceRequest(stalled, { file: ${JSON.stringify(voice)} }, () => {}, AbortSignal.timeout(100)), new Promise((_, reject) => setTimeout(() => reject(new Error('page preparation stayed pending')), 3_000))]), error => error.code === 'VOICE_RUNTIME_FATAL');
+        assert.strictEqual(fatal.code, 'VOICE_RUNTIME_FATAL');
+        // 后项必须在前项失败前真实入队；页面准备就绪信号排除单测调度先后的猜测。
+        let entered; const preparing = new Promise(resolve => { entered = resolve; });
+        const queuedRuntime = testing.createDaemonRuntime({ browser: { isConnected: () => true, newPage: () => { entered(); return new Promise(() => {}); } }, bootstrapPage: null, project: policy.parse('g-p-stall123-mcp', 'MCP') });
+        const firstAbort = new AbortController();
+        const failing = testing.runVoiceRequest(queuedRuntime, { file: ${JSON.stringify(voice)} }, () => {}, firstAbort.signal).catch(error => error);
+        await preparing;
+        const successor = testing.runVoiceRequest(queuedRuntime, { file: ${JSON.stringify(voice)} }, () => {}, AbortSignal.timeout(5000)).catch(error => error);
+        // 前项已读取音频而后项尚未开始；删除文件使错误继续验证的路径确定性暴露ENOENT。
+        require('fs').unlinkSync(${JSON.stringify(voice)}); firstAbort.abort();
+        const failed = await failing;
+        assert.strictEqual(failed.code, 'VOICE_RUNTIME_FATAL');
+        // 必须是同一sticky错误；后项自身超时或文件错误都不能冒充已正确终止。
+        assert.strictEqual(await successor, failed);
       })().catch(error => { console.error(error.stack || error); process.exit(1); });
     `;
   });
@@ -2651,12 +2682,13 @@ async function testDirectVoiceTranscribeSkipsComposerWait() {
       evaluate: async (_fn, config) => {
         calls.evaluate++;
         // direct upload 的唯一 page.evaluate 输入应包含音频 bytes 配置；其它 evaluate 代表意外触碰 DOM fallback。
-        if (config?.audioBase64) return { ok: true, text: 'direct transcript', elapsedMs: 7 };
+        if (config?.audioBase64) return { ok: true, text: 'direct transcript', accessToken: 'fixture-token', elapsedMs: 7 };
         throw new Error('unexpected page.evaluate before direct upload');
       },
     };
-    const text = await createChatGPTDom({ responseTimeout: 1000 }).transcribeAudioFile(page, voice, projectUrl, () => {});
-    assert.strictEqual(text, 'direct transcript');
+    const result = await createChatGPTDom({ responseTimeout: 1000 }).transcribeAudioFile(page, voice, projectUrl, () => {});
+    // DOM公开结果只交付文字与本次凭据；耗时仍属于日志，不进入消费者合同。
+    assert.deepStrictEqual(result, { text: 'direct transcript', accessToken: 'fixture-token' });
     // direct path 成功时不应触发 goto 导航(直接返回文本,不进入 fallback)
     assert.deepStrictEqual(calls.goto, []);
     // composer wait 和 fake mic 都是 fallback-only 行为；direct 成功时必须保持为零以避免固定 3 秒浪费。
@@ -2677,9 +2709,9 @@ async function testDirectVoiceTranscribeSkipsComposerWait() {
   }
 }
 
-// Bearer只能从当前页面client-bootstrap读取并用于本次fetch，Node测试只能看到请求shape布尔事实。
+// Bearer从当前页面client-bootstrap读取；成功结果必须携带本次POST使用的原值供私有快照复用。
 // logged-out或缺token必须在POST前失败；HTTP错误仍保持一次请求且不得切换端点。
-// 成功response只返回文本和耗时，凭据不能穿过page.evaluate结果边界。
+// 页面在响应前更换bootstrap，验证返回值不是成功后再次读取的另一份凭据。
 async function testDirectVoiceUsesBootstrapAuth() {
   const { createChatGPTDom } = require('./chatgpt-dom');
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-direct-bootstrap-auth-'));
@@ -2721,6 +2753,7 @@ async function testDirectVoiceUsesBootstrapAuth() {
           accept = headers.accept || null;
           language = headers['oai-language'] || null;
           authorization = headers.authorization || null;
+          await page.evaluate(() => { document.querySelector('#client-bootstrap').textContent = JSON.stringify({ authStatus: 'logged_in', session: { accessToken: 'later-token' } }); });
           // 真实short voice曾被15秒页面timer误杀；fixture跨过该边界但仍位于本次20秒总预算内。
           await new Promise(resolve => setTimeout(resolve, 15_200));
           try { return await request.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ text: 'bootstrap transcript' }) }); }
@@ -2730,8 +2763,11 @@ async function testDirectVoiceUsesBootstrapAuth() {
       });
       await page.goto('https://chatgpt.com');
       const dom = createChatGPTDom({ responseTimeout: 20_000 });
-      const text = await dom.transcribeAudioFile(page, voice, 'https://chatgpt.com', () => {}, () => false, () => {}, { requestID: 'bootstrap-auth', timeoutMs: 20_000 });
-      assert.strictEqual(text, 'bootstrap transcript');
+      const logs = [];
+      const result = await dom.transcribeAudioFile(page, voice, 'https://chatgpt.com', message => logs.push(message), () => false, () => {}, { requestID: 'bootstrap-auth', timeoutMs: 20_000 });
+      assert.deepStrictEqual(result, { text: 'bootstrap transcript', accessToken: 'page-access-token' });
+      // 私有返回值允许凭据，诊断日志仍只能记录耗时，不能泄漏任一版本的token。
+      assert.ok(!logs.join('\n').includes('page-access-token') && !logs.join('\n').includes('later-token'));
       // 一个输入只走网页当前authenticated POST；Bearer与cookie同源发送，不能切换第二种上传算法。
       assert.strictEqual(sessionRequests, 0);
       assert.strictEqual(transcribeRequests, 1);
@@ -2758,7 +2794,7 @@ async function testDirectVoiceUsesBootstrapAuth() {
 
 // 四态事实同时约束bootstrap、composer和登录入口，防止半登录DOM被简单布尔值误判。
 // Mutation等待只观察当前页面自然收敛，不触发刷新、导航或旧session endpoint请求。
-// adapter返回固定非敏感联合，accessToken永远不进入core或测试进程。
+// 状态探针仍返回固定非敏感联合；成功转录的私有凭据合同不应扩大到探针。
 async function testSessionPageFactUsesBootstrapAuth() {
   const { createChatGPTDom } = require('./chatgpt-dom');
   await withBrowserPage('session page fact', 'chatgpt-session-page-fact-', async page => {
@@ -2865,16 +2901,12 @@ async function testVoiceSkipsStaleBrowserDaemon() {
   }
 }
 
-// 一个CLI事务对可恢复429执行初次加三次相同endpoint attempt；第四次成功即返回文本。
-// 重试次数来自用户合同，每次仍只有一个direct endpoint，不允许切DOM或第二上传算法。
+// 浏览器已是末级恢复：429 必须结束当前 CLI，不能再次上传同一个 WAV。
 async function testVoiceRetriesRecoverableFailure() {
-  // 三个独立429响应是远端producer事实，第四次literal文本是独立expected；测试不复刻classifier算法。
-  // calls=4锁定“初次+三次”用户合同，也防止无界循环或成功后继续发送第五次。
+  // 第二个响应属于下一次显式 CLI 调用；它同时验证 text+auth 在传输层完整保留。
   const fixture = await withFakeDaemon({ browserConnected: true, voiceResponses: [
     { status: 429, body: { ok: false, code: 'VOICE_RATE_LIMIT', error: 'rate limited 1' } },
-    { status: 429, body: { ok: false, code: 'VOICE_RATE_LIMIT', error: 'rate limited 2' } },
-    { status: 429, body: { ok: false, code: 'VOICE_RATE_LIMIT', error: 'rate limited 3' } },
-    { status: 200, body: { ok: true, text: 'retry recovered' } },
+    { status: 200, body: { ok: true, text: 'next recording', auth: { cookies: [], fetchedAt: '2026-09-18T00:00:00.000Z' } } },
   ] });
   const voice = path.join(fixture.dir, 'one request.wav');
   writeTinyWav(voice);
@@ -2882,10 +2914,13 @@ async function testVoiceRetriesRecoverableFailure() {
     const result = await runChatgptCLI(['transcribe-file', '--file', voice, '--json'], {
       ...fixture.env,
     }, 15_000);
-    assert.strictEqual(result.status, 0, result.stderr);
-    assert.deepStrictEqual(JSON.parse(result.stdout), { text: 'retry recovered' });
-    assert.strictEqual(fixture.calls.voice, 4, 'initial request plus three retries must use the same endpoint contract');
+    assert.strictEqual(result.status, 1);
+    assert.match(result.stderr, /rate limited 1/);
+    assert.strictEqual(fixture.calls.voice, 1, 'the final browser attempt must not retry');
     assert.strictEqual(fixture.calls.stop, 0, 'HTTP 429 does not invalidate a healthy daemon/browser lifecycle');
+    const next = await runChatgptCLI(['transcribe-file', '--file', voice, '--json'], fixture.env);
+    assert.strictEqual(next.status, 0, next.stderr);
+    assert.deepStrictEqual(JSON.parse(next.stdout), { text: 'next recording', auth: { cookies: [], fetchedAt: '2026-09-18T00:00:00.000Z' } });
   } finally {
     await fixture.close();
   }
@@ -2926,7 +2961,7 @@ async function testVoiceDoesNotRetryDeterministicFailure() {
   }
 }
 
-// local 401只允许复用已经发布且身份变化的usable daemon；旧token不得stop或删除current discovery。
+// 旧 token 收到401即结束本次语音；保留新发布索引供下一次调用，不能自动重发。
 async function testDaemonIdentityMismatchReconcilesCurrentDaemon() {
   // replacement先独立监听并发布完整state；旧daemon只在业务401边界替换发现文件，复现真实并发生命周期。
   const replacement = await withFakeDaemon({ browserConnected: true, voiceResponse: { status: 200, body: { ok: true, text: 'replacement daemon' } } });
@@ -2935,10 +2970,10 @@ async function testDaemonIdentityMismatchReconcilesCurrentDaemon() {
   writeTinyWav(voice);
   try {
     const result = await runChatgptCLI(['transcribe-file', '--file', voice, '--json'], { ...fixture.env, CHATGPT_VOICE_FILE_ROOTS: fixture.dir }, 15_000);
-    assert.strictEqual(result.status, 0, result.stderr);
-    assert.deepStrictEqual(JSON.parse(result.stdout), { text: 'replacement daemon' });
-    // 两个stop计数均为0证明reconciliation没有拿旧token碰A/B shutdown，也没有把B索引当stale删除。
-    assert.deepStrictEqual({ firstVoice: fixture.calls.voice, firstStop: fixture.calls.stop, replacementVoice: replacement.calls.voice, replacementStop: replacement.calls.stop }, { firstVoice: 1, firstStop: 0, replacementVoice: 1, replacementStop: 0 });
+    assert.strictEqual(result.status, 1);
+    assert.match(result.stderr, /Unauthorized daemon request/);
+    // 新旧 daemon 均不得被旧调用关闭；replacement 零 POST 证明没有隐藏的第二次尝试。
+    assert.deepStrictEqual({ firstVoice: fixture.calls.voice, firstStop: fixture.calls.stop, replacementVoice: replacement.calls.voice, replacementStop: replacement.calls.stop }, { firstVoice: 1, firstStop: 0, replacementVoice: 0, replacementStop: 0 });
   } finally {
     await fixture.close();
     await replacement.close();
@@ -3073,10 +3108,19 @@ async function testViewportResyncClearsStaleLayoutSize() {
       const page = await acquired.browser.newPage();
       const session = await page.createCDPSession();
       // 用CDP metrics override模拟renderer卡在小尺寸：innerWidth不再跟随窗口。
+      // 先建立真实大窗口前提；默认窗口可能较小，500x400会落在生产允许的正常尺寸差内。
+      const win = await session.send('Browser.getWindowForTarget');
+      await session.send('Browser.setWindowBounds', { windowId: win.windowId, bounds: { windowState: 'normal' } });
+      await session.send('Browser.setWindowBounds', { windowId: win.windowId, bounds: { width: 1200, height: 900 } });
+      // 等实际布局就绪后再注入旧尺寸，避免窗口resize尚未应用就检查恢复结果。
+      await page.waitForFunction(() => window.innerWidth > 700 && window.innerHeight > 500, { timeout: 5000 });
       await session.send('Emulation.setDeviceMetricsOverride', { width: 500, height: 400, deviceScaleFactor: 1, mobile: false });
       assert.strictEqual(await page.evaluate(() => window.innerWidth), 500, 'fixture must pin the stale layout size');
       await session.detach();
       await testing.syncPageViewportWithWindow(page);
+      // CDP确认清除override时renderer可能尚未重排；等待结果可见，不重复执行同步修复。
+      // 故障尺寸与最终断言保持原值，缺少sync的负对照仍无法越过这个条件。
+      await page.waitForFunction(() => window.innerWidth > 700 && window.innerHeight > 500, { timeout: 5000 });
       const synced = await page.evaluate(() => ({ w: window.innerWidth, h: window.innerHeight }));
       assert.ok(synced.w > 700 && synced.h > 500, 'viewport resync must restore window-following layout size: ' + JSON.stringify(synced));
       assert.strictEqual(await testing.closeOwnedBrowser(acquired.browser), true);
@@ -3350,7 +3394,7 @@ async function testDebugPortDaemonCrashReconnectsAndStops() {
     process.env.CHATGPT_TEST_HOOKS = '1';
     const core = require(${JSON.stringify(path.join(__dirname, 'chatgpt-core.js'))});
     core.testing.dom.sessionPageFact = async () => ({ kind: 'authenticated', origin: 'https://chatgpt.com', readyState: 'complete' });
-    core.testing.dom.transcribeAudioFile = async () => 'daemon lifecycle';
+    core.testing.dom.transcribeAudioFile = async () => ({ text: 'daemon lifecycle', accessToken: 'fixture-token' });
     core.startDaemonProcess();
   `);
   const env = { CHATGPT_STATE_DIR: dir, CHATGPT_SESSION_DIR: path.join(dir, 'sessions'), CHATGPT_VOICE_FILE_ROOTS: dir, CHATGPT_BROWSER_PATH: browserPath, CHATGPT_BROWSER_DEBUG_PORT: String(port), CHATGPT_DAEMON_INTERNAL_SCRIPT: wrapper, CHATGPT_DAEMON_START_TIMEOUT_MS: '30000', CHATGPT_TEST_HEADLESS: '1' };
@@ -3713,6 +3757,91 @@ async function testVoiceCancelSendSafeOnClosedRes() {
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+  // 真正断开 TCP，经过生产 route/controller/页面 fetch，再确认同一 daemon 可接收下一次录音。
+  await withBrowserPage('HTTP voice cancellation', 'chatgpt-http-cancel-', async (_page, browser) => {
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-http-state-'));
+    const voice = path.join(stateDir, 'voice.wav'); writeTinyWav(voice);
+    // HTTP 导出读取另一个离线 profile，Cookie 不在浏览器里，防止接口偷偷沿用 CDP。
+    if (process.platform === 'win32') {
+      const root = path.join(stateDir, 'profile'); fs.mkdirSync(path.join(root, 'Default', 'Network'), { recursive: true });
+      const sealed = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Add-Type -AssemblyName System.Security; [Convert]::ToBase64String([Security.Cryptography.ProtectedData]::Protect([Convert]::FromBase64String([Console]::In.ReadToEnd()), $null, [Security.Cryptography.DataProtectionScope]::CurrentUser))'], { input: Buffer.alloc(32, 7).toString('base64'), encoding: 'utf8', windowsHide: true });
+      assert.strictEqual(sealed.status, 0, 'HTTP fixture DPAPI protection failed');
+      fs.writeFileSync(path.join(root, 'Local State'), JSON.stringify({ os_crypt: { encrypted_key: Buffer.concat([Buffer.from('DPAPI'), Buffer.from(sealed.stdout.trim(), 'base64')]).toString('base64') } }));
+      const db = new (require('node:sqlite').DatabaseSync)(path.join(root, 'Default', 'Network', 'Cookies'));
+      // 这里覆盖 SQLite 明文字段；v10 与域摘要由 CLI 的独立加密 fixture 完整覆盖。
+      try { db.exec("CREATE TABLE meta (key TEXT, value TEXT); INSERT INTO meta VALUES ('version', '24'); CREATE TABLE cookies (host_key TEXT, name TEXT, value TEXT, encrypted_value BLOB, path TEXT, expires_utc INTEGER); INSERT INTO cookies VALUES ('chatgpt.com', 'offline', 'http-cookie', x'', '/', 0)"); } finally { db.close(); }
+    }
+    const script = `
+      const assert = require('assert'), puppeteer = require('puppeteer-core');
+      const connect = puppeteer.connect.bind(puppeteer), timeout = AbortSignal.timeout;
+      // 只加速测试时钟，同时校验生产每次请求确实创建固定40000ms signal。
+      AbortSignal.timeout = ms => { assert.strictEqual(ms, 40000); return timeout(2000); };
+      puppeteer.connect = async (...args) => {
+        const browser = await connect(...args), newPage = browser.newPage.bind(browser); let posts = 0;
+        browser.newPage = async () => {
+          const page = await newPage();
+          // 在 newPage 返回前安装远端 fixture，避免导航竞态触达真实 ChatGPT。
+          await page.setRequestInterception(true);
+          await page.evaluateOnNewDocument(() => {
+            const timer = window.setTimeout; window.voiceTimers = [];
+            window.setTimeout = (fn, ms, ...args) => { window.voiceTimers.push(ms); return timer(fn, ms, ...args); };
+          });
+          page.on('request', request => {
+            if (request.url().includes('/backend-api/transcribe')) {
+              posts++; process.stdout.write('POST\\n');
+              // 前两次挂起分别由客户端断开和固定期限终止；第三次证明队列仍可用。
+              if (posts <= 2) return;
+              return request.respond({ status: 200, contentType: 'application/json', body: '{"text":"after abort"}' });
+            }
+            request.respond({ status: 200, contentType: 'text/html', body: '<div id="prompt-textarea"></div><script id="client-bootstrap" type="application/json">{"authStatus":"logged_in","session":{"accessToken":"fixture"}}</script>' });
+          });
+          return page;
+        };
+        return browser;
+      };
+      require('./chatgpt-core').startDaemonProcess();
+    `;
+    const env = { ...BASE_ENV, CHATGPT_STATE_DIR: stateDir, CHATGPT_SESSION_DIR: path.join(stateDir, 'sessions'), CHATGPT_VOICE_FILE_ROOTS: stateDir, CHATGPT_BROWSER_WS_ENDPOINT: browser.wsEndpoint() };
+    const child = spawn(process.execPath, ['-'], { cwd: __dirname, env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    const closed = new Promise(resolve => child.once('close', resolve));
+    let stderr = ''; child.stderr.on('data', chunk => { stderr += chunk; }); child.stdin.end(script);
+    let state;
+    try {
+      // readiness 只读取此测试的 daemon 索引；不探测或连接用户运行中的实例。
+      for (let i = 0; i < 100 && !fs.existsSync(path.join(stateDir, 'daemon.json')); i++) await new Promise(resolve => setTimeout(resolve, 50));
+      assert.ok(fs.existsSync(path.join(stateDir, 'daemon.json')), stderr || 'isolated daemon did not become ready');
+      state = JSON.parse(fs.readFileSync(path.join(stateDir, 'daemon.json'), 'utf8'));
+      const headers = { authorization: 'Bearer ' + state.token, 'content-type': 'application/json' };
+      const url = 'http://127.0.0.1:' + state.port;
+      if (process.platform === 'win32') {
+        // 正常认证 HTTP 返回 CookieExport，不能夹带浏览器 bootstrap bearer。
+        const exported = await fetch(url + '/auth/export', { method: 'POST', headers }).then(response => response.json());
+        assert.deepStrictEqual(Object.keys(exported).sort(), ['cookies', 'fetchedAt', 'ok']);
+        assert.deepStrictEqual(exported.cookies, [{ name: 'offline', value: 'http-cookie', domain: 'chatgpt.com', path: '/', expires: 0 }]);
+      }
+      const started = new Promise(resolve => child.stdout.once('data', resolve));
+      const request = http.request(url + '/voice/transcribe-file', { method: 'POST', headers });
+      request.on('error', () => {}); request.end(JSON.stringify({ file: voice }));
+      await started; request.destroy();
+      const page = (await browser.pages()).find(page => page.url() === 'https://chatgpt.com/');
+      // 页面请求表清空证明 AbortController 真正退出 fetch，不只是客户端停止等待。
+      await page.waitForFunction(() => Object.keys(window.__opencodeVoiceRequests || {}).length === 0, { timeout: 5000 });
+      const timed = await fetch(url + '/voice/transcribe-file', { method: 'POST', headers, body: JSON.stringify({ file: voice }) });
+      assert.strictEqual((await timed.json()).code, 'VOICE_TIMEOUT');
+      // route 时钟虽加速，页面计时参数仍须固定40秒，不能被改成 remaining 或测试期限。
+      assert.deepStrictEqual(await page.evaluate(() => window.voiceTimers.filter(ms => ms === 40000)), [40000, 40000]);
+      const next = await runChatgptCLI(['transcribe-file', '--file', voice, '--json'], env);
+      assert.strictEqual(next.status, 0, next.stderr);
+      assert.strictEqual(JSON.parse(next.stdout).text, 'after abort');
+      assert.ok(Array.isArray(JSON.parse(next.stdout).auth.cookies));
+    } finally {
+      // shared browser 由外层 fixture 关闭；这里只停止自己的 daemon，并等待进程结束。
+      if (state) await fetch('http://127.0.0.1:' + state.port + '/stop', { method: 'POST', headers: { authorization: 'Bearer ' + state.token } }).catch(() => {});
+      else child.kill();
+      await closed;
+      fs.rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
 }
 
 main().catch(err => {
@@ -3720,118 +3849,127 @@ main().catch(err => {
   process.exit(1);
 });
 
-// auth-export 是 TUI 私有 side-channel：导出必须复用 voice 页面所有权（与进行中的转写经 voice 锁串行），
-// 登录会话产出 slim cookie + bootstrap token；未登录返回确定性错误码而非重试。
-function testAuthExportExportsLoggedInSession() {
-  // 本机 Windows 宿主对 `node -e <本 fixture 脚本>` 的 argv 传输确定性失败（spawn 阶段 EPERM/
-  // 0xC0000142，与脚本逻辑无关：同内容落盘后以文件模式执行可跑通；更小/更大脚本 -e 均正常）。
-  // 因此这里沿用 runCoreFixture 的 env 语义，改为把 fixture 落盘后按文件 spawn；
-  // 子进程仍驱动真实 runAuthExport + 假 runtime/page，保持黑盒语义一致。
+// 真实浏览器执行同源转录和 CDP 导出；fixture 只替代远端 HTTP，不替代 Cookie 算法。
+async function testAuthExportExportsLoggedInSession() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-auth-export-'));
   try {
-    fs.mkdirSync(path.join(dir, 'sessions'), { recursive: true });
     const voice = path.join(dir, 'voice.wav'); writeTinyWav(voice);
-    const fixture = path.join(dir, 'fixture.cjs');
-    fs.writeFileSync(fixture, String.raw`
-      const assert = require('assert');
-      const policy = require(${JSON.stringify(path.join(__dirname, 'chatgpt-project'))});
-      const { testing } = require(${JSON.stringify(path.join(__dirname, 'chatgpt-core'))});
-      const project = policy.parse('g-p-authexp1-mcp', 'MCP');
-      let evaluated = 0, detached = 0;
-      const page = {
-        current: 'about:blank', closed: false,
-        url() { return this.current; }, isClosed() { return this.closed; },
-        async goto(url) { this.current = url; }, async close() { this.closed = true; },
-        async evaluate() {
-          evaluated++;
-          // 生产代码在页面任务内读取 #client-bootstrap；fixture 直接返回登录会话事实。
-          if (this.current !== 'https://chatgpt.com') throw new Error('Voice page left the official ChatGPT origin');
-          return { origin: 'https://chatgpt.com', authStatus: 'logged_in', accessToken: 'tok-1' };
-        },
-        async createCDPSession() {
-          return {
-            async send(method, params) {
-              assert.strictEqual(method, 'Network.getCookies');
-              assert.deepStrictEqual(params, { urls: ['https://chatgpt.com'] });
-              // CDP 协议真实形态是 { cookies: [...] }；stub 必须镜像协议，否则会掩盖生产解构错误。
-              return { cookies: [
-                { name: '__Secure-next-auth.session-token', value: 'sess', domain: '.chatgpt.com', path: '/', expires: 1_900_000, httpOnly: true, secure: true, sameSite: 'Lax' },
-                { name: 'oai-did', value: 'did', domain: '.chatgpt.com', path: '/', expires: -1, httpOnly: false, secure: true },
-              ] };
-            },
-            async detach() { detached++; },
-          };
-        },
-      };
-      const runtime = testing.createDaemonRuntime({ browser: { isConnected: () => true, newPage: async () => page }, bootstrapPage: null, project });
-      testing.dom.sessionPageFact = async () => ({ kind: 'authenticated', origin: 'https://chatgpt.com', readyState: 'complete' });
-      let releaseVoice;
-      const voiceGate = new Promise(resolve => { releaseVoice = resolve; });
-      let voiceStartedResolve;
-      const voiceStarted = new Promise(resolve => { voiceStartedResolve = resolve; });
-      (async () => {
-        testing.dom.transcribeAudioFile = async () => { voiceStartedResolve(); await voiceGate; return 'voice text'; };
-        const voicePromise = testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, () => {}, () => false);
-        await voiceStarted;
-        const exportPromise = testing.runAuthExport(runtime);
-        await new Promise(resolve => setImmediate(resolve));
-        // evaluated 计数锁定导出在 voice 释放前零页面动作，不能与转写并发操作同一页面域。
-        assert.strictEqual(evaluated, 0, 'auth export must wait behind the active voice lease');
-        releaseVoice();
-        await voicePromise;
-        const exported = await exportPromise;
-        assert.strictEqual(exported.ok, true);
-        assert.strictEqual(exported.authStatus, 'logged_in');
-        assert.strictEqual(exported.accessToken, 'tok-1');
-        assert.deepStrictEqual(exported.cookies, [
-          { name: '__Secure-next-auth.session-token', value: 'sess', domain: '.chatgpt.com', path: '/', expires: 1_900_000, httpOnly: true, secure: true, sameSite: 'Lax' },
-          { name: 'oai-did', value: 'did', domain: '.chatgpt.com', path: '/', expires: -1, httpOnly: false, secure: true, sameSite: undefined },
-        ]);
-        assert.ok(exported.fetchedAt, 'export must carry a fetchedAt timestamp');
-        assert.strictEqual(detached, 1, 'CDP session must be detached after the export');
-        // 未登录是确定性介入：换页 evaluate 直接返回 logged_out，锁定结构化错误码而非 5xx 外壳。
-        page.evaluate = async () => ({ origin: 'https://chatgpt.com', authStatus: 'logged_out', accessToken: null });
-        await assert.rejects(() => testing.runAuthExport(runtime), err => err.code === 'AUTH_EXPORT_LOGIN_REQUIRED');
-      })().catch(error => { console.error(error.stack || error); process.exit(1); });
-    `);
-    const child = spawnSync(process.execPath, [fixture], { cwd: __dirname, encoding: 'utf8', timeout: 8_000, windowsHide: true, env: { ...BASE_ENV, CHATGPT_TEST_HOOKS: '1', CHATGPT_VOICE_FILE_ROOTS: dir, CHATGPT_STATE_DIR: dir, CHATGPT_SESSION_DIR: path.join(dir, 'sessions') } });
-    assert.strictEqual(child.status, 0, child.error?.stack || child.stderr || child.stdout);
+    await withBrowserPage('voice CookieExport', 'chatgpt-cookie-browser-', async (page, browser) => {
+      let posts = 0, sessions = 0;
+      await page.setRequestInterception(true);
+      page.on('request', request => {
+        if (request.url().includes('/api/auth/session')) sessions++;
+        if (request.url().includes('/backend-api/transcribe')) {
+          posts++;
+          // 响应时更新 HttpOnly Cookie，返回值必须来自本次转录之后的同一个页面租约。
+          return request.respond({ status: 200, contentType: 'application/json', headers: { 'set-cookie': 'voice-fixture=updated; Path=/; Secure; HttpOnly' }, body: '{"text":"voice text"}' });
+        }
+        return request.respond({ status: 200, contentType: 'text/html', body: '<div id="prompt-textarea" contenteditable="true"></div><script id="client-bootstrap" type="application/json">{"authStatus":"logged_in","session":{"accessToken":"fixture-token"}}</script>' });
+      });
+      await page.goto('https://chatgpt.com/');
+      const script = String.raw`
+        const assert = require('assert'), puppeteer = require('puppeteer-core'), { testing } = require('./chatgpt-core');
+        (async () => {
+          const browser = await puppeteer.connect({ browserWSEndpoint: ${JSON.stringify(browser.wsEndpoint())} });
+          try {
+            const page = (await browser.pages()).find(p => p.url() === 'https://chatgpt.com/');
+            const runtime = testing.createDaemonRuntime({ browser, bootstrapPage: page, project: null });
+            const logs = [];
+            const result = await testing.runVoiceRequest(runtime, { file: ${JSON.stringify(voice)} }, message => logs.push(message), new AbortController().signal);
+            assert.strictEqual(result.text, 'voice text');
+            assert.deepStrictEqual(Object.keys(result.auth).sort(), ['accessToken', 'cookies', 'fetchedAt']);
+            // core必须消费DOM同次结果，不能用另一次bootstrap读取替代成功POST的账户身份。
+            assert.strictEqual(result.auth.accessToken, 'fixture-token');
+            assert.ok(!logs.join('').includes('fixture-token') && !logs.join('').includes('updated'));
+            // HttpOnly 对页面 JS 不可见，这个值只能由真实 CDP 从浏览器 Cookie store 取得。
+            assert.ok(result.auth.cookies.some(c => c.name === 'voice-fixture' && c.value === 'updated' && c.httpOnly));
+            assert.ok(Number.isFinite(Date.parse(result.auth.fetchedAt)));
+            // 成功导出后队列必须可再次取得，不能把 CDP 完成点留在租约外。
+            assert.strictEqual(await runtime.withSubmission(async () => 'released'), 'released');
+          } finally { browser.disconnect(); }
+        })().catch(error => { console.error(error.stack); process.exitCode = 1; });
+      `;
+      const child = spawn(process.execPath, ['-e', script], { cwd: __dirname, windowsHide: true, env: { ...BASE_ENV, CHATGPT_TEST_HOOKS: '1', CHATGPT_VOICE_FILE_ROOTS: dir, CHATGPT_STATE_DIR: dir, CHATGPT_SESSION_DIR: path.join(dir, 'sessions') }, stdio: ['ignore', 'ignore', 'pipe'] });
+      let stderr = ''; child.stderr.on('data', chunk => { stderr += chunk; });
+      assert.strictEqual(await new Promise(resolve => child.once('close', resolve)), 0, stderr);
+      assert.strictEqual(posts, 1);
+      assert.strictEqual(sessions, 0, 'voice must never refresh the browser session');
+    });
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 }
 
-// CLI 黑盒：auth-export --json 输出完整凭据（opencode 收割入口），默认摘要不泄漏 token；
-// 登录介入错误（400 + AUTH_EXPORT_LOGIN_REQUIRED）单次失败退出，不重试。
+// 独立明文经原生 DPAPI 和 SQLite 落盘；原 CLI 必须离线解密，不能用 daemon 响应冒充 profile。
 async function testAuthExportCliAgainstFakeDaemon() {
-  const daemon = await withFakeDaemon({
-    browserConnected: true,
-    authExportResponse: { status: 200, body: { ok: true, authStatus: 'logged_in', accessToken: 'secret-access-token-9f', cookies: [{ name: 'a', value: '1', expires: -1 }], fetchedAt: '2026-09-06T00:00:00.000Z' } },
-  });
-  // 独立 daemon 实例隔离 400 响应，避免与 200 用例共享调用计数。
-  const loggedOut = await withFakeDaemon({
-    browserConnected: true,
-    authExportResponse: { status: 400, body: { ok: false, code: 'AUTH_EXPORT_LOGIN_REQUIRED', error: 'ChatGPT page is not logged in' } },
-  });
+  if (process.platform !== 'win32') throw new SkipError('native DPAPI fixture requires Windows');
+  const { DatabaseSync } = require('node:sqlite');
+  const daemon = await withFakeDaemon({ browserConnected: true });
+  const root = path.join(daemon.dir, 'owned-profile');
+  fs.mkdirSync(path.join(root, 'Selected', 'Network'), { recursive: true });
+  const key = crypto.randomBytes(32);
   try {
-    const harvested = await runChatgptCLI(['auth-export', '--json'], daemon.env, 15_000);
+    // DPAPI 绑定当前用户；密钥只走 stdin/stdout，绝不进入命令参数或断言失败输出。
+    const protectedKey = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Add-Type -AssemblyName System.Security; [Convert]::ToBase64String([Security.Cryptography.ProtectedData]::Protect([Convert]::FromBase64String([Console]::In.ReadToEnd()), $null, [Security.Cryptography.DataProtectionScope]::CurrentUser))'], { input: key.toString('base64'), encoding: 'utf8', windowsHide: true });
+    assert.strictEqual(protectedKey.status, 0, 'native fixture key protection failed');
+    fs.writeFileSync(path.join(root, 'Local State'), JSON.stringify({ os_crypt: { encrypted_key: Buffer.concat([Buffer.from('DPAPI'), Buffer.from(protectedKey.stdout.trim(), 'base64')]).toString('base64') } }));
+    const db = new DatabaseSync(path.join(root, 'Selected', 'Network', 'Cookies'));
+    try {
+      db.exec('CREATE TABLE meta (key TEXT, value TEXT); INSERT INTO meta VALUES (\'version\', \'24\'); CREATE TABLE cookies (host_key TEXT, name TEXT, value TEXT, encrypted_value BLOB, path TEXT, expires_utc INTEGER)');
+      // 固定预期值独立于解密器；同时覆盖会话期限、host-only、域摘要及不适用 Cookie。
+      for (const [domain, name, value, cookiePath, expires] of [
+        ['.chatgpt.com', 'session', 'fixture-session', '/', 1900000000],
+        ['chatgpt.com', 'device', 'fixture-device', '/', 0],
+        ['.chatgpt.com', 'nested', 'excluded', '/nested', 0],
+        ['other.chatgpt.com', 'subdomain', 'excluded', '/', 0],
+        ['.example.com', 'foreign', 'excluded', '/', 0],
+        ['.chatgpt.com', 'expired', 'excluded', '/', 1],
+      ]) {
+        const iv = crypto.randomBytes(12), cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+        const encrypted = Buffer.concat([Buffer.from('v10'), iv, cipher.update(Buffer.concat([crypto.createHash('sha256').update(domain).digest(), Buffer.from(value)])), cipher.final(), cipher.getAuthTag()]);
+        db.prepare('INSERT INTO cookies VALUES (?, ?, ?, ?, ?, ?)').run(domain, name, '', encrypted, cookiePath, expires ? (expires + 11644473600) * 1000000 : 0);
+      }
+    } finally { db.close(); }
+    const env = { ...daemon.env, CHATGPT_BROWSER_USER_DATA_DIR: root, CHATGPT_BROWSER_PROFILE_DIRECTORY: 'Selected', CHATGPT_BROWSER_PATH: path.join(daemon.dir, 'missing.exe') };
+    // 故意配置不存在的浏览器路径；成功只能来自所选 profile 的离线读取。
+    const harvested = await runChatgptCLI(['auth-export', '--json'], env, 15_000);
     assert.strictEqual(harvested.status, 0, harvested.stderr);
     const parsed = JSON.parse(harvested.stdout.trim());
-    assert.strictEqual(parsed.accessToken, 'secret-access-token-9f');
-    assert.strictEqual(parsed.authStatus, 'logged_in');
-    assert.strictEqual(parsed.cookies.length, 1);
-    assert.strictEqual(daemon.calls.authExport, 1);
-
-    // 摘要包含 token_expires 字段但不包含 token 本体：'secret-access-token-9f' 是唯一指纹。
-    const summary = await runChatgptCLI(['auth-export'], daemon.env, 15_000);
+    assert.deepStrictEqual(Object.keys(parsed).sort(), ['cookies', 'fetchedAt', 'ok']);
+    assert.strictEqual(parsed.ok, true);
+    assert.deepStrictEqual(parsed.cookies, [
+      { name: 'session', value: 'fixture-session', domain: '.chatgpt.com', path: '/', expires: 1900000000 },
+      { name: 'device', value: 'fixture-device', domain: 'chatgpt.com', path: '/', expires: 0 },
+    ]);
+    assert.ok(Number.isFinite(Date.parse(parsed.fetchedAt)));
+    assert.strictEqual(daemon.calls.authExport, 0, 'offline export must not consult the daemon');
+    const summary = await runChatgptCLI(['auth-export'], env, 15_000);
     assert.strictEqual(summary.status, 0, summary.stderr);
-    assert.ok(!summary.stdout.includes('secret-access-token-9f'), 'human summary must not leak the access token');
-    assert.match(summary.stdout, /status=logged_in cookies=1/);
-
-    const rejected = await runChatgptCLI(['auth-export', '--json'], loggedOut.env, 15_000);
+    assert.match(summary.stdout, /cookies=2/);
+    assert.ok(!summary.stdout.includes('fixture-session') && !summary.stdout.includes('fixture-device'));
+    // 纯导入不注册信号；预取消必须在读取数据库和启动子进程之前失败。
+    const imported = spawnSync(process.execPath, ['-'], { input: `
+      const assert = require('assert'), cp = require('child_process');
+      const before = ['SIGINT','SIGTERM'].map(s => process.listenerCount(s));
+      const controller = new AbortController(), spawn = cp.spawn; let child;
+      // 包装只在真实进程 spawn 后发取消，不替换 DPAPI 算法或进程完成信号。
+      cp.spawn = (...args) => { child = spawn(...args); child.once('spawn', () => controller.abort()); return child; };
+      const { exportProfileAuth } = require('./chatgpt');
+      assert.deepStrictEqual(['SIGINT','SIGTERM'].map(s => process.listenerCount(s)), before);
+      (async () => {
+        await assert.rejects(exportProfileAuth(AbortSignal.abort()), e => e.name === 'AbortError');
+        await assert.rejects(exportProfileAuth(controller.signal), e => e.name === 'AbortError');
+        assert.ok(child.exitCode !== null || child.signalCode !== null, 'export must wait for the DPAPI child to exit');
+      })().catch(error => { console.error(error.message); process.exitCode = 1; });
+    `, cwd: __dirname, env, encoding: 'utf8', timeout: 10_000 });
+    assert.strictEqual(imported.status, 0, imported.stderr);
+    // 合法 GCM 密文移到另一个允许域仍须失败；不能只剥离摘要而忽略域绑定。
+    const tampered = new DatabaseSync(path.join(root, 'Selected', 'Network', 'Cookies'));
+    try { tampered.exec("UPDATE cookies SET host_key = 'chatgpt.com' WHERE name = 'session'"); } finally { tampered.close(); }
+    const rejected = await runChatgptCLI(['auth-export', '--json'], env);
     assert.strictEqual(rejected.status, 1);
-    assert.match(rejected.stderr, /not logged in/);
-    assert.strictEqual(loggedOut.calls.authExport, 1, 'AUTH_EXPORT_LOGIN_REQUIRED must not be retried');
+    assert.match(rejected.stderr, /domain digest mismatch/);
+    assert.ok(!rejected.stderr.includes('fixture-session') && !rejected.stdout.includes('fixture-session'));
   } finally {
+    key.fill(0);
     await daemon.close();
-    await loggedOut.close();
   }
 }

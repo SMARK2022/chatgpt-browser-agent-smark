@@ -67,7 +67,8 @@ const PRIVATE_BROWSER_PID_FILE = path.join(STATE_DIR, 'browser-pid.json');
 const PRIVATE_BROWSER_PORT_FILE = path.join(STATE_DIR, 'browser-port.json');
 const CHATGPT_URL      = 'https://chatgpt.com';
 const DEFAULT_PROJECT  = process.env.CHATGPT_PROJECT || process.env.CHATGPT_PROJECT_NAME || process.env.CHATGPT_PROJECT_URL || 'MCP';
-const DAEMON_VERSION   = 24;
+// 与CLI同步升级私有协议，保证同次成功结果中的Bearer能供后续账户直连复用。
+const DAEMON_VERSION   = 26;
 const RESPONSE_TIMEOUT = positiveIntEnv('CHATGPT_RESPONSE_TIMEOUT_MS', 540_000); // 大文件分析会很慢，默认给 9 分钟。
 const MAX_RETURN_CHARS = positiveIntEnv('CHATGPT_MAX_RETURN_CHARS', 6_000);
 const RESPONSE_PREVIEW_CHARS = positiveIntEnv('CHATGPT_RESPONSE_PREVIEW_CHARS', 4_000);
@@ -83,9 +84,6 @@ const MAX_UPLOAD_FILES = positiveIntEnv('CHATGPT_MAX_UPLOAD_FILES', 12);
 const MAX_UPLOAD_BYTES = positiveIntEnv('CHATGPT_MAX_UPLOAD_BYTES', 400 * 1024 * 1024);
 const MAX_TOTAL_UPLOAD_BYTES = positiveIntEnv('CHATGPT_MAX_TOTAL_UPLOAD_BYTES', 800 * 1024 * 1024);
 const MAX_VOICE_FILE_BYTES = positiveIntEnv('CHATGPT_VOICE_FILE_MAX_BYTES', 50 * 1024 * 1024);
-// voice总预算从入队开始；80秒覆盖真实cold FIFO，并仍早于TUI 90秒和CLI 120秒外层终止。
-// 总预算覆盖页面准备和唯一direct请求；超时后voiceLock必须在settle或隔离后释放。
-const VOICE_TRANSCRIBE_TIMEOUT_MS = positiveIntEnv('CHATGPT_VOICE_TRANSCRIBE_TIMEOUT_MS', 80_000);
 // 长期复用页即使仍能 evaluate，也可能累积失效的 Service Worker/fetch 状态；到期主动换页作为健康维持上限。
 const VOICE_PAGE_MAX_AGE_MS = positiveIntEnv('CHATGPT_VOICE_PAGE_MAX_AGE_MS', 600_000);
 // startup与fresh voice page共享真实React hydrate预算；不能用更短snapshot误杀正常加载。
@@ -550,41 +548,16 @@ function browserProfileWritable() {
   catch { try { if (fs.existsSync(probe)) fs.unlinkSync(probe); } catch {} return false; }
 }
 
-// voice 转写的客户端断开检测:轮询 shouldCancel,断开时 reject 让 Promise.race 中止转写。
-// 必须通过返回的 .stop() 在 finally 中清除定时器,否则成功路径会永久轮询泄漏。
-function cancelSignal(shouldCancel, pollMs) {
-  let timer;
+// HTTP 断开与固定期限共享一次 abort 事件；成功后移除监听，避免请求闭包留在 signal 上。
+function cancelSignal(signal) {
+  let abort;
   const promise = new Promise((_, reject) => {
-    const check = () => {
-      if (shouldCancel()) reject(Object.assign(new Error('Voice transcription cancelled: client disconnected'), { code: 'VOICE_CANCELLED' }));
-      else timer = setTimeout(check, pollMs);
-    };
-    timer = setTimeout(check, pollMs);
+    abort = () => reject(Object.assign(new Error(signal.reason?.message || 'Voice transcription cancelled'), { code: signal.reason?.name === 'TimeoutError' ? 'VOICE_TIMEOUT' : 'VOICE_CANCELLED' }));
+    signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) abort();
   });
-  promise.stop = () => clearTimeout(timer);
+  promise.stop = () => signal.removeEventListener('abort', abort);
   return promise;
-}
-
-function makeRequestContext({ deadline, isClientClosed = () => false, runtime, pollMs = 500 }) {
-  let timer, notify, stopped = false; // 每个HTTP请求独占timer，禁止voice期限泄漏到ask。
-  const currentError = () => {
-    if (runtime?.fatalError) return runtime.fatalError; // fatal优先，不能被普通client-close降级为可继续状态。
-    if (isClientClosed()) return Object.assign(new Error('Voice transcription cancelled: client disconnected'), { code: 'VOICE_CANCELLED' }); // 保留用户取消语义。
-    if (Date.now() >= deadline) return Object.assign(new Error('Voice transcription timed out'), { code: 'VOICE_TIMEOUT' }); // absolute deadline从入队前起算。
-    return null;
-  };
-  // notification只resolve，排队期间尚未建立race也不会产生unhandled rejection。
-  const cancelled = new Promise(resolve => { notify = resolve; }); // 只resolve，尚未建立race时也不会产生未处理拒绝。
-  const check = () => {
-    const error = currentError();
-    if (error) notify(error); else if (!stopped) timer = setTimeout(check, pollMs);
-  };
-  timer = setTimeout(check, pollMs);
-  return {
-    cancelled, shouldCancel: Object.assign(() => !!currentError(), { remaining: () => Math.max(1, deadline - Date.now()) }), // gate与timeout共享同一时钟事实。
-    assertUsable() { const error = currentError(); if (error) throw error; },
-    stop() { stopped = true; clearTimeout(timer); },
-  };
 }
 
 function tcpConnect(host, port) {
@@ -1963,20 +1936,19 @@ function createDaemonRuntime({ browser, bootstrapPage, project = null, initializ
 
 // ─── Voice Flow ──────────────────────────────────────────────────────────────
 
-async function runVoiceTranscribe(runtime, input, log, shouldCancel = () => false) {
+async function runVoiceTranscribe(runtime, input, log, signal) {
   log(`voice: transcribing ${path.basename(input.file)} bytes=${fs.statSync(input.file).size}`);
-  const cancel = cancelSignal(shouldCancel, 500);
+  const cancel = cancelSignal(signal);
   let lease;
   let submitted = false;
-  let cancelledBeforeSubmission = false;
   let queueStarted = false;
   let requestID;
   // voice lease/preflight与direct必须保持同一队列所有权；否则Project click可与另一页的稳定性evaluate重叠。
   const direct = runtime.withSubmission(async () => {
     queueStarted = true;
-    if (cancelledBeforeSubmission || shouldCancel()) throw Object.assign(new Error('Voice transcription cancelled before submission'), { code: 'VOICE_CANCELLED' });
+    signal.throwIfAborted();
     const acquired = await runtime.voiceLease();
-    if (cancelledBeforeSubmission || shouldCancel()) {
+    if (signal.aborted) {
       await acquired.discard();
       throw Object.assign(new Error('Voice transcription cancelled during page preparation'), { code: 'VOICE_CANCELLED' });
     }
@@ -1985,24 +1957,36 @@ async function runVoiceTranscribe(runtime, input, log, shouldCancel = () => fals
     requestID = crypto.randomBytes(8).toString('hex'); // compare-and-delete和abort都绑定本次页面任务。
     submitted = true;
     runtime.noteVoiceSubmitted();
-    // 页面AbortController必须消费当前请求剩余预算，不能让内部固定timer早于同一个绝对deadline。
-    // optional fallback只服务内部直接调用；真实HTTP请求总会携带request context的remaining。
-    return CHATGPT_DOM.transcribeAudioFile(page, input.file, CHATGPT_URL, log, shouldCancel, () => {}, { mode: 'direct', requestID, timeoutMs: shouldCancel.remaining?.() || VOICE_TRANSCRIBE_TIMEOUT_MS });
+    const transcription = await CHATGPT_DOM.transcribeAudioFile(page, input.file, CHATGPT_URL, log, () => signal.aborted, () => {}, { mode: 'direct', requestID });
+    signal.throwIfAborted();
+    const cdp = await page.createCDPSession();
+    try {
+      // CDP 可读 HttpOnly 会话 cookie；这是导出存在的唯一理由（页面 JS 拿不到它们）。
+      const result = await cdp.send('Network.getCookies', { urls: [CHATGPT_URL] });
+      // CDP 协议返回 { cookies: [...] }；形状漂移 fail-closed，不猜第二种结构。
+      if (!result || typeof result !== 'object' || !Array.isArray(result.cookies)) {
+        throw Object.assign(new Error('CDP cookie export returned an unexpected shape'), { code: 'AUTH_EXPORT_CDP_SHAPE' });
+      }
+      // slim 形状与 opencode 侧 authFromHarvest 一一对应；expires 保留 CDP 原值（-1 会话 cookie 由 opencode 归零）。
+      const slim = result.cookies.map(c => ({
+        name: c.name, value: c.value, domain: c.domain, path: c.path,
+        expires: typeof c.expires === 'number' ? c.expires : 0,
+        httpOnly: !!c.httpOnly, secure: !!c.secure, sameSite: c.sameSite || undefined,
+      }));
+      // 文字、实际POST的Bearer与Cookie属于同一submission；不得重新读取bootstrap或在取消后交付。
+      signal.throwIfAborted();
+      return { text: transcription.text, auth: { accessToken: transcription.accessToken, cookies: slim, fetchedAt: new Date().toISOString() } };
+    } finally { await cdp.detach(); }
   });
   // cancelSignal只负责停止当前direct；稳定性与完成均来自page probe和完整HTTP响应。
   try {
-    const text = await Promise.race([
-      withTimeout(direct, shouldCancel.remaining?.() || VOICE_TRANSCRIBE_TIMEOUT_MS,
-      `Voice transcription timed out after ${VOICE_TRANSCRIBE_TIMEOUT_MS}ms`),
-      cancel,
-    ]);
+    const result = await Promise.race([direct, cancel]);
     lease?.release();
-    return { ok: true, text };
+    return { ok: true, ...result };
   } catch (err) {
     direct.catch(() => {});
     // queue尚未取得所有权时只锁存取消事实；迟到任务进入队列后会在创建page前无副作用退出。
     if (!submitted) {
-      cancelledBeforeSubmission = true;
       if (queueStarted) {
         try { await withTimeout(direct.catch(() => {}), 1_000, 'cancelled voice task did not settle'); }
         catch (cleanupError) { throw runtime.fail(cleanupError); }
@@ -2010,7 +1994,7 @@ async function runVoiceTranscribe(runtime, input, log, shouldCancel = () => fals
       throw err;
     }
     let settled = false;
-    if (err.code === 'VOICE_CANCELLED') {
+    if (err.code === 'VOICE_CANCELLED' || err.code === 'VOICE_TIMEOUT') {
       try { await withTimeout(CHATGPT_DOM.cancelDirectVoice(lease.page, requestID), 500, 'abort direct voice'); await withTimeout(direct.catch(() => {}), 500, 'settle direct voice'); settled = true; } catch {}
     }
     // endpoint失败不损坏页面；transport/page/timeout必须隔离，且音频POST后绝不续租或重发。
@@ -2022,75 +2006,25 @@ async function runVoiceTranscribe(runtime, input, log, shouldCancel = () => fals
     }
     throw err;
   } finally {
-    // 无论成功/超时/取消都清除轮询；direct路径不持有前台状态。
+    // 取消事件只负责业务中止；原 settle/discard 完成后才释放监听及租约。
     cancel.stop();
   }
 }
 
-async function runVoiceRequest(runtime, input, log, isClientClosed) {
-  const context = makeRequestContext({ deadline: Date.now() + VOICE_TRANSCRIBE_TIMEOUT_MS, isClientClosed, runtime }); // deadline包含排队时间。
+async function runVoiceRequest(runtime, input, log, signal) {
+  const cancel = cancelSignal(signal);
   try {
     let started = false; const operation = runtime.withVoice(async () => {
+      // 前项隔离失败后的排队请求沿既有fatal终止，不能再读取音频或进入提交队列。
+      if (runtime.fatalError) throw runtime.fatalError;
       // 取消或排队超时必须先于realpath/stat/read，避免TUI已删除WAV后旧任务仍访问磁盘。
-      context.assertUsable(); started = true; const parsed = validateVoiceInput(input); context.assertUsable();
-      return runVoiceTranscribe(runtime, parsed, log, context.shouldCancel);
+      signal.throwIfAborted(); started = true; const parsed = validateVoiceInput(input); signal.throwIfAborted();
+      return runVoiceTranscribe(runtime, parsed, log, signal);
     });
     operation.catch(error => runtime.onFatal?.(error)); // caller先取消后，迟到fatal仍必须触发daemon退出。
-    return await Promise.race([operation, context.cancelled.then(error => { if (started) return operation; throw error; })]);
+    return await Promise.race([operation, cancel.catch(error => { if (started) return operation; throw error; })]);
   } finally {
-    context.stop();
-  }
-}
-
-// 凭据导出是 TUI 私有 side-channel（同 /voice/transcribe-file 语义）：
-// 复用 voice 页面所有权模型，把 bootstrap token 与 HttpOnly cookie 导出给本机调用方。
-// token/cookie 值只进入 HTTP 响应体，永不写入 daemon 日志。
-async function runAuthExport(runtime) {
-  let lease;
-  const operation = runtime.withVoice(async () => {
-    // 导出与转写共享 voice 锁和提交队列：不能与 voice/ask 的页面事务并发操作同一页面域。
-    return runtime.withSubmission(async () => {
-      lease = await runtime.voiceLease();
-      const page = lease.page;
-      // 页面任务内部检查 origin：Node 侧 url() 与 evaluate 之间存在导航竞态。
-      const fact = await page.evaluate(() => {
-        const node = document.querySelector('#client-bootstrap');
-        const bootstrap = node ? JSON.parse(node.textContent || 'null') : null;
-        return {
-          origin: location.origin,
-          authStatus: bootstrap ? bootstrap.authStatus : null,
-          accessToken: (bootstrap && bootstrap.session && bootstrap.session.accessToken) || null,
-        };
-      });
-      if (fact.origin !== CHATGPT_URL || fact.authStatus !== 'logged_in' || typeof fact.accessToken !== 'string' || !fact.accessToken) {
-        // 登录介入是确定性错误：不能借 HTTP 500 外壳进入 CLI 的可重试集合（同 VOICE_AUTH 语义）。
-        throw Object.assign(new Error('ChatGPT page is not logged in'), { code: 'AUTH_EXPORT_LOGIN_REQUIRED' });
-      }
-      const cdp = await page.createCDPSession();
-      // CDP 可读 HttpOnly 会话 cookie；这是导出存在的唯一理由（页面 JS 拿不到它们）。
-      const result = await cdp.send('Network.getCookies', { urls: [CHATGPT_URL] });
-      await cdp.detach();
-      // CDP 协议返回 { cookies: [...] }；形状漂移 fail-closed，不猜第二种结构。
-      if (!result || typeof result !== 'object' || !Array.isArray(result.cookies)) {
-        throw Object.assign(new Error('CDP cookie export returned an unexpected shape'), { code: 'AUTH_EXPORT_CDP_SHAPE' });
-      }
-      // slim 形状与 opencode 侧 authFromHarvest 一一对应；expires 保留 CDP 原值（-1 会话 cookie 由 opencode 归零）。
-      const slim = result.cookies.map(c => ({
-        name: c.name, value: c.value, domain: c.domain, path: c.path,
-        expires: typeof c.expires === 'number' ? c.expires : 0,
-        httpOnly: !!c.httpOnly, secure: !!c.secure, sameSite: c.sameSite || undefined,
-      }));
-      return { ok: true, authStatus: fact.authStatus, accessToken: fact.accessToken, cookies: slim, fetchedAt: new Date().toISOString() };
-    });
-  });
-  try {
-    const result = await operation;
-    lease.release();
-    return result;
-  } catch (err) {
-    // 读取类失败后页面健康度未知：退役页面，下次导出/转写只认领新页；导出绝不重试第二算法。
-    if (lease) await lease.discard().catch(() => {});
-    throw err;
+    cancel.stop();
   }
 }
 
@@ -2667,33 +2601,35 @@ async function startDaemonProcess() {
     }
 
     if (req.method === 'POST' && req.url === '/voice/transcribe-file') {
-      // 检测客户端断开:TUI cancel 后 daemon 仍持有 voiceLock 直到超时(60s);
-      // shouldCancel 让 cancelSignal 在 500ms 内检测断开,关闭页面释放 voiceLock。
-      let voiceClientClosed = false;
-      res.on('close', () => { if (!res.writableEnded) voiceClientClosed = true; });
+      // response 提前关闭才是客户端取消；正常 end 不取消已经交付的结果。
+      const controller = new AbortController();
+      const close = () => { if (!res.writableEnded) controller.abort(); };
+      res.on('close', close);
+      const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(40_000)]);
       try {
-        res.setTimeout(RESPONSE_TIMEOUT + 60_000);
         const parsed = await readDaemonJsonBody(req, '/voice/transcribe-file', log);
-        const result = await runVoiceRequest(runtime, parsed, log, () => voiceClientClosed);
+        const result = await runVoiceRequest(runtime, parsed, log, signal);
         send(200, result);
       } catch (err) {
         log(`Error: ${err.message}`);
         // 503表示本地browser生命周期失效；CLI淘汰索引但当前录音不得自动重发。
         send(err.code === 'BROWSER_DISCONNECTED' ? 503 : /body|file|WAV|regular|large|exist/i.test(err.message) ? 400 : 500, { ok: false, ...(err.code ? { code: err.code } : {}), error: err.message });
-      }
+      } finally { res.removeListener('close', close); }
       return;
     }
 
     if (req.method === 'POST' && req.url === '/auth/export') {
-      // 无请求体：导出只读取当前登录会话，不接受任何调用方提供的路径或凭据。
+      // 路径只来自 MCP 自身配置；HTTP 和 CLI 共用离线 reader，不占用浏览器租约。
+      const controller = new AbortController();
+      const close = () => { if (!res.writableEnded) controller.abort(); };
+      res.on('close', close);
       try {
-        const result = await runAuthExport(runtime);
-        send(200, result);
+        const result = await require('./chatgpt').exportProfileAuth(AbortSignal.any([controller.signal, AbortSignal.timeout(40_000)]));
+        send(200, { ok: true, ...result });
       } catch (err) {
         log(`Error: ${err.message}`);
-        // 400 登录介入不进 CLI 重试集合；browser 生命周期错误走 503 让 CLI 淘汰 stale daemon。
-        send(err.code === 'AUTH_EXPORT_LOGIN_REQUIRED' ? 400 : err.code === 'BROWSER_DISCONNECTED' ? 503 : 500, { ok: false, ...(err.code ? { code: err.code } : {}), error: err.message });
-      }
+        send(500, { ok: false, error: err.message });
+      } finally { res.removeListener('close', close); }
       return;
     }
 
@@ -2821,7 +2757,7 @@ async function startDaemonProcess() {
 
 // 正常运行只暴露 daemon 入口；离线测试显式 opt-in 后才能访问无网络状态机 seam。
 module.exports = process.env.CHATGPT_TEST_HOOKS === '1'
-  ? { startDaemonProcess, testing: Object.freeze({ launchBrowser, acquireBootstrapBrowser, createDaemonRuntime, prepareBootstrapPage, convergeBootstrapPage, syncPageViewportWithWindow, closeOwnedBrowser, installBrowserDisconnectHandler, browserOwnerMatches, writeBrowserOwner, deleteBrowserOwner, resolveProject, ensureProjectHome, restoreSessionPage, rememberCurrentSessionUrl, readSessionEntry, markSessionPending, markSessionCompleted, markSessionLost, validateAskInput, validateVoiceInput, sendJSON, assistantTextAdvanced, runAsk, runVoiceRequest, runAuthExport, requestHash, dom: CHATGPT_DOM }) }
+  ? { startDaemonProcess, testing: Object.freeze({ launchBrowser, acquireBootstrapBrowser, createDaemonRuntime, prepareBootstrapPage, convergeBootstrapPage, syncPageViewportWithWindow, closeOwnedBrowser, installBrowserDisconnectHandler, browserOwnerMatches, writeBrowserOwner, deleteBrowserOwner, resolveProject, ensureProjectHome, restoreSessionPage, rememberCurrentSessionUrl, readSessionEntry, markSessionPending, markSessionCompleted, markSessionLost, validateAskInput, validateVoiceInput, sendJSON, assistantTextAdvanced, runAsk, runVoiceRequest, requestHash, dom: CHATGPT_DOM }) }
   : { startDaemonProcess };
 
 if (require.main === module) {

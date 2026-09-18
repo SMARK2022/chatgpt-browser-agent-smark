@@ -169,12 +169,11 @@ function createChatGPTDom({ responseTimeout }) {
       // direct path 零页面操作：不 bringToFront、不 goto、不依赖任何 DOM 状态。
       // borrowed和dedicated页都已由runtime稳定化；adapter只拥有同源HTTP wire边界。
       try {
-        // 页面timer消费core剩余总预算；不能再按短音频大小另造一个更早的成功期限。
-        // adapter独立调用没有core context时才使用responseTimeout，production始终优先显式remaining。
-        const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? options.timeoutMs : responseTimeout;
-        const direct = await transcribeAudioFileDirect(page, audioBase64, file, options.requestID, timeoutMs); // requestID贯穿Node取消与页面controller。
+        // 页面 fetch 固定40秒；HTTP 的 abort 可更早到达，requestID 仍绑定同一个 controller。
+        const direct = await transcribeAudioFileDirect(page, audioBase64, file, options.requestID, 40_000);
         log(`Direct voice transcription finished in ${direct.elapsedMs}ms`);
-        return direct.text;
+        // 仅私有结果携带成功POST使用的凭据；耗时日志不能序列化整个direct对象。
+        return { text: direct.text, accessToken: direct.accessToken };
       } catch (err) {
         const code = err.code || (shouldCancel()
           ? 'VOICE_CANCELLED'
@@ -190,7 +189,7 @@ function createChatGPTDom({ responseTimeout }) {
         const requests = window.__opencodeVoiceRequests ||= {}; // 页面全局表只保存短期controller，不保存音频或token。
         const request = requests[id] ||= { cancelled: true }; // cancel先到时留下tombstone，禁止迟到fetch启动。
         request.cancelled = true; // controller建立前后共用同一取消事实。
-        request.controller?.abort(); // 已开始的session/transcribe fetch必须真实中止。
+        request.controller?.abort(); // 已开始的transcribe fetch必须真实中止，不存在session刷新请求。
       }, requestID);
     },
 
@@ -758,7 +757,7 @@ function createChatGPTDom({ responseTimeout }) {
   }
 
   async function transcribeAudioFileDirect(page, audioBase64, file, requestID, fetchTimeoutMs) {
-    // 此值来自请求剩余绝对deadline；页面AbortController只执行同一预算，不拥有第二套大小公式。
+    // 页面fetch固定40秒，外层取消可提前中止；这里不计算剩余deadline或第二套大小公式。
     const result = await page.evaluate(async (config) => {
       const startedAt = performance.now();
       const requests = window.__opencodeVoiceRequests ||= {}; // 同一page可复用，但每次任务必须按ID隔离。
@@ -778,8 +777,8 @@ function createChatGPTDom({ responseTimeout }) {
       const accessToken = bootstrap?.session?.accessToken;
       // 与网页SendIfAvailable的已登录分支保持一致；stable probe后凭据消失时必须在POST前停止。
       if (bootstrap?.authStatus !== 'logged_in' || typeof accessToken !== 'string' || !accessToken) {
-        // stable probe后token仍可能消失；这是确定性登录介入，不得借HTTP 500外壳进入四次重试。
-        // kind在页面owner原位产生，Node不接触token也无需从message猜认证状态。
+        // stable probe后token仍可能消失；这是确定性登录介入，单次转录直接失败且不重发音频。
+        // kind在页面owner原位产生，Node无需从message猜认证状态，也不重新解析凭据。
         const error = new Error('Voice page does not expose an authenticated session');
         error.kind = 'auth';
         throw error;
@@ -788,11 +787,11 @@ function createChatGPTDom({ responseTimeout }) {
       const bytes = Uint8Array.from(atob(config.audioBase64), char => char.charCodeAt(0));
       const form = new FormData();
       // 私有direct endpoint当前接受file字段；结构漂移时明确失败，不尝试第二种上传算法。
-      // 这里只传文件名和MIME；cookie与page-local Bearer留在浏览器上下文，任何token都不返回Node日志。
+      // 这里只传文件名和MIME；Bearer只随成功结果走私有IPC，任何凭据都不得进入Node日志。
       form.append('file', new File([bytes], config.name, { type: config.mimeType }));
       // FormData建立后仍可能发生SPA/外部导航；POST音频前再次在同一execution context核验origin。
       if (location.origin !== config.requiredOrigin) throw new Error('Voice page left the official ChatGPT origin');
-      // 当前网页使用HttpOnly会话cookie授权转录；credentials保留凭证且不把token暴露给Node或页面返回值。
+      // credentials保留HttpOnly Cookie，bootstrap Bearer同时标识账户；成功快照须保留这份实际请求凭据。
       const response = await fetchWithTimeout('/backend-api/transcribe', {
         method: 'POST',
         body: form,
@@ -827,7 +826,7 @@ function createChatGPTDom({ responseTimeout }) {
         throw error;
       }
       // elapsedMs 只用于本地诊断日志；不参与业务判断，避免慢网下误判为失败。
-      return { ok: true, text: json.text, elapsedMs: Math.round(performance.now() - startedAt) }; // 页面只返回非敏感业务结果。
+      return { ok: true, text: json.text, accessToken, elapsedMs: Math.round(performance.now() - startedAt) }; // 保留POST局部原值，避免响应期间bootstrap变化。
       } catch (error) {
         // producer kind优先于通用异常名；只有没有业务分类时才按transport/origin/unknown收敛。
         // unknown endpoint故障fail closed，不因文案包含HTTP字样扩大retry集合。
@@ -870,7 +869,7 @@ function createChatGPTDom({ responseTimeout }) {
         if (bootstrap?.authStatus === 'logged_out') return { ...fact, kind: 'logged-out' };
         const accessToken = bootstrap?.session?.accessToken;
         if (bootstrap?.authStatus === 'logged_in' && typeof accessToken === 'string' && accessToken && composer && !hasLoginBtn) {
-          // token只参与页面内判定；返回值固定为非敏感判别联合，core永远拿不到凭据。
+          // 此探针的token只参与页面内判定；状态返回值保持非敏感，凭据仅由成功转录结果交付。
           return { ...fact, kind: 'authenticated' };
         }
         // complete后的缺token、缺composer或登录入口并存都是同一个不一致事实，不猜未来schema。
